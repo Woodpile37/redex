@@ -35,10 +35,10 @@ struct IRTypeCheckerConfig : public Configurable {
   bool run_after_each_pass;
   bool verify_moves;
   bool validate_invoke_super;
-  bool check_num_of_refs;
   std::unordered_set<std::string> run_after_passes;
   bool check_no_overwrite_this;
   bool annotated_cfg_on_error{false};
+  bool check_classes;
 };
 
 struct HasherConfig : public Configurable {
@@ -126,7 +126,9 @@ struct MethodSimilarityOrderingConfig : public Configurable {
   }
 
   bool disable{true};
+  bool use_compression_conscious_order{false};
   bool use_class_level_perf_sensitivity{false};
+  std::string store_name_to_disable;
 };
 
 struct ProguardConfig : public Configurable {
@@ -140,6 +142,7 @@ struct ProguardConfig : public Configurable {
 
   std::vector<std::string> blocklist;
   bool disable_default_blocklist{false};
+  bool fail_on_unknown_commands{true};
 };
 
 struct PassManagerConfig : public Configurable {
@@ -151,6 +154,39 @@ struct PassManagerConfig : public Configurable {
   }
 
   std::unordered_map<std::string, std::string> pass_aliases;
+  bool jemalloc_full_stats{false};
+  bool violations_tracking{false};
+  bool check_pass_order_properties{false};
+  bool check_properties_deep{false};
+};
+
+struct ResourceConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override { return "ResourceConfig"; }
+  std::string get_config_doc() override {
+    return "Options used by many resource optimization passes or global "
+           "cleanup steps.";
+  }
+
+  // Outer R class names that have been customized to hold extra data (which
+  // need special treatment when remapping constants). Not used by all apps.
+  std::unordered_set<std::string> customized_r_classes;
+  // Type names in the resource table (example: "id") which should enable
+  // canonical offsets for entries/values.
+  std::unordered_set<std::string> canonical_entry_types;
+  bool sort_key_strings{false};
+};
+
+struct DexOutputConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override { return "DexOutputConfig"; }
+  std::string get_config_doc() override {
+    return "Options used by the Dex writer.";
+  }
+
+  bool write_class_sizes{false};
 };
 
 class GlobalConfig;

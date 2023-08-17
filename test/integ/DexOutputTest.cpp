@@ -35,7 +35,7 @@ class DexOutputTest : public RedexIntegrationTest {
   }
 };
 
-TEST_F(DexOutputTest, testSimilarityOrderer) {
+TEST_F(DexOutputTest, TEST_SIMILARITY_ORDERER) {
   std::vector<SortMode> sort_modes{SortMode::METHOD_PROFILED_ORDER,
                                    SortMode::METHOD_SIMILARITY};
 
@@ -52,7 +52,7 @@ TEST_F(DexOutputTest, testSimilarityOrderer) {
   auto gtypes = std::make_shared<GatheredTypes>(&*classes);
   DexOutput dout("", &*classes, std::move(gtypes), nullptr, true, 0, nullptr, 0,
                  DebugInfoKind::NoCustomSymbolication, nullptr, config_files,
-                 pos_mapper.get(), nullptr, nullptr, nullptr, 25);
+                 pos_mapper.get(), nullptr, nullptr, DexOutputConfig(), 25);
 
   dout.prepare(SortMode::DEFAULT, sort_modes, config_files, "dex\n039");
   auto code_items = get_ordered_methods(dout);
@@ -73,6 +73,7 @@ TEST_F(DexOutputTest, testSimilarityOrderer) {
       "LDexOutputTest$SecondPerfSensitiveClass;.EjustReturnFive:()I",
       "LDexOutputTest;.AjustReturnFive:()I",
       "LDexOutputTest;.EjustReturnFive:()I",
+      "LDexOutputTest;.DgetSixpublic:()I",
       "LDexOutputTest$NonPerfSensitiveClass;.FsomeLogic:(I)I",
       "LDexOutputTest$PerfSensitiveClass;.FsomeLogic:(I)I",
       "LDexOutputTest$SecondPerfSensitiveClass;.FsomeLogic:(I)I",
@@ -80,14 +81,13 @@ TEST_F(DexOutputTest, testSimilarityOrderer) {
       "LDexOutputTest;.FsomeLogic:(I)I",
       "LDexOutputTest;.HsomeLogic:(I)I",
       "LDexOutputTest;.BjustCallSixpublic:()I",
-      "LDexOutputTest;.GjustCallSixpublic:()I",
-      "LDexOutputTest;.DgetSixpublic:()I"};
+      "LDexOutputTest;.GjustCallSixpublic:()I"};
 
   EXPECT_TRUE(std::equal(method_names.begin(), method_names.end(),
                          expected_order.begin()));
 }
 
-TEST_F(DexOutputTest, testPerfSensitive) {
+TEST_F(DexOutputTest, TEST_SIMILARITY_ORDERER_PERF_SENSITIVE) {
   std::vector<SortMode> sort_modes{SortMode::METHOD_PROFILED_ORDER,
                                    SortMode::METHOD_SIMILARITY};
 
@@ -101,8 +101,8 @@ TEST_F(DexOutputTest, testPerfSensitive) {
   config_files.parse_global_config();
   std::unique_ptr<PositionMapper> pos_mapper(PositionMapper::make(""));
 
-  (*classes)[1]->set_perf_sensitive(true);
-  (*classes)[2]->set_perf_sensitive(true);
+  (*classes)[1]->set_perf_sensitive(PerfSensitiveGroup::BETAMAP_ORDERED);
+  (*classes)[2]->set_perf_sensitive(PerfSensitiveGroup::BETAMAP_ORDERED);
 
   auto scope = build_class_scope(stores);
 
@@ -113,7 +113,7 @@ TEST_F(DexOutputTest, testPerfSensitive) {
   auto gtypes = std::make_shared<GatheredTypes>(&*classes);
   DexOutput dout("", &*classes, std::move(gtypes), nullptr, true, 0, nullptr, 0,
                  DebugInfoKind::NoCustomSymbolication, nullptr, config_files,
-                 pos_mapper.get(), nullptr, nullptr, nullptr, 25);
+                 pos_mapper.get(), nullptr, nullptr, DexOutputConfig(), 25);
 
   dout.prepare(SortMode::DEFAULT, sort_modes, config_files, "dex\n039");
   auto code_items = get_ordered_methods(dout);
@@ -136,13 +136,132 @@ TEST_F(DexOutputTest, testPerfSensitive) {
       "LDexOutputTest$NonPerfSensitiveClass;.EjustReturnFive:()I",
       "LDexOutputTest;.AjustReturnFive:()I",
       "LDexOutputTest;.EjustReturnFive:()I",
+      "LDexOutputTest;.DgetSixpublic:()I",
       "LDexOutputTest$NonPerfSensitiveClass;.FsomeLogic:(I)I",
       "LDexOutputTest;.CsomeLogic:(I)I",
       "LDexOutputTest;.FsomeLogic:(I)I",
       "LDexOutputTest;.HsomeLogic:(I)I",
       "LDexOutputTest;.BjustCallSixpublic:()I",
+      "LDexOutputTest;.GjustCallSixpublic:()I"};
+
+  EXPECT_TRUE(std::equal(method_names.begin(), method_names.end(),
+                         expected_order.begin()));
+}
+
+TEST_F(DexOutputTest, TEST_COMPRESSION_ORDERER) {
+  std::vector<SortMode> sort_modes{SortMode::METHOD_PROFILED_ORDER,
+                                   SortMode::METHOD_SIMILARITY};
+
+  Json::Value cfg;
+  std::istringstream temp_json(
+      "{\"method_similarity_order\":{\"use_compression_conscious_order\":true}"
+      "}");
+  temp_json >> cfg;
+
+  ConfigFiles config_files(cfg);
+  config_files.parse_global_config();
+  std::unique_ptr<PositionMapper> pos_mapper(PositionMapper::make(""));
+  auto scope = build_class_scope(stores);
+
+  // Lower the code
+  walk::parallel::methods<>(
+      scope, [](DexMethod* m) { instruction_lowering::lower(m, true); });
+
+  auto gtypes = std::make_shared<GatheredTypes>(&*classes);
+  DexOutput dout("", &*classes, std::move(gtypes), nullptr, true, 0, nullptr, 0,
+                 DebugInfoKind::NoCustomSymbolication, nullptr, config_files,
+                 pos_mapper.get(), nullptr, nullptr, DexOutputConfig(), 25);
+
+  dout.prepare(SortMode::DEFAULT, sort_modes, config_files, "dex\n039");
+  auto code_items = get_ordered_methods(dout);
+
+  uint32_t i = 0;
+  std::vector<std::string> method_names(code_items.size());
+  for (auto* m : code_items) {
+    method_names[i++] = show(m);
+  }
+
+  std::vector<std::string> expected_order = {
+      "LDexOutputTest$NonPerfSensitiveClass;.EjustReturnFive:()I",
+      "LDexOutputTest$PerfSensitiveClass;.EjustReturnFive:()I",
+      "LDexOutputTest$SecondPerfSensitiveClass;.EjustReturnFive:()I",
+      "LDexOutputTest;.DgetSixpublic:()I",
+      "LDexOutputTest;.AjustReturnFive:()I",
+      "LDexOutputTest;.EjustReturnFive:()I",
+      "LDexOutputTest;.BjustCallSixpublic:()I",
       "LDexOutputTest;.GjustCallSixpublic:()I",
-      "LDexOutputTest;.DgetSixpublic:()I"};
+      "LDexOutputTest$NonPerfSensitiveClass;.FsomeLogic:(I)I",
+      "LDexOutputTest$PerfSensitiveClass;.FsomeLogic:(I)I",
+      "LDexOutputTest$SecondPerfSensitiveClass;.FsomeLogic:(I)I",
+      "LDexOutputTest;.CsomeLogic:(I)I",
+      "LDexOutputTest;.FsomeLogic:(I)I",
+      "LDexOutputTest;.HsomeLogic:(I)I",
+      "LDexOutputTest$NonPerfSensitiveClass;.<init>:(LDexOutputTest;)V",
+      "LDexOutputTest$PerfSensitiveClass;.<init>:(LDexOutputTest;)V",
+      "LDexOutputTest$SecondPerfSensitiveClass;.<init>:(LDexOutputTest;)V",
+      "LDexOutputTest;.<init>:()V"};
+
+  EXPECT_TRUE(std::equal(method_names.begin(), method_names.end(),
+                         expected_order.begin()));
+}
+
+TEST_F(DexOutputTest, TEST_COMPRESSION_ORDERER_PERF_SENSITIVE) {
+  std::vector<SortMode> sort_modes{SortMode::METHOD_PROFILED_ORDER,
+                                   SortMode::METHOD_SIMILARITY};
+
+  Json::Value cfg;
+  std::istringstream temp_json(
+      "{\"method_similarity_order\":{\"use_class_level_perf_sensitivity\":true,"
+      "\"use_compression_conscious_order\":true}"
+      "}");
+  temp_json >> cfg;
+
+  ConfigFiles config_files(cfg);
+  config_files.parse_global_config();
+  std::unique_ptr<PositionMapper> pos_mapper(PositionMapper::make(""));
+
+  (*classes)[1]->set_perf_sensitive(PerfSensitiveGroup::BETAMAP_ORDERED);
+  (*classes)[2]->set_perf_sensitive(PerfSensitiveGroup::BETAMAP_ORDERED);
+
+  auto scope = build_class_scope(stores);
+
+  // Lower the code
+  walk::parallel::methods<>(
+      scope, [](DexMethod* m) { instruction_lowering::lower(m, true); });
+
+  auto gtypes = std::make_shared<GatheredTypes>(&*classes);
+  DexOutput dout("", &*classes, std::move(gtypes), nullptr, true, 0, nullptr, 0,
+                 DebugInfoKind::NoCustomSymbolication, nullptr, config_files,
+                 pos_mapper.get(), nullptr, nullptr, DexOutputConfig(), 25);
+
+  dout.prepare(SortMode::DEFAULT, sort_modes, config_files, "dex\n039");
+  auto code_items = get_ordered_methods(dout);
+
+  uint32_t i = 0;
+  std::vector<std::string> method_names(code_items.size());
+  for (auto* m : code_items) {
+    method_names[i++] = show(m);
+  }
+
+  std::vector<std::string> expected_order = {
+      "LDexOutputTest$PerfSensitiveClass;.<init>:(LDexOutputTest;)V",
+      "LDexOutputTest$PerfSensitiveClass;.EjustReturnFive:()I",
+      "LDexOutputTest$PerfSensitiveClass;.FsomeLogic:(I)I",
+      "LDexOutputTest$SecondPerfSensitiveClass;.<init>:(LDexOutputTest;)V",
+      "LDexOutputTest$SecondPerfSensitiveClass;.EjustReturnFive:()I",
+      "LDexOutputTest$SecondPerfSensitiveClass;.FsomeLogic:(I)I",
+      "LDexOutputTest$NonPerfSensitiveClass;.FsomeLogic:(I)I",
+      "LDexOutputTest;.CsomeLogic:(I)I",
+      "LDexOutputTest;.FsomeLogic:(I)I",
+      "LDexOutputTest;.HsomeLogic:(I)I",
+      "LDexOutputTest$NonPerfSensitiveClass;.<init>:(LDexOutputTest;)V",
+      "LDexOutputTest;.<init>:()V",
+      "LDexOutputTest$NonPerfSensitiveClass;.EjustReturnFive:()I",
+      "LDexOutputTest;.DgetSixpublic:()I",
+      "LDexOutputTest;.AjustReturnFive:()I",
+      "LDexOutputTest;.EjustReturnFive:()I",
+      "LDexOutputTest;.BjustCallSixpublic:()I",
+      "LDexOutputTest;.GjustCallSixpublic:()I"};
 
   EXPECT_TRUE(std::equal(method_names.begin(), method_names.end(),
                          expected_order.begin()));

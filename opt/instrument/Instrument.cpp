@@ -51,31 +51,22 @@ constexpr bool instr_debug = false;
 
 constexpr const char* SIMPLE_METHOD_TRACING = "simple_method_tracing";
 constexpr const char* BASIC_BLOCK_TRACING = "basic_block_tracing";
+constexpr const char* BASIC_BLOCK_HIT_COUNT = "basic_block_hit_count";
 constexpr const char* METHOD_REPLACEMENT = "methods_replacement";
 
 class InstrumentInterDexPlugin : public interdex::InterDexPassPlugin {
  public:
-  explicit InstrumentInterDexPlugin(size_t max_analysis_methods)
-      : m_max_analysis_methods(max_analysis_methods) {}
+  InstrumentInterDexPlugin(size_t frefs, size_t trefs, size_t mrefs)
+      : m_frefs(frefs), m_trefs(trefs), m_mrefs(mrefs) {}
 
-  size_t reserve_frefs() override {
-    // We may introduce a new field
-    return 1;
-  }
-
-  size_t reserve_trefs() override {
-    // We introduce a type reference to the analysis class in each dex
-    return 1;
-  }
-
-  size_t reserve_mrefs() override {
-    // In each dex, we will introduce more method refs from analysis methods.
-    // This makes sure that the inter-dex pass keeps space for new method refs.
-    return m_max_analysis_methods;
+  ReserveRefsInfo reserve_refs() override {
+    return ReserveRefsInfo(m_frefs, m_trefs, m_mrefs);
   }
 
  private:
-  const size_t m_max_analysis_methods;
+  const size_t m_frefs;
+  const size_t m_trefs;
+  const size_t m_mrefs;
 };
 
 // For example, say that "Lcom/facebook/debug/" is in the set. We match either
@@ -439,7 +430,8 @@ void count_source_block_chain_length(DexStoresVector& stores, PassManager& pm) {
 
 } // namespace
 
-constexpr const char* InstrumentPass::STATS_FIELD_NAME;
+InstrumentPass::InstrumentPass() : Pass("InstrumentPass") {}
+InstrumentPass::~InstrumentPass() {}
 
 // Find a sequence of opcode that creates a static array. Patch the array size.
 void InstrumentPass::patch_array_size(DexClass* analysis_cls,
@@ -561,26 +553,11 @@ void InstrumentPass::bind_config() {
        m_options.instrument_blocks_without_source_block);
   bind("instrument_only_root_store", false,
        m_options.instrument_only_root_store);
+  bind("inline_onBlockHit", false, m_options.inline_onBlockHit);
+  bind("inline_onNonLoopBlockHit", false, m_options.inline_onNonLoopBlockHit);
+  bind("apply_CSE_CopyProp", false, m_options.apply_CSE_CopyProp);
 
-  size_t max_analysis_methods;
-  if (m_options.instrumentation_strategy == SIMPLE_METHOD_TRACING) {
-    max_analysis_methods = m_options.num_shards;
-  } else if (m_options.instrumentation_strategy == BASIC_BLOCK_TRACING) {
-    // Our current DynamicAnalysis has 7 onMethodExits and 1 onMethodBegin.
-    max_analysis_methods = 8;
-  } else {
-    max_analysis_methods = 1;
-  }
-
-  after_configuration([this, max_analysis_methods] {
-    // Make a small room for additional method refs during InterDex.
-    interdex::InterDexRegistry* registry =
-        static_cast<interdex::InterDexRegistry*>(
-            PluginRegistry::get().pass_registry(interdex::INTERDEX_PASS_NAME));
-    registry->register_plugin(
-        "INSTRUMENT_PASS_PLUGIN", [max_analysis_methods]() {
-          return new InstrumentInterDexPlugin(max_analysis_methods);
-        });
+  after_configuration([this] {
     // Currently we only support instance call to static call.
     for (auto& pair : m_options.methods_replacement) {
       always_assert(!is_static(pair.first));
@@ -675,6 +652,33 @@ void InstrumentPass::eval_pass(DexStoresVector& stores,
 
   set_no_opt_flag_on_analysis_methods(true, m_options.analysis_class_name,
                                       m_options.analysis_method_names);
+
+  // Make a small room for additional method refs during InterDex. We may
+  // introduce a new field. We introduce a type reference to the analysis class
+  // in each dex. We will introduce more method refs from analysis methods.
+
+  interdex::InterDexRegistry* registry =
+      static_cast<interdex::InterDexRegistry*>(
+          PluginRegistry::get().pass_registry(interdex::INTERDEX_PASS_NAME));
+
+  size_t max_analysis_methods;
+  if (m_options.instrumentation_strategy == SIMPLE_METHOD_TRACING) {
+    max_analysis_methods = m_options.num_shards;
+  } else if (m_options.instrumentation_strategy == BASIC_BLOCK_TRACING) {
+    // TODO: Derive this from the source.
+    // Our current DynamicAnalysis has 2 * 7 onMethodExits and 1 onMethodBegin.
+    max_analysis_methods = 15;
+  } else {
+    max_analysis_methods = 1;
+  }
+
+  m_plugin = std::unique_ptr<interdex::InterDexPassPlugin>(
+      new InstrumentInterDexPlugin(1, 1, max_analysis_methods));
+
+  registry->register_plugin("INSTRUMENT_PASS_PLUGIN", [this]() {
+    return new InstrumentInterDexPlugin(
+        *(InstrumentInterDexPlugin*)m_plugin.get());
+  });
 }
 
 // Check for inclusion in allow/block lists of methods/classes. It supports:
@@ -998,7 +1002,8 @@ void InstrumentPass::run_pass(DexStoresVector& stores,
 
   if (m_options.instrumentation_strategy == SIMPLE_METHOD_TRACING) {
     do_simple_method_tracing(analysis_cls, stores, cfg, pm, m_options);
-  } else if (m_options.instrumentation_strategy == BASIC_BLOCK_TRACING) {
+  } else if (m_options.instrumentation_strategy == BASIC_BLOCK_TRACING ||
+             m_options.instrumentation_strategy == BASIC_BLOCK_HIT_COUNT) {
     BlockInstrumentHelper::do_basic_block_tracing(analysis_cls, stores, cfg, pm,
                                                   m_options);
   } else {
@@ -1022,13 +1027,45 @@ void InstrumentPass::run_pass(DexStoresVector& stores,
   shrinker_config.run_const_prop = true;
   shrinker_config.run_local_dce = true;
   shrinker_config.compute_pure_methods = false;
+  if (m_options.apply_CSE_CopyProp) {
+    shrinker_config.run_cse = true;
+    shrinker_config.run_copy_prop = true;
+  }
+
+  std::unordered_set<const DexField*> finalish_fields;
+  if (m_options.apply_CSE_CopyProp) {
+    auto* field =
+        analysis_cls->find_field_from_simple_deobfuscated_name("sHitStats");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+
+    field =
+        analysis_cls->find_field_from_simple_deobfuscated_name("sIsEnabled");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+
+    field = analysis_cls->find_field_from_simple_deobfuscated_name(
+        "sNumStaticallyHitsInstrumented");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+
+    field = analysis_cls->find_field_from_simple_deobfuscated_name(
+        "sNumStaticallyInstrumented");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+  }
 
   init_classes::InitClassesWithSideEffects init_classes_with_side_effects(
       scope, cfg.create_init_class_insns());
 
   int min_sdk = pm.get_redex_options().min_sdk;
   shrinker::Shrinker shrinker(stores, scope, init_classes_with_side_effects,
-                              shrinker_config, min_sdk);
+                              shrinker_config, min_sdk, {}, {},
+                              finalish_fields);
 
   {
     Timer cleanup{"Parallel Cleanup"};

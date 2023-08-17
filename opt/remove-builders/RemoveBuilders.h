@@ -13,11 +13,21 @@ class RemoveBuildersPass : public Pass {
  public:
   RemoveBuildersPass() : Pass("RemoveBuildersPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+    };
+  }
+
   void bind_config() override {
     bind("enable_buildee_constr_change", false, m_enable_buildee_constr_change);
     bind("blocklist", {}, m_blocklist);
   }
 
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:

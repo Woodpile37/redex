@@ -104,9 +104,6 @@ void analyze_compare(const IRInstruction* insn, ConstantEnvironment* env) {
   }
 }
 
-bool is_zero(boost::optional<SignedConstantDomain> src) {
-  return src && src->get_constant() && *(src->get_constant()) == 0;
-}
 } // namespace
 
 namespace constant_propagation {
@@ -243,7 +240,7 @@ bool LocalArrayAnalyzer::analyze_new_array(const IRInstruction* insn,
     return false;
   }
   env->new_heap_value(RESULT_REGISTER, insn,
-                      ConstantPrimitiveArrayDomain(*length_value_opt));
+                      ConstantValueArrayDomain(*length_value_opt));
   return true;
 }
 
@@ -257,7 +254,7 @@ bool LocalArrayAnalyzer::analyze_aget(const IRInstruction* insn,
   if (!idx_opt) {
     return false;
   }
-  auto arr = env->get_pointee<ConstantPrimitiveArrayDomain>(insn->src(0));
+  auto arr = env->get_pointee<ConstantValueArrayDomain>(insn->src(0));
   env->set(RESULT_REGISTER, arr.get(*idx_opt));
   return true;
 }
@@ -272,7 +269,7 @@ bool LocalArrayAnalyzer::analyze_aput(const IRInstruction* insn,
   if (!idx_opt) {
     return false;
   }
-  auto val = env->get<SignedConstantDomain>(insn->src(0));
+  auto val = env->get(insn->src(0));
   env->set_array_binding(insn->src(1), *idx_opt, val);
   return true;
 }
@@ -331,8 +328,8 @@ bool PrimitiveAnalyzer::analyze_const(const IRInstruction* insn,
 
 bool PrimitiveAnalyzer::analyze_check_cast(const IRInstruction* insn,
                                            ConstantEnvironment* env) {
-  auto src = env->get(insn->src(0)).maybe_get<SignedConstantDomain>();
-  if (is_zero(src)) {
+  auto src = env->get(insn->src(0));
+  if (src.is_zero()) {
     env->set(RESULT_REGISTER, SignedConstantDomain(0));
     return true;
   }
@@ -341,8 +338,8 @@ bool PrimitiveAnalyzer::analyze_check_cast(const IRInstruction* insn,
 
 bool PrimitiveAnalyzer::analyze_instance_of(const IRInstruction* insn,
                                             ConstantEnvironment* env) {
-  auto src = env->get(insn->src(0)).maybe_get<SignedConstantDomain>();
-  if (is_zero(src)) {
+  auto src = env->get(insn->src(0));
+  if (src.is_zero()) {
     env->set(RESULT_REGISTER, SignedConstantDomain(0));
     return true;
   }
@@ -398,68 +395,60 @@ bool PrimitiveAnalyzer::analyze_binop_lit(
   if (cst) {
     bool use_result_reg = false;
     switch (op) {
-    case OPCODE_ADD_INT_LIT16:
-    case OPCODE_ADD_INT_LIT8: {
-      // add-int/lit8 is the most common arithmetic instruction: about .29% of
+    case OPCODE_ADD_INT_LIT: {
+      // add-int/lit is the most common arithmetic instruction: about .29% of
       // all instructions. All other arithmetic instructions are less than
       // .05%
       result = (*cst) + lit;
       break;
     }
-    case OPCODE_RSUB_INT:
-    case OPCODE_RSUB_INT_LIT8: {
+    case OPCODE_RSUB_INT_LIT: {
       result = lit - (*cst);
       break;
     }
-    case OPCODE_MUL_INT_LIT16:
-    case OPCODE_MUL_INT_LIT8: {
+    case OPCODE_MUL_INT_LIT: {
       result = (*cst) * lit;
       break;
     }
-    case OPCODE_DIV_INT_LIT16:
-    case OPCODE_DIV_INT_LIT8: {
+    case OPCODE_DIV_INT_LIT: {
       if (lit != 0) {
         result = (*cst) / lit;
       }
       use_result_reg = true;
       break;
     }
-    case OPCODE_REM_INT_LIT16:
-    case OPCODE_REM_INT_LIT8: {
+    case OPCODE_REM_INT_LIT: {
       if (lit != 0) {
         result = (*cst) % lit;
       }
       use_result_reg = true;
       break;
     }
-    case OPCODE_AND_INT_LIT16:
-    case OPCODE_AND_INT_LIT8: {
+    case OPCODE_AND_INT_LIT: {
       result = (*cst) & lit;
       break;
     }
-    case OPCODE_OR_INT_LIT16:
-    case OPCODE_OR_INT_LIT8: {
+    case OPCODE_OR_INT_LIT: {
       result = (*cst) | lit;
       break;
     }
-    case OPCODE_XOR_INT_LIT16:
-    case OPCODE_XOR_INT_LIT8: {
+    case OPCODE_XOR_INT_LIT: {
       result = (*cst) ^ lit;
       break;
     }
     // as in https://source.android.com/devices/tech/dalvik/dalvik-bytecode
     // the following operations have the second operand masked.
-    case OPCODE_SHL_INT_LIT8: {
+    case OPCODE_SHL_INT_LIT: {
       uint32_t ucst = *cst;
       uint32_t uresult = ucst << (lit & 0x1f);
       result = (int32_t)uresult;
       break;
     }
-    case OPCODE_SHR_INT_LIT8: {
+    case OPCODE_SHR_INT_LIT: {
       result = (*cst) >> (lit & 0x1f);
       break;
     }
-    case OPCODE_USHR_INT_LIT8: {
+    case OPCODE_USHR_INT_LIT: {
       uint32_t ucst = *cst;
       // defined in dalvik spec
       result = ucst >> (lit & 0x1f);
@@ -551,6 +540,15 @@ bool PrimitiveAnalyzer::analyze_binop(const IRInstruction* insn,
     return true;
   }
   return analyze_default(insn, env);
+}
+
+bool InjectionIdAnalyzer::analyze_injection_id(const IRInstruction* insn,
+                                               ConstantEnvironment* env) {
+  auto id = static_cast<int32_t>(insn->get_literal());
+  TRACE(CONSTP, 5, "Discovered new injection id for reg: %d value: %d",
+        insn->dest(), id);
+  env->set(insn->dest(), ConstantInjectionIdDomain(id));
+  return true;
 }
 
 bool ClinitFieldAnalyzer::analyze_sget(const DexType* class_under_init,
@@ -778,6 +776,131 @@ bool BoxedBooleanAnalyzer::analyze_invoke(
   }
 }
 
+bool StringAnalyzer::analyze_invoke(const IRInstruction* insn,
+                                    ConstantEnvironment* env) {
+  DexMethod* method =
+      resolve_method(insn->get_method(), opcode_to_search(insn));
+  if (method == nullptr) {
+    return false;
+  }
+
+  auto maybe_string = [&](int arg_idx) -> const DexString* {
+    auto value = env->get(insn->src(arg_idx));
+    if (value.is_top() || value.is_bottom()) {
+      return nullptr;
+    }
+    if (const auto& string_value_opt = value.maybe_get<StringDomain>()) {
+      return *string_value_opt->get_constant();
+    }
+    return nullptr;
+  };
+
+  if (method == method::java_lang_String_equals()) {
+    always_assert(insn->srcs_size() == 2);
+    if (const auto* arg0 = maybe_string(0)) {
+      if (const auto* arg1 = maybe_string(1)) {
+        // pointer comparison is okay, DexStrings are internalized
+        int64_t res = arg0 == arg1;
+        env->set(RESULT_REGISTER, SignedConstantDomain(res));
+        return true;
+      }
+    }
+  } else if (method == method::java_lang_String_hashCode()) {
+    always_assert(insn->srcs_size() == 1);
+    if (const auto* arg0 = maybe_string(0)) {
+      int64_t res = arg0->java_hashcode();
+      env->set(RESULT_REGISTER, SignedConstantDomain(res));
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool NewObjectAnalyzer::ignore_type(
+    const ImmutableAttributeAnalyzerState* state, DexType* type) {
+  // Avoid types that may interact other more specialized object domains.
+  if (state->may_be_initialized_type(type) ||
+      type == type::java_lang_String() || type == type::java_lang_Boolean()) {
+    return true;
+  }
+  auto cls = type_class(type);
+  return cls && is_enum(cls);
+}
+
+bool NewObjectAnalyzer::analyze_new_instance(
+    const ImmutableAttributeAnalyzerState* state,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  if (ignore_type(state, insn->get_type())) {
+    return false;
+  }
+  env->set(RESULT_REGISTER, NewObjectDomain(insn));
+  return true;
+}
+
+bool NewObjectAnalyzer::analyze_filled_new_array(
+    const ImmutableAttributeAnalyzerState* state,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  if (ignore_type(state, insn->get_type())) {
+    return false;
+  }
+  auto array_length = SignedConstantDomain(insn->srcs_size());
+  env->set(RESULT_REGISTER, NewObjectDomain(insn, array_length));
+  return true;
+}
+
+bool NewObjectAnalyzer::analyze_new_array(
+    const ImmutableAttributeAnalyzerState* state,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  if (ignore_type(state, insn->get_type())) {
+    return false;
+  }
+  boost::optional<SignedConstantDomain> array_length_opt =
+      env->get<SignedConstantDomain>(insn->src(0));
+  SignedConstantDomain array_length =
+      array_length_opt ? *array_length_opt : SignedConstantDomain::top();
+  array_length.meet_with(SignedConstantDomain(sign_domain::Interval::GEZ));
+  env->set(RESULT_REGISTER, NewObjectDomain(insn, array_length));
+  return true;
+}
+
+bool NewObjectAnalyzer::analyze_instance_of(
+    const ImmutableAttributeAnalyzerState*,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  auto new_obj_opt = env->get(insn->src(0)).maybe_get<NewObjectDomain>();
+  if (!new_obj_opt) {
+    return false;
+  }
+  auto obj_type = new_obj_opt->get_type();
+  if (!obj_type) {
+    return false;
+  }
+  auto cls = type_class(type::get_element_type_if_array(obj_type));
+  if (!cls || (cls->is_external() && obj_type != insn->get_type())) {
+    return false;
+  }
+  auto res = type::check_cast(obj_type, insn->get_type());
+  env->set(RESULT_REGISTER, SignedConstantDomain(res ? 1 : 0));
+  return true;
+}
+
+bool NewObjectAnalyzer::analyze_array_length(
+    const ImmutableAttributeAnalyzerState*,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  auto new_obj_opt = env->get(insn->src(0)).maybe_get<NewObjectDomain>();
+  if (!new_obj_opt) {
+    return false;
+  }
+  auto array_length = new_obj_opt->get_array_length();
+  env->set(RESULT_REGISTER, SignedConstantDomain(array_length));
+  return true;
+}
+
 ImmutableAttributeAnalyzerState::Initializer&
 ImmutableAttributeAnalyzerState::add_initializer(DexMethod* initialize_method,
                                                  DexMethod* attr) {
@@ -797,6 +920,7 @@ ImmutableAttributeAnalyzerState::add_initializer(DexMethod* initialize_method,
                   });
       });
   redex_assert(new_initializer);
+  initialized_types.insert(initialized_type(initialize_method));
   return *new_initializer;
 }
 
@@ -819,6 +943,7 @@ ImmutableAttributeAnalyzerState::add_initializer(DexMethod* initialize_method,
                   });
       });
   redex_assert(new_initializer);
+  initialized_types.insert(initialized_type(initialize_method));
   return *new_initializer;
 }
 
@@ -895,6 +1020,28 @@ DexType* ImmutableAttributeAnalyzerState::initialized_type(
              : initialize_method->get_proto()->get_rtype();
 }
 
+bool ImmutableAttributeAnalyzerState::may_be_initialized_type(
+    DexType* type) const {
+  auto res = may_be_initialized_types.get(type, std::nullopt);
+  if (!res) {
+    res = false;
+    for (auto* initialized_type : initialized_types) {
+      if (type::check_cast(type, initialized_type)) {
+        res = true;
+        break;
+      }
+    }
+    may_be_initialized_types.update(type, [&](auto*, auto& value, bool exists) {
+      if (exists) {
+        always_assert(value == res);
+      } else {
+        value = res;
+      }
+    });
+  }
+  return *res;
+}
+
 bool ImmutableAttributeAnalyzer::analyze_iget(
     const ImmutableAttributeAnalyzerState* state,
     const IRInstruction* insn,
@@ -904,7 +1051,10 @@ bool ImmutableAttributeAnalyzer::analyze_iget(
   if (!field) {
     field = static_cast<DexField*>(field_ref);
   }
-  if (!state->attribute_fields.count(field)) {
+
+  // Immutable state should not be updated in parallel with analysis.
+
+  if (!state->attribute_fields.count_unsafe(field)) {
     return false;
   }
   auto this_domain = env->get(insn->src(0));
@@ -942,9 +1092,12 @@ bool ImmutableAttributeAnalyzer::analyze_invoke(
     // Example: Integer.valueOf(I) is an external method.
     method = static_cast<DexMethod*>(method_ref);
   }
-  if (state->method_initializers.count(method)) {
+
+  // Immutable state should not be updated in parallel with analysis.
+
+  if (state->method_initializers.count_unsafe(method)) {
     return analyze_method_initialization(state, insn, env, method);
-  } else if (state->attribute_methods.count(method)) {
+  } else if (state->attribute_methods.count_unsafe(method)) {
     return analyze_method_attr(state, insn, env, method);
   }
   return false;
@@ -1193,31 +1346,33 @@ FixpointIterator::FixpointIterator(
     const cfg::ControlFlowGraph& cfg,
     InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
     bool imprecise_switches)
-    : MonotonicFixpointIterator(cfg),
+    : BaseEdgeAwareIRAnalyzer(cfg),
       m_insn_analyzer(std::move(insn_analyzer)),
       m_kotlin_null_check_assertions(get_kotlin_null_assertions()),
+      m_redex_null_check_assertion(method::redex_internal_checkObjectNotNull()),
       m_imprecise_switches(imprecise_switches) {}
 
-void FixpointIterator::analyze_instruction(const IRInstruction* insn,
-                                           ConstantEnvironment* env,
-                                           bool is_last) const {
-  TRACE(CONSTP, 5, "Analyzing instruction: %s", SHOW(insn));
+void FixpointIterator::analyze_instruction_normal(
+    const IRInstruction* insn, ConstantEnvironment* env) const {
   m_insn_analyzer(insn, env);
-  if (!is_last) {
-    analyze_instruction_no_throw(insn, env);
-  }
 }
 
-void FixpointIterator::analyze_instruction_no_throw(
-    const IRInstruction* insn, ConstantEnvironment* current_state) const {
+void FixpointIterator::analyze_no_throw(const IRInstruction* insn,
+                                        ConstantEnvironment* env) const {
   auto src_index = get_dereferenced_object_src_index(insn);
   if (!src_index) {
     src_index =
         get_null_check_object_index(insn, m_kotlin_null_check_assertions);
   }
   if (!src_index) {
-    return;
+    // Check if it is redex null check.
+    if (insn->opcode() != OPCODE_INVOKE_STATIC ||
+        insn->get_method() != m_redex_null_check_assertion) {
+      return;
+    }
+    src_index = 0;
   }
+
   if (insn->has_dest()) {
     auto dest = insn->dest();
     if ((dest == *src_index) ||
@@ -1226,19 +1381,9 @@ void FixpointIterator::analyze_instruction_no_throw(
     }
   }
   auto src = insn->src(*src_index);
-  auto value = current_state->get(src);
-  current_state->set(
-      src, meet(value, SignedConstantDomain(sign_domain::Interval::NEZ)));
-}
-
-void FixpointIterator::analyze_node(const NodeId& block,
-                                    ConstantEnvironment* state_at_entry) const {
-  TRACE(CONSTP, 5, "Analyzing block: %zu", block->id());
-  auto last_insn = block->get_last_insn();
-  for (auto& mie : InstructionIterable(block)) {
-    auto insn = mie.insn;
-    analyze_instruction(insn, state_at_entry, insn == last_insn->insn);
-  }
+  auto value = env->get(src);
+  value.meet_with(SignedConstantDomain(sign_domain::Interval::NEZ));
+  env->set(src, value);
 }
 
 /*
@@ -1304,13 +1449,13 @@ static SignedConstantDomain refine_ne_left(const SignedConstantDomain& left,
       if (*c >= left.max_element_int()) {
         return SignedConstantDomain::bottom();
       }
-      return SignedConstantDomain(*c + 1, left.max_element_int());
+      return left.meet(SignedConstantDomain(*c + 1, left.max_element_int()));
     }
     if (*c == left.max_element_int()) {
       if (*c <= left.min_element_int()) {
         return SignedConstantDomain::bottom();
       }
-      return SignedConstantDomain(left.min_element_int(), *c - 1);
+      return left.meet(SignedConstantDomain(left.min_element_int(), *c - 1));
     }
   }
   return left;
@@ -1321,12 +1466,13 @@ static SignedConstantDomain refine_ne_left(const SignedConstantDomain& left,
  * the environment, set the environment to bottom upon entry into the
  * unreachable block.
  */
-static void analyze_if(const IRInstruction* insn,
-                       ConstantEnvironment* env,
-                       bool is_true_branch) {
+void FixpointIterator::analyze_if(const IRInstruction* insn,
+                                  cfg::Edge* const& edge,
+                                  ConstantEnvironment* env) const {
   if (env->is_bottom()) {
     return;
   }
+  bool is_true_branch = edge->type() == cfg::EDGE_BRANCH;
   // Inverting the conditional here means that we only need to consider the
   // "true" case of the if-* opcode
   auto op = !is_true_branch ? opcode::invert_conditional_branch(insn->opcode())
@@ -1335,20 +1481,20 @@ static void analyze_if(const IRInstruction* insn,
   auto right =
       insn->srcs_size() > 1 ? env->get(insn->src(1)) : SignedConstantDomain(0);
   const IfZeroMeetWith& izmw = if_zero_meet_with.at(op);
-  if (right == SignedConstantDomain(0)) {
+  if (right.is_zero()) {
     env->set(insn->src(0),
-             meet(left, SignedConstantDomain(izmw.right_zero_meet_interval)));
+             left.meet(SignedConstantDomain(izmw.right_zero_meet_interval)));
     return;
   }
-  if (left == SignedConstantDomain(0)) {
+  if (left.is_zero()) {
     env->set(insn->src(1),
-             meet(right, SignedConstantDomain(*izmw.left_zero_meet_interval)));
+             right.meet(SignedConstantDomain(*izmw.left_zero_meet_interval)));
     return;
   }
 
   switch (op) {
   case OPCODE_IF_EQ: {
-    auto refined_value = meet(left, right);
+    auto refined_value = left.meet(right);
     env->set(insn->src(0), refined_value);
     env->set(insn->src(1), refined_value);
     break;
@@ -1438,67 +1584,52 @@ static void analyze_if(const IRInstruction* insn,
   }
 }
 
-ConstantEnvironment FixpointIterator::analyze_edge(
-    const EdgeId& edge, const ConstantEnvironment& exit_state_at_source) const {
-  auto env = exit_state_at_source;
-  auto last_insn_it = edge->src()->get_last_insn();
-  if (last_insn_it == edge->src()->end()) {
-    return env;
-  }
-
-  auto insn = last_insn_it->insn;
-  auto op = insn->opcode();
-  if (opcode::is_a_conditional_branch(op)) {
-    analyze_if(insn, &env, edge->type() == cfg::EDGE_BRANCH);
-  } else if (opcode::is_switch(op)) {
-    auto selector_val = env.get(insn->src(0));
-    const auto& case_key = edge->case_key();
-    if (case_key) {
-      always_assert(edge->type() == cfg::EDGE_BRANCH);
-      selector_val.meet_with(SignedConstantDomain(*case_key));
-      if (m_imprecise_switches) {
-        // We could refine the selector value itself, for maximum knowledge.
-        // However, in practice, this can cause following blocks to be refined
-        // with the constant, which then degrades subsequent block deduping.
-        if (selector_val.is_bottom()) {
-          env.set_to_bottom();
-          return env;
-        }
-      } else {
-        env.set(insn->src(0), selector_val);
+void FixpointIterator::analyze_switch(const IRInstruction* insn,
+                                      cfg::Edge* const& edge,
+                                      ConstantEnvironment* env) const {
+  auto selector_val = env->get(insn->src(0));
+  const auto& case_key = edge->case_key();
+  if (case_key) {
+    always_assert(edge->type() == cfg::EDGE_BRANCH);
+    selector_val.meet_with(SignedConstantDomain(*case_key));
+    if (m_imprecise_switches) {
+      // We could refine the selector value itself, for maximum knowledge.
+      // However, in practice, this can cause following blocks to be refined
+      // with the constant, which then degrades subsequent block deduping.
+      if (selector_val.is_bottom()) {
+        env->set_to_bottom();
+        return;
       }
     } else {
-      always_assert(edge->type() == cfg::EDGE_GOTO);
-      // We are looking at the fallthrough case. Set env to bottom in case there
-      // is a non-fallthrough edge with a case-key that is equal to the actual
-      // selector value.
-      auto scd = selector_val.maybe_get<SignedConstantDomain>();
-      if (!scd) {
-        return env;
-      }
-      auto selector_const = scd->get_constant();
-      if (selector_const &&
-          has_switch_consecutive_case_keys(edge->src(), *selector_const,
-                                           *selector_const)) {
-        env.set_to_bottom();
-        return env;
-      }
-      auto numeric_interval_domain = scd->numeric_interval_domain();
-      if (numeric_interval_domain.is_bottom()) {
-        return env;
-      }
-      auto lb = numeric_interval_domain.lower_bound();
-      auto ub = numeric_interval_domain.upper_bound();
-      if (lb > NumericIntervalDomain::MIN && ub < NumericIntervalDomain::MAX &&
-          has_switch_consecutive_case_keys(edge->src(), lb, ub)) {
-        env.set_to_bottom();
-        return env;
-      }
+      env->set(insn->src(0), selector_val);
     }
-  } else if (edge->type() != cfg::EDGE_THROW) {
-    analyze_instruction_no_throw(insn, &env);
+  } else {
+    always_assert(edge->type() == cfg::EDGE_GOTO);
+    // We are looking at the fallthrough case. Set env to bottom in case there
+    // is a non-fallthrough edge with a case-key that is equal to the actual
+    // selector value.
+    auto scd = selector_val.maybe_get<SignedConstantDomain>();
+    if (!scd) {
+      return;
+    }
+    auto selector_const = scd->get_constant();
+    if (selector_const && has_switch_consecutive_case_keys(
+                              edge->src(), *selector_const, *selector_const)) {
+      env->set_to_bottom();
+      return;
+    }
+    auto numeric_interval_domain = scd->numeric_interval_domain();
+    if (numeric_interval_domain.is_bottom()) {
+      return;
+    }
+    auto lb = numeric_interval_domain.lower_bound();
+    auto ub = numeric_interval_domain.upper_bound();
+    if (lb > NumericIntervalDomain::MIN && ub < NumericIntervalDomain::MAX &&
+        has_switch_consecutive_case_keys(edge->src(), lb, ub)) {
+      env->set_to_bottom();
+      return;
+    }
   }
-  return env;
 }
 
 } // namespace intraprocedural

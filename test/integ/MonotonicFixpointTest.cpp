@@ -5,8 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "MonotonicFixpointIterator.h"
-
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -16,6 +14,9 @@
 #include <memory>
 #include <sstream>
 
+#include <sparta/HashedSetAbstractDomain.h>
+#include <sparta/MonotonicFixpointIterator.h>
+
 #include "ControlFlow.h"
 #include "DexInstruction.h"
 #include "DexPosition.h"
@@ -24,8 +25,6 @@
 #include "IRInstruction.h"
 #include "RedexTest.h"
 #include "Show.h"
-
-#include "HashedSetAbstractDomain.h"
 
 using namespace sparta;
 
@@ -47,7 +46,7 @@ class IRFixpointIterator final
   using NodeId = cfg::Block*;
 
   explicit IRFixpointIterator(const cfg::ControlFlowGraph& cfg)
-      : MonotonicFixpointIterator(cfg, cfg.blocks().size()), m_cfg(cfg) {}
+      : MonotonicFixpointIterator(cfg, cfg.num_blocks()), m_cfg(cfg) {}
 
   void analyze_node(const NodeId& block,
                     LivenessDomain* current_state) const override {

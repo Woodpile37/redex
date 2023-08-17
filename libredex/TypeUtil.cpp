@@ -154,7 +154,7 @@ bool is_reference_array(const DexType* type) {
   return !is_primitive(ctype);
 }
 
-bool is_integer(const DexType* type) {
+bool is_integral(const DexType* type) {
   char sig = type->get_name()->c_str()[0];
   switch (sig) {
   case 'Z':
@@ -170,8 +170,22 @@ bool is_integer(const DexType* type) {
   }
 }
 
+bool is_int(const DexType* type) { return type->get_name()->c_str()[0] == 'I'; }
+
+bool is_char(const DexType* type) {
+  return type->get_name()->c_str()[0] == 'C';
+}
+
+bool is_short(const DexType* type) {
+  return type->get_name()->c_str()[0] == 'S';
+}
+
 bool is_boolean(const DexType* type) {
   return type->get_name()->c_str()[0] == 'Z';
+}
+
+bool is_byte(const DexType* type) {
+  return type->get_name()->c_str()[0] == 'B';
 }
 
 bool is_long(const DexType* type) {
@@ -246,10 +260,7 @@ std::string_view get_package_name(const DexType* type) {
 }
 
 bool same_package(const DexType* type1, const DexType* type2) {
-  auto package1 = get_package_name(type1);
-  auto package2 = get_package_name(type2);
-  auto min_len = std::min(package1.size(), package2.size());
-  return package1.compare(0, min_len, package2, 0, min_len) == 0;
+  return get_package_name(type1) == get_package_name(type2);
 }
 
 std::string get_simple_name(const DexType* type) {
@@ -451,11 +462,11 @@ bool is_uninstantiable_class(DexType* type) {
   }
 
   auto cls = type_class(type);
-  if (cls == nullptr || is_interface(cls) || is_native(cls) ||
-      cls->is_external() || !cls->rstate.can_delete()) {
+  if (cls == nullptr || is_interface(cls) || cls->is_external() ||
+      !cls->rstate.can_delete()) {
     return false;
   }
-  return !cls->has_ctors();
+  return is_abstract(cls) || !cls->has_ctors();
 }
 
 boost::optional<int32_t> evaluate_type_check(const DexType* src_type,

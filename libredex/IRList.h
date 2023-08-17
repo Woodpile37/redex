@@ -541,6 +541,9 @@ class IRList {
    */
   size_t sum_opcode_sizes() const;
 
+  // similar to sum_opcode_sizes, but takes into account non-opcode payloads
+  uint32_t estimate_code_units() const;
+
   /*
    * Returns the number of instructions.
    */
@@ -669,8 +672,12 @@ class InstructionIteratorImpl {
   InstructionIteratorImpl(const InstructionIteratorImpl<false>& rhs)
       : m_it(rhs.m_it), m_end(rhs.m_end) {}
 
-  InstructionIteratorImpl& operator=(const InstructionIteratorImpl& other) =
-      default;
+  InstructionIteratorImpl& operator=(
+      const InstructionIteratorImpl<false>& rhs) {
+    m_it = rhs.m_it;
+    m_end = rhs.m_end;
+    return *this;
+  }
 
   InstructionIteratorImpl& operator++() {
     ++m_it;

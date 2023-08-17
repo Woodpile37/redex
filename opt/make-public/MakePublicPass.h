@@ -18,5 +18,17 @@ class MakePublicPass : public Pass {
  public:
   MakePublicPass() : Pass("MakePublicPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},      {HasSourceBlocks, Preserves},
+        {NeedsEverythingPublic, Destroys}, {NoInitClassInstructions, Preserves},
+        {RenameClass, Preserves},
+    };
+  }
+
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 };

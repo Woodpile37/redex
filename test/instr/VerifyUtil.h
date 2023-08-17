@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <functional>
 #include <gtest/gtest.h>
 
 #include "DexClass.h"
@@ -42,11 +43,20 @@ struct PostVerify : public RedexTest {
                                         "post")) {}
 };
 
+// \returns -1 if no class with \name is found. Otherwise, \returns the the
+// class's idx in \classes list.
+int find_class_idx(const DexClasses& classes, const char* name);
+
 DexClass* find_class_named(const DexClasses& classes, const char* name);
+DexClass* find_class_named(const DexClasses& classes,
+                           const std::function<bool(const char*)>& matcher);
 DexField* find_ifield_named(const DexClass& cls, const char* name);
 DexField* find_sfield_named(const DexClass& cls, const char* name);
 DexField* find_field_named(const DexClass& cls, const char* name);
 DexMethod* find_vmethod_named(const DexClass& cls, const char* name);
+DexMethod* find_vmethod(const DexClass& cls,
+                        const char* name,
+                        const DexProto* proto);
 DexMethod* find_dmethod_named(const DexClass& cls, const char* name);
 DexMethod* find_method_named(const DexClass& cls, const char* name);
 /* Find the first invoke instruction that calls a particular method name */
@@ -61,7 +71,13 @@ DexOpcodeMethod* find_invoke(std::vector<DexInstruction*>::iterator begin,
                              DexType* receiver = nullptr);
 DexInstruction* find_instruction(DexMethod* m, DexOpcode opcode);
 
-void verify_type_erased(const DexClass* cls, size_t num_dmethods = 0);
+/* Find the number of invoke instructions that calls a particular method name */
+size_t find_num_invoke(const DexMethod* m,
+                       DexOpcode opcode,
+                       const char* target_mname,
+                       DexType* receiver = nullptr);
+
+void verify_class_merged(const DexClass* cls, size_t num_dmethods = 0);
 
 // A quick helper to dump CFGs before/after verify
 //

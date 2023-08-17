@@ -19,6 +19,7 @@
 #include "DexUtil.h"
 #include "GraphUtil.h"
 #include "IRList.h"
+#include "InstructionLowering.h"
 #include "RedexContext.h"
 #include "Show.h"
 #include "SourceBlocks.h"
@@ -264,15 +265,15 @@ void Block::remove_insn(const IRList::iterator& it) {
   remove_insn(to_cfg_instruction_iterator(it));
 }
 
-void Block::remove_mie(const IRList::iterator& it) {
+IRList::iterator Block::remove_mie(const IRList::iterator& it) {
   if (it->type == MFLOW_OPCODE) {
     m_parent->m_removed_insns.push_back(it->insn);
   }
 
-  m_entries.erase_and_dispose(it);
+  return m_entries.erase_and_dispose(it);
 }
 
-opcode::Branchingness Block::branchingness() {
+opcode::Branchingness Block::branchingness() const {
   // TODO (cnli): put back 'always_assert(m_parent->editable());'
   // once ModelMethodMerger::sink_common_ctor_to_return_block update
   // to editable CFG.
@@ -317,6 +318,22 @@ uint32_t Block::num_opcodes() const {
 uint32_t Block::sum_opcode_sizes() const {
   always_assert(m_parent->editable());
   return m_entries.sum_opcode_sizes();
+}
+
+uint32_t Block::estimate_code_units() const {
+  always_assert(m_parent->editable());
+  auto code_units = m_entries.estimate_code_units();
+  auto it = get_last_insn();
+  if (it != end() && opcode::is_switch(it->insn->opcode())) {
+    instruction_lowering::CaseKeysExtentBuilder case_keys;
+    for (auto* e : succs()) {
+      if (e->type() == EDGE_BRANCH) {
+        case_keys.insert(*e->case_key());
+      }
+    }
+    code_units += case_keys->estimate_switch_payload_code_units();
+  }
+  return code_units;
 }
 
 // shallowly copy pointers (edges and parent cfg)
@@ -377,7 +394,30 @@ IRList::iterator Block::get_last_insn() {
   return end();
 }
 
+IRList::const_iterator Block::get_last_insn() const {
+  for (auto it = rbegin(); it != rend(); ++it) {
+    if (it->type == MFLOW_OPCODE) {
+      // Reverse iterators have a member base() which returns a corresponding
+      // forward iterator. Beware that this isn't an iterator that refers to the
+      // same object - it actually refers to the next object in the sequence.
+      // This is so that rbegin() corresponds with end() and rend() corresponds
+      // with begin(). Copied from https://stackoverflow.com/a/2037917
+      return std::prev(it.base());
+    }
+  }
+  return end();
+}
+
 IRList::iterator Block::get_first_insn() {
+  for (auto it = begin(); it != end(); ++it) {
+    if (it->type == MFLOW_OPCODE) {
+      return it;
+    }
+  }
+  return end();
+}
+
+IRList::const_iterator Block::get_first_insn() const {
   for (auto it = begin(); it != end(); ++it) {
     if (it->type == MFLOW_OPCODE) {
       return it;
@@ -398,8 +438,36 @@ IRList::iterator Block::get_first_non_param_loading_insn() {
   return end();
 }
 
+IRList::const_iterator Block::get_first_non_param_loading_insn() const {
+  for (auto it = begin(); it != end(); ++it) {
+    if (it->type != MFLOW_OPCODE) {
+      continue;
+    }
+    if (!opcode::is_a_load_param(it->insn->opcode())) {
+      return it;
+    }
+  }
+  return end();
+}
+
 IRList::iterator Block::get_last_param_loading_insn() {
   IRList::iterator res = end();
+  for (auto it = begin(); it != end(); ++it) {
+    if (it->type != MFLOW_OPCODE) {
+      continue;
+    }
+    if (opcode::is_a_load_param(it->insn->opcode())) {
+      res = it;
+    } else {
+      // There won't be another one.
+      break;
+    }
+  }
+  return res;
+}
+
+IRList::const_iterator Block::get_last_param_loading_insn() const {
+  IRList::const_iterator res = end();
   for (auto it = begin(); it != end(); ++it) {
     if (it->type != MFLOW_OPCODE) {
       continue;
@@ -428,7 +496,21 @@ IRList::iterator Block::get_first_insn_before_position() {
   return end();
 }
 
-bool Block::starts_with_move_result() {
+IRList::const_iterator Block::get_first_insn_before_position() const {
+  for (auto it = begin(); it != end(); ++it) {
+    if (it->type == MFLOW_OPCODE) {
+      auto op = it->insn->opcode();
+      if (!opcode::is_move_result_any(op) && !opcode::is_goto(op)) {
+        return it;
+      }
+    } else if (it->type == MFLOW_POSITION) {
+      return end();
+    }
+  }
+  return end();
+}
+
+bool Block::starts_with_move_result() const {
   auto first_it = get_first_insn();
   if (first_it != end()) {
     auto first_op = first_it->insn->opcode();
@@ -439,7 +521,7 @@ bool Block::starts_with_move_result() {
   return false;
 }
 
-bool Block::starts_with_move_exception() {
+bool Block::starts_with_move_exception() const {
   auto first_it = get_first_insn();
   if (first_it != end()) {
     auto first_op = first_it->insn->opcode();
@@ -450,7 +532,7 @@ bool Block::starts_with_move_exception() {
   return false;
 }
 
-bool Block::contains_opcode(IROpcode opcode) {
+bool Block::contains_opcode(IROpcode opcode) const {
   for (auto it = begin(); it != end(); ++it) {
     if (it->type != MFLOW_OPCODE) {
       continue;
@@ -462,9 +544,9 @@ bool Block::contains_opcode(IROpcode opcode) {
   return false;
 }
 
-bool Block::begins_with(Block* other) {
-  IRList::iterator self_it = this->begin();
-  IRList::iterator other_it = other->begin();
+bool Block::begins_with(Block* other) const {
+  IRList::const_iterator self_it = this->begin();
+  IRList::const_iterator other_it = other->begin();
 
   while (self_it != this->end() && other_it != other->end()) {
     if (*self_it != *other_it) {
@@ -1360,6 +1442,41 @@ uint32_t ControlFlowGraph::sum_opcode_sizes() const {
   return result;
 }
 
+// similar to sum_opcode_sizes, but takes into account non-opcode payloads
+uint32_t ControlFlowGraph::estimate_code_units() const {
+  uint32_t code_units = 0;
+  for (const auto& entry : m_blocks) {
+    code_units += entry.second->estimate_code_units();
+  }
+  return code_units;
+}
+
+uint32_t ControlFlowGraph::get_size_adjustment(
+    bool assume_no_unreachable_blocks) {
+  auto ordering =
+      order(/* custom_strategy */ nullptr, assume_no_unreachable_blocks);
+  uint32_t adjustment{0};
+  for (auto it = ordering.begin(); it != ordering.end(); ++it) {
+    cfg::Block* b = *it;
+
+    for (const cfg::Edge* edge : b->succs()) {
+      if (edge->type() == cfg::EDGE_GOTO) {
+        auto next_it = std::next(it);
+        if (next_it != ordering.end()) {
+          cfg::Block* next = *next_it;
+          if (edge->target() == next) {
+            // Don't need a goto because this will fall through to `next`
+            continue;
+          }
+        }
+        // We need a goto
+        adjustment++;
+      }
+    }
+  }
+  return adjustment;
+}
+
 Block* ControlFlowGraph::get_first_block_with_insns() const {
   always_assert(editable());
   Block* block = entry_block();
@@ -1631,9 +1748,12 @@ ConstInstructionIterator ControlFlowGraph::find_insn(IRInstruction* insn,
 }
 
 std::vector<Block*> ControlFlowGraph::order(
-    const std::unique_ptr<LinearizationStrategy>& custom_strategy) {
-  // We must simplify first to remove any unreachable blocks
-  simplify();
+    const std::unique_ptr<LinearizationStrategy>& custom_strategy,
+    bool assume_no_unreachable_blocks) {
+  if (!assume_no_unreachable_blocks) {
+    // We must simplify first to remove any unreachable blocks
+    simplify();
+  }
 
   // This is a modified Weak Topological Ordering (WTO). We create "chains" of
   // blocks that will be kept together, then feed these chains to WTO for it to
@@ -1653,7 +1773,7 @@ std::vector<Block*> ControlFlowGraph::order(
                                 : wto_chains(std::move(wto));
 
   always_assert_log(result.size() == m_blocks.size(),
-                    "result has %lu blocks, m_blocks has %lu", result.size(),
+                    "result has %zu blocks, m_blocks has %zu", result.size(),
                     m_blocks.size());
 
   // The entry block must always be first.
@@ -1810,7 +1930,7 @@ std::vector<Block*> ControlFlowGraph::wto_chains(
     sparta::WeakTopologicalOrdering<BlockChain*> wto) {
 
   std::vector<Block*> main_order;
-  main_order.reserve(this->blocks().size());
+  main_order.reserve(this->num_blocks());
 
   auto chain_order = [&main_order](BlockChain* c) {
     for (Block* b : *c) {
@@ -2547,7 +2667,7 @@ void ControlFlowGraph::insert_block(Block* pred,
                       "invalid block insertion\n");
     to_move.push_back(e);
   }
-  always_assert_log(to_move.size() >= 1,
+  always_assert_log(!to_move.empty(),
                     "Can't insert a block between 2 disconnected blocks\n");
   // Redirect the edges from succ to inserted_block.
   for (auto e : to_move) {

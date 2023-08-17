@@ -7,10 +7,11 @@
 
 #pragma once
 
+#include <sparta/PatriciaTreeSet.h>
+
 #include "ConcurrentContainers.h"
 #include "IROpcode.h"
 #include "MethodOverrideGraph.h"
-#include "PatriciaTreeSet.h"
 #include "Purity.h"
 
 class DexField;
@@ -71,7 +72,8 @@ class SharedState {
  public:
   explicit SharedState(
       const std::unordered_set<DexMethodRef*>& pure_methods,
-      const std::unordered_set<const DexString*>& finalish_field_names);
+      const std::unordered_set<const DexString*>& finalish_field_names,
+      const std::unordered_set<const DexField*>& finalish_fields);
   void init_scope(const Scope&,
                   const method::ClInitHasNoSideEffectsPredicate&
                       clinit_has_no_side_effects);
@@ -120,6 +122,7 @@ class SharedState {
   // subset of safe methods which are in fact defs
   std::unordered_set<const DexMethod*> m_safe_method_defs;
   const std::unordered_set<const DexString*>& m_finalish_field_names;
+  const std::unordered_set<const DexField*>& m_finalish_fields;
   std::unordered_set<const DexField*> m_finalizable_fields;
   std::unique_ptr<ConcurrentMap<Barrier, size_t, BarrierHasher>> m_barriers;
   std::unordered_map<const DexMethod*, CseUnorderedLocationSet>

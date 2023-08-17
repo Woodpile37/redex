@@ -7,7 +7,7 @@
 
 package com.facebook.redexinline;
 
-import static org.fest.assertions.api.Assertions.*;
+import static org.assertj.core.api.Assertions.*;
 import com.facebook.redexinline.otherpackage.MethodInlineOtherPackage;
 import android.util.Log;
 import android.os.Build;
@@ -420,7 +420,7 @@ public class MethodInlineTest {
       return 1;
     }
 
-    @android.support.annotation.RequiresApi(Build.VERSION_CODES.N)
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.N)
     public static int shouldNotInlineOintoN() {
       return NeedsAndroidO.useApiO();
     }

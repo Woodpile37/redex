@@ -75,7 +75,6 @@ struct Location {
     return t == 'J' || t == 'D' ? 2 : 1;
   }
 
- private:
   Location(DexType* t, reg_t pos) : type(t), reg(pos) {}
 
   DexType* type;
@@ -248,14 +247,10 @@ struct MethodBlock {
   // Helper
   void init_loc(Location& loc);
 
-  void binop_lit16(IROpcode op,
-                   const Location& dest,
-                   const Location& src,
-                   int16_t literal);
-  void binop_lit8(IROpcode op,
-                  const Location& dest,
-                  const Location& src,
-                  int8_t literal);
+  void binop_lit(IROpcode op,
+                 const Location& dest,
+                 const Location& src,
+                 int16_t literal);
 
   //
   // branch instruction
@@ -370,7 +365,6 @@ struct MethodBlock {
   MethodBlock* make_switch_block(IRInstruction* insn,
                                  std::map<SwitchIndices, MethodBlock*>& cases);
 
- private:
   MethodCreator* mc;
   // A MethodBlock is simply an iterator over an IRList used to emit
   // instructions
@@ -403,6 +397,9 @@ struct MethodCreator {
                 std::unique_ptr<DexAnnotationSet> anno = nullptr,
                 bool with_debug_item = true);
 
+  MethodCreator(MethodCreator&&) noexcept = default;
+  MethodCreator& operator=(MethodCreator&&) noexcept = default;
+
   /**
    * Get an existing local.
    */
@@ -433,7 +430,6 @@ struct MethodCreator {
    */
   DexMethod* create();
 
- public:
   /**
    * Transfer code from a given method to a static with the same signature
    * in the given class.
@@ -489,7 +485,6 @@ struct MethodCreator {
       IRList::iterator* default_block,
       std::map<SwitchIndices, IRList::iterator>& cases);
 
- private:
   DexMethod* method;
   IRCode* meth_code;
   std::vector<Location> locals;
@@ -521,7 +516,7 @@ struct ClassCreator {
     m_cls->m_source_file = nullptr;
     m_cls->m_anno = nullptr;
     m_cls->m_external = false;
-    m_cls->m_perf_sensitive = false;
+    m_cls->m_perf_sensitive = PerfSensitiveGroup::NONE;
     m_cls->set_deobfuscated_name(type->get_name()->c_str());
   }
 

@@ -163,6 +163,12 @@ DexTypeList* DexTypeList::pop_front(size_t n) const {
   return make_type_list(std::move(new_list));
 }
 
+DexTypeList* DexTypeList::pop_back(size_t n) const {
+  redex_assert(m_list.size() >= n);
+  ContainerType new_list{m_list.begin(), m_list.end() - n};
+  return make_type_list(std::move(new_list));
+}
+
 DexTypeList* DexTypeList::push_back(DexType* t) const {
   ContainerType new_list{m_list};
   new_list.push_back(t);
@@ -388,7 +394,9 @@ static std::vector<DexDebugEntry> eval_debug_instructions(
       uint8_t adjustment = op - DBG_FIRST_SPECIAL;
       absolute_line += DBG_LINE_BASE + (adjustment % DBG_LINE_RANGE);
       pc += adjustment / DBG_LINE_RANGE;
-      entries.emplace_back(pc, std::make_unique<DexPosition>(absolute_line));
+      entries.emplace_back(
+          pc, std::make_unique<DexPosition>(
+                  DexString::make_string("UnknownSource"), absolute_line));
       break;
     }
     }
@@ -475,9 +483,9 @@ std::vector<std::unique_ptr<DexDebugInstruction>> generate_debug_instructions(
     for (; it != entries.end() && it->addr == addr; ++it) {
       switch (it->type) {
       case DexDebugEntryType::Position:
-        if (it->pos->file != nullptr) {
-          positions.push_back(it->pos.get());
-        }
+        always_assert_log(it->pos->file != nullptr,
+                          "Position file has nullptr");
+        positions.push_back(it->pos.get());
         break;
       case DexDebugEntryType::Instruction:
         insns.push_back(it->insn.get());
@@ -559,7 +567,11 @@ void DexDebugItem::bind_positions(DexMethod* method, const DexString* file) {
   for (auto& entry : m_dbg_entries) {
     switch (entry.type) {
     case DexDebugEntryType::Position:
-      entry.pos->bind(method_str, file);
+      if (file) {
+        entry.pos->bind(method_str, file);
+      } else {
+        entry.pos->bind(method_str);
+      }
       break;
     case DexDebugEntryType::Instruction:
       break;
@@ -609,7 +621,7 @@ DexCode::~DexCode() {
 
 std::unique_ptr<DexCode> DexCode::get_dex_code(DexIdx* idx, uint32_t offset) {
   if (offset == 0) return std::unique_ptr<DexCode>();
-  const dex_code_item* code = (const dex_code_item*)idx->get_uint_data(offset);
+  const dex_code_item* code = idx->get_data<dex_code_item>(offset);
   std::unique_ptr<DexCode> dc(new DexCode());
   dc->m_registers_size = code->registers_size;
   dc->m_ins_size = code->ins_size;
@@ -621,6 +633,8 @@ std::unique_ptr<DexCode> DexCode::get_dex_code(DexIdx* idx, uint32_t offset) {
     // On average there seem to be about two code units per instruction
     dc->m_insns->reserve(code->insns_size / 2);
     const uint16_t* end = cdata + code->insns_size;
+    always_assert(cdata <= end);
+    always_assert((uint8_t*)(end) <= idx->end());
     while (cdata < end) {
       DexInstruction* dop = DexInstruction::make_instruction(idx, &cdata);
       always_assert_log(dop != nullptr,
@@ -638,6 +652,8 @@ std::unique_ptr<DexCode> DexCode::get_dex_code(DexIdx* idx, uint32_t offset) {
 
   if (tries) {
     const dex_tries_item* dti = (const dex_tries_item*)cdata;
+    always_assert(dti <= dti + tries);
+    always_assert((uint8_t*)(dti + tries) <= idx->end());
     const uint8_t* handlers = (const uint8_t*)(dti + tries);
     for (uint32_t i = 0; i < tries; i++) {
       DexTryItem* dextry = new DexTryItem(dti[i].start_addr, dti[i].insn_count);
@@ -881,12 +897,12 @@ DexMethodRef* DexMethod::make_method(
     const std::string& return_type) {
   DexTypeList::ContainerType dex_types;
   for (const std::string& type_str : arg_types) {
-    dex_types.push_back(DexType::make_type(type_str.c_str()));
+    dex_types.push_back(DexType::make_type(type_str));
   }
   return DexMethod::make_method(
-      DexType::make_type(class_type.c_str()),
+      DexType::make_type(class_type),
       DexString::make_string(name),
-      DexProto::make_proto(DexType::make_type(return_type.c_str()),
+      DexProto::make_proto(DexType::make_type(return_type),
                            DexTypeList::make_type_list(std::move(dex_types))));
 }
 
@@ -1029,13 +1045,6 @@ void DexClass::remove_method(const DexMethod* m) {
     meths.erase(it);
   }
   redex_assert(erased);
-}
-
-void DexClass::remove_method_definition(DexMethod* m) {
-  remove_method(m);
-  // Virtually delete the definition of the method.
-  m->m_concrete = false;
-  m->release_code();
 }
 
 void DexMethod::become_virtual() {
@@ -1383,10 +1392,12 @@ int DexClass::encode(DexOutputIdx* dodx,
 void DexClass::load_class_annotations(DexIdx* idx, uint32_t anno_off) {
   if (anno_off == 0) return;
   const dex_annotations_directory_item* annodir =
-      (const dex_annotations_directory_item*)idx->get_uint_data(anno_off);
+      idx->get_data<dex_annotations_directory_item>(anno_off);
   m_anno =
       DexAnnotationSet::get_annotation_set(idx, annodir->class_annotations_off);
   const uint32_t* annodata = (uint32_t*)(annodir + 1);
+  always_assert(annodata <= annodata + annodir->fields_size * 2);
+  always_assert((uint8_t*)(annodata + annodir->fields_size * 2) <= idx->end());
   for (uint32_t i = 0; i < annodir->fields_size; i++) {
     uint32_t fidx = *annodata++;
     uint32_t off = *annodata++;
@@ -1394,6 +1405,8 @@ void DexClass::load_class_annotations(DexIdx* idx, uint32_t anno_off) {
     auto aset = DexAnnotationSet::get_annotation_set(idx, off);
     field->attach_annotation_set(std::move(aset));
   }
+  always_assert(annodata <= annodata + annodir->methods_size * 2);
+  always_assert((uint8_t*)(annodata + annodir->methods_size * 2) <= idx->end());
   for (uint32_t i = 0; i < annodir->methods_size; i++) {
     uint32_t midx = *annodata++;
     uint32_t off = *annodata++;
@@ -1401,6 +1414,9 @@ void DexClass::load_class_annotations(DexIdx* idx, uint32_t anno_off) {
     auto aset = DexAnnotationSet::get_annotation_set(idx, off);
     method->attach_annotation_set(std::move(aset));
   }
+  always_assert(annodata <= annodata + annodir->parameters_size * 2);
+  always_assert((uint8_t*)(annodata + annodir->parameters_size * 2) <=
+                idx->end());
   for (uint32_t i = 0; i < annodir->parameters_size; i++) {
     uint32_t midx = *annodata++;
     uint32_t xrefoff = *annodata++;
@@ -1408,6 +1424,8 @@ void DexClass::load_class_annotations(DexIdx* idx, uint32_t anno_off) {
       DexMethod* method = static_cast<DexMethod*>(idx->get_methodidx(midx));
       const uint32_t* annoxref = idx->get_uint_data(xrefoff);
       uint32_t count = *annoxref++;
+      always_assert(annoxref <= annoxref + count);
+      always_assert((uint8_t*)(annoxref + count) <= idx->end());
       for (uint32_t j = 0; j < count; j++) {
         uint32_t off = annoxref[j];
         auto aset = DexAnnotationSet::get_annotation_set(idx, off);
@@ -1555,7 +1573,7 @@ DexClass::DexClass(DexIdx* idx,
       m_location(location),
       m_access_flags((DexAccessFlags)cdef->access_flags),
       m_external(false),
-      m_perf_sensitive(false) {}
+      m_perf_sensitive(PerfSensitiveGroup::NONE) {}
 
 DexClass::~DexClass() = default; // For forwarding.
 
@@ -1780,23 +1798,6 @@ void DexClass::gather_methods(C& lmethod) const {
   }
 }
 INSTANTIATE(DexClass::gather_methods, DexMethodRef*)
-
-size_t DexClass::estimated_size() const {
-  // These values are derived from the size of metadata for each class or field.
-  constexpr size_t base_size = 48;
-  constexpr size_t field_size = 8;
-
-  size_t size =
-      base_size + field_size * (get_ifields().size() + get_sfields().size());
-  for (const auto m : get_vmethods()) {
-    size += m->estimated_size();
-  }
-
-  for (const auto m : get_dmethods()) {
-    size += m->estimated_size();
-  }
-  return size;
-}
 
 const DexField* DexFieldRef::as_def() const {
   if (is_def()) {
@@ -2128,21 +2129,27 @@ DexProto* DexType::get_non_overlapping_proto(const DexString* method_name,
 void DexMethod::add_load_params(size_t num_add_loads) {
   IRCode* code = this->get_code();
   always_assert_log(code, "Method don't have IRCode\n");
-  auto callee_params = code->get_param_instructions();
+  always_assert_log(code->editable_cfg_built(),
+                    "should be edtiable cfg here\n");
+  auto& cfg = code->cfg();
+  auto block = cfg.entry_block();
+  auto last_loading = block->get_last_param_loading_insn();
   size_t added_params = 0;
   while (added_params < num_add_loads) {
     ++added_params;
-    auto temp = code->allocate_temp();
+    auto temp = cfg.allocate_temp();
     IRInstruction* new_param_load = new IRInstruction(IOPCODE_LOAD_PARAM);
     new_param_load->set_dest(temp);
-    code->insert_before(callee_params.end(), new_param_load);
+    if (last_loading != block->end()) {
+      cfg.insert_after(block->to_cfg_instruction_iterator(last_loading),
+                       new_param_load);
+    } else {
+      cfg.insert_before(block->to_cfg_instruction_iterator(
+                            block->get_first_non_param_loading_insn()),
+                        new_param_load);
+    }
+    last_loading = block->get_last_param_loading_insn();
   }
-}
-
-size_t DexMethod::estimated_size() const {
-  constexpr size_t method_metadata_size = 20;
-  return method_metadata_size +
-         (get_code() ? get_code()->sum_opcode_sizes() : 0);
 }
 
 void gather_components(std::vector<const DexString*>& lstring,

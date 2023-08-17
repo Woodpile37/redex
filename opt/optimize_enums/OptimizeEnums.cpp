@@ -7,16 +7,25 @@
 
 #include "OptimizeEnums.h"
 
+#include <algorithm>
+#include <fstream>
+#include <ostream>
+#include <set>
+#include <sstream>
+#include <unordered_set>
+
 #include "ClassAssemblingUtils.h"
 #include "ConfigFiles.h"
+#include "DexClass.h"
 #include "EnumAnalyzeGeneratedMethods.h"
 #include "EnumClinitAnalysis.h"
-#include "EnumInSwitch.h"
 #include "EnumTransformer.h"
 #include "EnumUpcastAnalysis.h"
 #include "IRCode.h"
 #include "MatchFlow.h"
 #include "OptimizeEnumsAnalysis.h"
+#include "OptimizeEnumsUnmap.h"
+#include "OptimizeEnumsUnsafeType.h"
 #include "PassManager.h"
 #include "ProguardMap.h"
 #include "Resolver.h"
@@ -26,8 +35,8 @@
 
 /**
  * 1. The pass tries to remove synthetic switch map classes for enums
- * completely, by replacing the access to thelookup table with the use of the
- * enum ordinal itself.
+ * completely, by replacing the access to the lookup table with the use
+ * of the enum ordinal itself.
  * Background of synthetic switch map classes:
  *   javac converts enum switches to a packed switch. In order to do this, for
  *   every use of an enum in a switch statement, an anonymous class is generated
@@ -40,29 +49,17 @@
 
 namespace {
 
+using namespace optimize_enums;
+
 // Map the field holding the lookup table to its associated enum type.
 using LookupTableToEnum = std::unordered_map<DexField*, DexType*>;
-
-// Map the static fields holding enumerands to their ordinal number (passed in
-// to their constructor).
-using EnumFieldToOrdinal = std::unordered_map<DexField*, size_t>;
 
 // Sets of types.  Intended to be sub-classes of Ljava/lang/Enum; but not
 // guaranteed by the type.
 using EnumTypes = std::unordered_set<DexType*>;
 
-// Lookup tables in generated classes map enum ordinals to the integers they
-// are represented by in switch statements using that lookup table:
-//
-//   lookup[enum.ordinal()] = case;
-//
-// GeneratedSwitchCases represent the reverse mapping for a lookup table:
-//
-//   gsc[lookup][case] = enum
-//
-// with lookup and enum identified by their fields.
-using GeneratedSwitchCases =
-    std::unordered_map<DexField*, std::unordered_map<size_t, DexField*>>;
+using GeneratedSwitchCases = optimize_enums::GeneratedSwitchCases;
+using EnumFieldToOrdinal = optimize_enums::EnumFieldToOrdinal;
 
 constexpr const char* METRIC_NUM_SYNTHETIC_CLASSES = "num_synthetic_classes";
 constexpr const char* METRIC_NUM_LOOKUP_TABLES = "num_lookup_tables";
@@ -136,7 +133,7 @@ bool analyze_enum_ctors(
 
   // TODO: We could order them instead of looping ...
   for (; !delegating_calls.empty(); delegating_calls.pop()) {
-    auto dc = std::move(delegating_calls.front());
+    auto dc = delegating_calls.front();
 
     auto* delegate =
         resolve_method(dc.invoke->get_method(), MethodSearch::Direct);
@@ -145,7 +142,7 @@ bool analyze_enum_ctors(
     { // Only proceed if the delegate constructor has already been processed.
       auto it = ctor_to_arg_ordinal.find(delegate);
       if (it == ctor_to_arg_ordinal.end()) {
-        delegating_calls.emplace(std::move(dc));
+        delegating_calls.emplace(dc);
         continue;
       } else {
         delegate_ordinal = it->second;
@@ -221,19 +218,19 @@ void collect_generated_switch_cases(
                      MethodSearch::Virtual);
   always_assert(Enum_ordinal);
 
-  auto m__generated_field = m::has_field(
+  auto m_generated_field = m::has_field(
       m::member_of<DexFieldRef>(m::equals(generated_cls->get_type())));
-  auto m__lookup = m::sget_object_(m__generated_field) || m::new_array_();
-  auto m__sget_enum = m::sget_object_(m::has_field(
+  auto m_lookup = m::sget_object_(m_generated_field) || m::new_array_();
+  auto m_sget_enum = m::sget_object_(m::has_field(
       m::member_of<DexFieldRef>(m::in<DexType*>(collected_enums))));
-  auto m__invoke_ordinal = m::invoke_virtual_(m::has_method(
+  auto m_invoke_ordinal = m::invoke_virtual_(m::has_method(
       m::resolve_method(MethodSearch::Virtual, m::equals(Enum_ordinal))));
 
   auto uniq = mf::alias | mf::unique;
-  auto look = f.insn(m__lookup);
-  auto gete = f.insn(m__sget_enum);
+  auto look = f.insn(m_lookup);
+  auto gete = f.insn(m_sget_enum);
   auto kase = f.insn(m::const_());
-  auto ordi = f.insn(m__invoke_ordinal).src(0, gete, uniq);
+  auto ordi = f.insn(m_invoke_ordinal).src(0, gete, uniq);
   auto aput = f.insn(m::aput_())
                   .src(0, kase, uniq)
                   .src(1, look, uniq)
@@ -253,10 +250,10 @@ void collect_generated_switch_cases(
   if (!new_array_to_sput.empty()) {
     mf::flow_t g;
 
-    auto m__sput_lookup = m::sput_object_(m__generated_field);
+    auto m_sput_lookup = m::sput_object_(m_generated_field);
 
     auto newa = g.insn(m::in<IRInstruction*>(new_array_to_sput));
-    auto sput = g.insn(m__sput_lookup).src(0, newa, uniq);
+    auto sput = g.insn(m_sput_lookup).src(0, newa, uniq);
 
     auto res_sputs = g.find(clinit_cfg, sput);
     for (auto* insn_sput : res_sputs.matching(sput)) {
@@ -311,6 +308,15 @@ class OptimizeEnums {
       : m_stores(stores), m_pg_map(conf.get_proguard_map()) {
     m_scope = build_class_scope(stores);
     m_java_enum_ctor = get_java_enum_ctor();
+
+    // Collect number of all enum classes.
+    std::atomic<size_t> cnt{0};
+    walk::parallel::classes(m_scope, [&](auto* klass) {
+      if (is_enum(klass) && !klass->is_external()) {
+        ++cnt;
+      }
+    });
+    m_stats.num_all_enum_classes = cnt.load();
   }
 
   void remove_redundant_generated_classes() {
@@ -359,14 +365,19 @@ class OptimizeEnums {
            m_stats.num_candidate_generated_methods);
     report(METRIC_NUM_REMOVED_GENERATED_METHODS,
            m_stats.num_removed_generated_methods);
+    report("num_all_enum_classes", m_stats.num_all_enum_classes);
   }
 
   /**
    * Replace enum with Boxed Integer object
    */
-  void replace_enum_with_int(int max_enum_size,
-                             bool skip_sanity_check,
-                             const std::vector<DexType*>& allowlist) {
+  void replace_enum_with_int(
+      PassManager& mgr,
+      int max_enum_size,
+      bool skip_sanity_check,
+      const std::vector<DexType*>& allowlist,
+      ConfigFiles& conf,
+      std::unordered_map<UnsafeType, size_t>& unsafe_counts) {
     if (max_enum_size <= 0) {
       return;
     }
@@ -375,60 +386,128 @@ class OptimizeEnums {
     calculate_param_summaries(m_scope, *override_graph,
                               &config.param_summary_map);
 
+    auto base_enum_check = [](const DexClass* cls) {
+      return is_enum(cls) && !cls->is_external();
+    };
+
     /**
      * An enum is safe if it not external, has no interfaces, and has only one
      * simple enum constructor. Static fields, primitive or string instance
      * fields, and virtual methods are safe.
      */
-    auto is_safe_enum = [this](const DexClass* cls) {
-      if (is_enum(cls) && !cls->is_external() && is_final(cls) &&
-          can_delete(cls) && cls->get_interfaces()->size() == 0 &&
-          only_one_static_synth_field(cls)) {
 
-        const auto& ctors = cls->get_ctors();
-        if (ctors.size() != 1 ||
-            !is_simple_enum_constructor(cls, ctors.front())) {
-          return false;
-        }
-
-        for (auto& dmethod : cls->get_dmethods()) {
-          if (is_static(dmethod) || method::is_constructor(dmethod)) {
-            continue;
-          }
-          if (!can_rename(dmethod)) {
-            return false;
-          }
-        }
-
-        for (auto& vmethod : cls->get_vmethods()) {
-          if (!can_rename(vmethod)) {
-            return false;
-          }
-        }
-
-        const auto& ifields = cls->get_ifields();
-        return std::all_of(ifields.begin(), ifields.end(), [](DexField* field) {
-          auto type = field->get_type();
-          return type::is_primitive(type) || type == type::java_lang_String();
-        });
+    auto is_safe_enum = [this, &base_enum_check](const DexClass* cls,
+                                                 UnsafeTypes& utypes) {
+      if (!base_enum_check(cls)) {
+        return false;
       }
-      return false;
+
+      if (!is_final(cls)) {
+        utypes.insert(UnsafeType::kNotFinal);
+      }
+      if (!can_delete(cls)) {
+        utypes.insert(UnsafeType::kCannotDelete);
+      }
+      if (!cls->get_interfaces()->empty()) {
+        utypes.insert(UnsafeType::kHasInterfaces);
+      }
+      if (!only_one_static_synth_field(cls)) {
+        utypes.insert(UnsafeType::kMoreThanOneSynthField);
+      }
+
+      const auto& ctors = cls->get_ctors();
+      if (ctors.size() != 1) {
+        utypes.insert(UnsafeType::kMultipleCtors);
+      } else if (!is_simple_enum_constructor(cls, ctors.front())) {
+        utypes.insert(UnsafeType::kComplexCtor);
+      }
+
+      for (auto& dmethod : cls->get_dmethods()) {
+        if (is_static(dmethod) || method::is_constructor(dmethod)) {
+          continue;
+        }
+        if (!can_rename(dmethod)) {
+          utypes.insert(UnsafeType::kUnrenamableDmethod);
+          break;
+        }
+      }
+
+      for (auto& vmethod : cls->get_vmethods()) {
+        if (!can_rename(vmethod)) {
+          utypes.insert(UnsafeType::kUnrenamableVmethod);
+          break;
+        }
+      }
+
+      const auto& ifields = cls->get_ifields();
+      bool all_of =
+          std::all_of(ifields.begin(), ifields.end(), [](DexField* field) {
+            auto type = field->get_type();
+            return type::is_primitive(type) || type == type::java_lang_String();
+          });
+      if (!all_of) {
+        utypes.insert(UnsafeType::kComplexField);
+      }
+
+      return utypes.empty();
     };
 
-    walk::parallel::classes(m_scope, [&config, is_safe_enum](DexClass* cls) {
-      if (is_safe_enum(cls)) {
-        config.candidate_enums.insert(cls->get_type());
+    ConcurrentMap<const DexType*, UnsafeTypes> unsafe_enums;
+    walk::parallel::classes(m_scope, [&config, is_safe_enum, &base_enum_check,
+                                      &unsafe_enums](DexClass* cls) {
+      if (base_enum_check(cls)) {
+        UnsafeTypes utypes;
+        if (is_safe_enum(cls, utypes)) {
+          config.candidate_enums.insert(cls->get_type());
+        } else {
+          unsafe_enums.emplace(cls->get_type(), std::move(utypes));
+        }
       }
     });
 
-    optimize_enums::reject_unsafe_enums(m_scope, &config);
+    // Need to remember to understand what was rejected.
+    std::unordered_set<DexType*> orig_candidates{config.candidate_enums.begin(),
+                                                 config.candidate_enums.end()};
+
+    auto add_unsafe_usage = [&](const DexType* type, UnsafeType u) {
+      // May be called in parallel.
+      unsafe_enums.update(
+          type, [&](auto, UnsafeTypes& utypes, auto) { utypes.insert(u); });
+    };
+
+    optimize_enums::reject_unsafe_enums(m_scope, &config, add_unsafe_usage);
     if (traceEnabled(ENUM, 4)) {
       for (auto cls : config.candidate_enums) {
         TRACE(ENUM, 4, "candidate_enum %s", SHOW(cls));
       }
     }
+
+    for (auto* t : orig_candidates) {
+      if (config.candidate_enums.count_unsafe(t) == 0) {
+        unsafe_enums.emplace_unsafe(t, UnsafeTypes{UnsafeType::kUsage});
+      }
+    }
+
+    // Write unsafe enums to file.
+    {
+      std::ofstream ofs(conf.metafile("redex-unsafe-enums.txt"),
+                        std::ofstream::out | std::ofstream::app);
+      std::vector<const DexType*> unsafe_types;
+      unsafe_types.reserve(unsafe_enums.size());
+      std::transform(unsafe_enums.begin(), unsafe_enums.end(),
+                     std::back_inserter(unsafe_types),
+                     [](const auto& p) { return p.first; });
+      std::sort(unsafe_types.begin(), unsafe_types.end(), compare_dextypes);
+      for (auto* t : unsafe_types) {
+        ofs << show(t) << ":" << unsafe_enums.at(t) << "\n";
+        for (auto u : unsafe_enums.at(t)) {
+          ++unsafe_counts[u];
+        }
+      }
+    }
+
     m_stats.num_enum_objs = optimize_enums::transform_enums(
-        config, &m_stores, &m_stats.num_int_objs);
+        mgr, config, &m_stores, &m_stats.num_int_objs);
     m_stats.num_enum_classes = config.candidate_enums.size();
   }
 
@@ -453,7 +532,7 @@ class OptimizeEnums {
       // Only consider enums that are final, not external, do not have
       // interfaces, and are not instance fields of any classes.
       return is_enum(cls) && !cls->is_external() && is_final(cls) &&
-             can_delete(cls) && cls->get_interfaces()->size() == 0 &&
+             can_delete(cls) && cls->get_interfaces()->empty() &&
              !types_used_as_instance_fields.count(cls->get_type());
     };
 
@@ -572,16 +651,7 @@ class OptimizeEnums {
   std::vector<DexClass*> collect_generated_classes() {
     std::vector<DexClass*> generated_classes;
 
-    // To avoid any cross store references, only accept generated classes
-    // that are in the root store (same for the Enums they reference).
-    XStoreRefs xstores(m_stores);
-
     for (const auto& cls : m_scope) {
-      size_t cls_store_idx = xstores.get_store_idx(cls->get_type());
-      if (cls_store_idx > 1) {
-        continue;
-      }
-
       auto& sfields = cls->get_sfields();
       const auto all_sfield_names_contain = [&sfields](const char* sub) {
         return std::all_of(
@@ -689,229 +759,15 @@ class OptimizeEnums {
       const EnumFieldToOrdinal& enum_field_to_ordinal,
       const GeneratedSwitchCases& generated_switch_cases) {
 
-    namespace cp = constant_propagation;
+    const optimize_enums::OptimizeEnumsUnmap unmap(enum_field_to_ordinal,
+                                                   generated_switch_cases);
+
     walk::parallel::code(m_scope, [&](DexMethod*, IRCode& code) {
       always_assert(code.cfg().editable());
       cfg::ControlFlowGraph& cfg = code.cfg();
       cfg.calculate_exit_block();
-
-      optimize_enums::Iterator fixpoint(&cfg);
-      fixpoint.run(optimize_enums::Environment());
-      std::unordered_set<IRInstruction*> switches;
-      for (const auto& info : fixpoint.collect()) {
-        const auto pair = switches.insert((*info.branch)->insn);
-        bool insert_occurred = pair.second;
-        if (!insert_occurred) {
-          // Make sure we don't have any duplicate switch opcodes. We can't
-          // change the register of a switch opcode to two different registers.
-          continue;
-        }
-        if (!check_lookup_table_usage(lookup_table_to_enum,
-                                      generated_switch_cases, info)) {
-          continue;
-        }
-        remove_lookup_table_usage(enum_field_to_ordinal, generated_switch_cases,
-                                  info);
-      }
+      unmap.unmap_switchmaps(cfg);
     });
-  }
-
-  /**
-   * Check to make sure this is a valid match. Return false to abort the
-   * optimization.
-   */
-  bool check_lookup_table_usage(
-      const LookupTableToEnum& lookup_table_to_enum,
-      const GeneratedSwitchCases& generated_switch_cases,
-      const optimize_enums::Info& info) {
-
-    // Check this is called on an enum.
-    auto invoke_ordinal = (*info.invoke)->insn;
-    auto invoke_type = invoke_ordinal->get_method()->get_class();
-    auto invoke_cls = type_class(invoke_type);
-    if (!invoke_cls ||
-        (invoke_type != type::java_lang_Enum() && !is_enum(invoke_cls))) {
-      return false;
-    }
-
-    auto lookup_table = info.array_field;
-    if (!lookup_table || lookup_table_to_enum.count(lookup_table) == 0) {
-      return false;
-    }
-
-    // Check the current enum corresponds.
-    auto current_enum = lookup_table_to_enum.at(lookup_table);
-    if (invoke_type != type::java_lang_Enum() && current_enum != invoke_type) {
-      return false;
-    }
-
-    // Check if the lookup table array field is actually populated with cases.
-    if (!generated_switch_cases.count(info.array_field)) {
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * Replaces the usage of the lookup table, by converting
-   *
-   * INVOKE_VIRTUAL <v_enum> Enum;.ordinal:()
-   * MOVE_RESULT <v_ordinal>
-   * AGET <v_field>, <v_ordinal>
-   * MOVE_RESULT_PSEUDO <v_dest>
-   * *_SWITCH <v_dest>              ; or IF_EQZ <v_dest> <v_some_constant>
-   *
-   * to
-   *
-   * INVOKE_VIRTUAL <v_enum> Enum;.ordinal:()
-   * MOVE_RESULT <v_ordinal>
-   * MOVE <v_dest>, <v_ordinal>
-   * SPARSE_SWITCH <v_dest>
-   *
-   * if <v_field> was fetched using SGET_OBJECT <lookup_table_holder>
-   *
-   * and updating switch cases (on the edges) to the enum field's ordinal
-   *
-   * NOTE: We leave unused code around, since LDCE should remove it
-   *       if it isn't used afterwards (which is expected), but we are
-   *       being conservative.
-   */
-  void remove_lookup_table_usage(
-      const EnumFieldToOrdinal& enum_field_to_ordinal,
-      const GeneratedSwitchCases& generated_switch_cases,
-      const optimize_enums::Info& info) {
-    auto& cfg = info.branch->cfg();
-    auto branch_block = info.branch->block();
-
-    // Use the SwitchEquivFinder to handle not just switch statements but also
-    // trees of if and switch statements
-    SwitchEquivFinder finder(&cfg, *info.branch, *info.reg,
-                             50 /* leaf_duplication_threshold */);
-    if (!finder.success()) {
-      ++m_stats.num_switch_equiv_finder_failures;
-      return;
-    }
-
-    std::vector<std::pair<int32_t, cfg::Block*>> cases;
-    const auto& field_enum_map = generated_switch_cases.at(info.array_field);
-    const auto& key_to_case = finder.key_to_case();
-    auto fallthrough_it = key_to_case.find(boost::none);
-    cfg::Block* fallthrough =
-        fallthrough_it == key_to_case.end() ? nullptr : fallthrough_it->second;
-    for (const auto& pair : key_to_case) {
-      auto old_case_key = pair.first;
-      cfg::Block* leaf = pair.second;
-
-      // if-else chains will load constants to compare against. Sometimes the
-      // leaves will use these values so we have to copy those values to the
-      // beginning of the leaf blocks. Any dead instructions will be cleaned up
-      // by LDCE.
-      const auto& extra_loads = finder.extra_loads();
-      const auto& loads_for_this_leaf = extra_loads.find(leaf);
-      if (loads_for_this_leaf != extra_loads.end()) {
-        for (const auto& register_and_insn : loads_for_this_leaf->second) {
-          IRInstruction* insn = register_and_insn.second;
-          if (insn != nullptr) {
-            // null instruction pointers are used to signify the upper half of a
-            // wide load.
-            auto copy = new IRInstruction(*insn);
-            TRACE(ENUM, 4, "adding %s to B%zu", SHOW(copy), leaf->id());
-            leaf->push_front(copy);
-          }
-        }
-      }
-
-      if (old_case_key == boost::none) {
-        continue;
-      }
-
-      auto search = field_enum_map.find(*old_case_key);
-      if (search != field_enum_map.end()) {
-        auto field_enum = search->second;
-        auto new_case_key = enum_field_to_ordinal.at(field_enum);
-        cases.emplace_back(new_case_key, leaf);
-      } else {
-        // Ignore blocks with...
-        // - negative case key, which should be dead code
-        // - 0 case key, as long as the leaf block is the fallthrough block, as
-        //   0 encodes the default case
-        always_assert_log(
-            *old_case_key < 0 || (*old_case_key == 0 && fallthrough == leaf),
-            "can't find case key %d leaving block %zu\n%s\nin %s\n",
-            *old_case_key, branch_block->id(), info.str().c_str(), SHOW(cfg));
-      }
-    }
-
-    // Add a new register to hold the ordinal and then use it to
-    // switch on the actual ordinal, instead of using the lookup table.
-    //
-    // Basically, the bytecode will be:
-    //
-    //  INVOKE_VIRTUAL <v_enum> <Enum>;.ordinal:()
-    //  MOVE_RESULT <v_ordinal>
-    //  MOVE <v_new_reg> <v_ordinal> // Newly added
-    //  ...
-    //  AGET <v_field>, <v_ordinal>
-    //  MOVE_RESULT_PSEUDO <v_dest>
-    //  ...
-    //  SPARSE_SWITCH <v_new_reg> // will use <v_new_reg> instead of <v_dest>
-    //
-    // NOTE: We leave CopyPropagation to clean up the extra moves and
-    //       LDCE the array access.
-    auto move_ordinal_it = cfg.move_result_of(*info.invoke);
-    if (move_ordinal_it.is_end()) {
-      return;
-    }
-
-    // Remove the switch statement so we can rebuild it with the correct case
-    // keys. This removes all edges to the if-else blocks and the blocks will
-    // eventually be removed by cfg.simplify()
-    cfg.remove_insn(*info.branch);
-
-    auto move_ordinal = move_ordinal_it->insn;
-    auto reg_ordinal = move_ordinal->dest();
-    auto new_ordinal_reg = cfg.allocate_temp();
-    auto move_ordinal_result = new IRInstruction(OPCODE_MOVE);
-    move_ordinal_result->set_src(0, reg_ordinal);
-    move_ordinal_result->set_dest(new_ordinal_reg);
-    cfg.insert_after(move_ordinal_it, move_ordinal_result);
-
-    // TODO?: Would it be possible to keep the original if-else tree form that
-    // D8 made?  It would probably be better to build a more general purpose
-    // switch -> if-else converter pass and run it after this pass.
-    if (cases.size() > 1) {
-      // Dex Lowering will decide if packed or sparse would be better
-      IRInstruction* new_switch = new IRInstruction(OPCODE_SWITCH);
-      new_switch->set_src(0, new_ordinal_reg);
-      cfg.create_branch(branch_block, new_switch, fallthrough, cases);
-    } else if (cases.size() == 1) {
-      // Only one non-fallthrough case, we can use an if statement.
-      // const vKey, case_key
-      // if-eqz vOrdinal, vKey
-      int32_t key = cases[0].first;
-      cfg::Block* target = cases[0].second;
-      IRInstruction* const_load = new IRInstruction(OPCODE_CONST);
-      auto key_reg = cfg.allocate_temp();
-      const_load->set_dest(key_reg);
-      const_load->set_literal(key);
-      branch_block->push_back(const_load);
-
-      IRInstruction* new_if = new IRInstruction(OPCODE_IF_EQ);
-      new_if->set_src(0, new_ordinal_reg);
-      new_if->set_src(1, key_reg);
-      cfg.create_branch(branch_block, new_if, fallthrough, target);
-    } else {
-      // Just one case, set the goto edge's target to the fallthrough block.
-      always_assert(cases.empty());
-      if (fallthrough != nullptr) {
-        auto existing_goto =
-            cfg.get_succ_edge_of_type(branch_block, cfg::EDGE_GOTO);
-        always_assert(existing_goto != nullptr);
-        cfg.set_edge_target(existing_goto, fallthrough);
-      }
-    }
-
-    m_lookup_tables_replaced.emplace(info.array_field);
   }
 
   /**
@@ -948,17 +804,17 @@ class OptimizeEnums {
                                         LookupTableToEnum& mapping) {
     mf::flow_t f;
 
-    auto m__invoke_values = m::invoke_static_(m::has_method(
+    auto m_invoke_values = m::invoke_static_(m::has_method(
         m::named<DexMethodRef>("values") &&
         m::member_of<DexMethodRef>(m::in<DexType*>(collected_enums))));
-    auto m__sput_lookup = m::sput_object_(m::has_field(
+    auto m_sput_lookup = m::sput_object_(m::has_field(
         m::member_of<DexFieldRef>(m::equals(generated_cls->get_type()))));
 
     auto uniq = mf::alias | mf::unique;
-    auto vals = f.insn(m__invoke_values);
+    auto vals = f.insn(m_invoke_values);
     auto alen = f.insn(m::array_length_()).src(0, vals, uniq);
     auto newa = f.insn(m::new_array_()).src(0, alen, uniq);
-    auto sput = f.insn(m__sput_lookup).src(0, newa, uniq);
+    auto sput = f.insn(m_sput_lookup).src(0, newa, uniq);
 
     auto res = f.find(clinit_cfg, sput);
     for (auto* insn_sput : res.matching(sput)) {
@@ -988,6 +844,7 @@ class OptimizeEnums {
     std::atomic<size_t> num_switch_equiv_finder_failures{0};
     size_t num_candidate_generated_methods{0};
     size_t num_removed_generated_methods{0};
+    size_t num_all_enum_classes{0};
   };
   Stats m_stats;
 
@@ -1016,10 +873,17 @@ void OptimizeEnumsPass::run_pass(DexStoresVector& stores,
                                  PassManager& mgr) {
   OptimizeEnums opt_enums(stores, conf);
   opt_enums.remove_redundant_generated_classes();
-  opt_enums.replace_enum_with_int(m_max_enum_size, m_skip_sanity_check,
-                                  m_enum_to_integer_allowlist);
+  std::unordered_map<UnsafeType, size_t> unsafe_counts;
+  opt_enums.replace_enum_with_int(mgr, m_max_enum_size, m_skip_sanity_check,
+                                  m_enum_to_integer_allowlist, conf,
+                                  unsafe_counts);
   opt_enums.remove_enum_generated_methods();
   opt_enums.stats(mgr);
+  for (auto& p : unsafe_counts) {
+    std::ostringstream oss;
+    oss << "reason." << p.first;
+    mgr.set_metric(oss.str(), p.second);
+  }
 }
 
 static OptimizeEnumsPass s_pass;

@@ -11,7 +11,6 @@
 #include <gtest/gtest.h>
 #include <json/value.h>
 
-#include "ABExperimentContext.h"
 #include "ConfigFiles.h"
 #include "DexClass.h"
 #include "DexLoader.h"
@@ -31,10 +30,6 @@ struct RedexTest : public testing::Test {
   RedexTest() { g_redex = new RedexContext(); }
 
   ~RedexTest() { delete g_redex; }
-
-  void reset_ab_experiments_global_state() {
-    ab_test::ABExperimentContext::reset_global_state();
-  }
 };
 
 struct RedexIntegrationTest : public RedexTest {
@@ -72,27 +67,52 @@ struct RedexIntegrationTest : public RedexTest {
 
   std::string& get_configfiles_out_dir() { return configfiles_out_dir.path; }
 
+  // NOTE: The defaults for RedexOptions are technically bad, as the
+  //       PassManager survives the `run_passes` call, at which point
+  //       the options object has gone out of scope. But simplicity...
+
   void run_passes(
       const std::vector<Pass*>& passes,
       std::unique_ptr<keep_rules::ProguardConfiguration> pg_config = nullptr,
-      const Json::Value& json_conf = Json::nullValue) {
-    run_passes(passes, std::move(pg_config), json_conf, [](const auto&) {});
+      const Json::Value& json_conf = Json::nullValue,
+      const RedexOptions& redex_options = RedexOptions{}) {
+    run_passes(
+        passes, std::move(pg_config), json_conf, [](const auto&) {},
+        [](const auto&) {}, redex_options);
   }
 
-  template <typename Fn>
+  template <typename MgrFn>
   void run_passes(const std::vector<Pass*>& passes,
                   std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
                   const Json::Value& json_conf,
-                  const Fn& fn) {
+                  const MgrFn& mgr_fn,
+                  const RedexOptions& redex_options = RedexOptions{}) {
+    run_passes(
+        passes, std::move(pg_config), json_conf, [](const auto&) {}, mgr_fn,
+        redex_options);
+  }
+
+  template <typename ConfFn, typename MgrFn>
+  void run_passes(const std::vector<Pass*>& passes,
+                  std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
+                  const Json::Value& json_conf,
+                  const ConfFn& conf_fn,
+                  const MgrFn& mgr_fn,
+                  const RedexOptions& redex_options = RedexOptions{}) {
     conf = std::make_unique<ConfigFiles>(json_conf);
+    conf->parse_global_config();
+
+    conf_fn(*conf);
+
     if (pg_config) {
-      pass_manager =
-          std::make_unique<PassManager>(passes, std::move(pg_config), *conf);
+      pass_manager = std::make_unique<PassManager>(passes, std::move(pg_config),
+                                                   *conf, redex_options);
     } else {
-      pass_manager = std::make_unique<PassManager>(passes, *conf);
+      pass_manager =
+          std::make_unique<PassManager>(passes, *conf, redex_options);
     }
 
-    fn(*pass_manager);
+    mgr_fn(*pass_manager);
 
     pass_manager->set_testing_mode();
     conf->set_outdir(configfiles_out_dir.path);
@@ -121,6 +141,19 @@ struct RedexIntegrationTest : public RedexTest {
                                                    DexString::make_string(name),
                                                    DexType::make_type(type)));
     return it == ifields.end() ? nullptr : *it;
+  }
+
+  template <typename C>
+  DexMethod* find_dmethod(const C& clazzes,
+                          const char* cls,
+                          const char* rtype,
+                          const char* name,
+                          const std::vector<const char*>& args) {
+    const auto* c = find_class(clazzes, cls);
+    const auto& dmethods = c->get_dmethods();
+    const auto it = std::find(dmethods.begin(), dmethods.end(),
+                              DexMethod::make_method(cls, name, rtype, args));
+    return it == dmethods.end() ? nullptr : *it;
   }
 
   template <typename C>

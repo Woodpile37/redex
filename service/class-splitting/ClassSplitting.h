@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <functional>
 #include <unordered_set>
 #include <vector>
 
@@ -36,6 +37,7 @@ struct ClassSplittingConfig {
   bool trampolines{true};
   unsigned int trampoline_size_threshold{100};
   std::vector<std::string> blocklist_types;
+  std::vector<std::string> blocklist_methods;
   // If true, only consider methods that appear in the profiles for relocation.
   bool profile_only{false};
   // If true, also consider source-block info for decision making.
@@ -51,6 +53,7 @@ struct ClassSplittingStats {
   size_t non_relocated_methods{0};
   size_t popular_methods{0};
   size_t source_block_positive_vals{0};
+  size_t method_size_too_small{0};
 };
 
 constexpr const char* METRIC_STATICIZED_METHODS =
@@ -76,8 +79,8 @@ constexpr const char* METRIC_SOURCE_BLOCKS_POSITIVE_VALS =
 constexpr const char* METRIC_RELOCATED_METHODS =
     "num_class_splitting_relocated_methods";
 constexpr const char* METRIC_TRAMPOLINES = "num_class_splitting_trampolines";
-
-constexpr const char* RELOCATED_SUFFIX = "$relocated;";
+constexpr const char* METRIC_TOO_SMALL_METHODS =
+    "num_class_splitting_methods_too_small";
 
 class ClassSplitter final {
  public:
@@ -96,10 +99,11 @@ class ClassSplitter final {
   void configure(const Scope& scope);
   void prepare(const DexClass* cls,
                std::vector<DexMethodRef*>* mrefs,
-               std::vector<DexType*>* trefs,
-               bool should_not_relocate_methods_of_class);
+               std::vector<DexType*>* trefs);
   DexClasses additional_classes(const DexClasses& classes);
   void cleanup(const Scope& final_scope);
+
+  void set_instrumentation_callback(std::function<void(DexMethod*)>&& callback);
 
  private:
   struct RelocatableMethodInfo {
@@ -129,6 +133,7 @@ class ClassSplitter final {
   DexMethod* create_trampoline_method(DexMethod* method,
                                       DexClass* target_cls,
                                       uint32_t api_level);
+  size_t get_trampoline_method_cost(DexMethod* method);
   bool has_source_block_positive_val(DexMethod* method);
   void materialize_trampoline_code(DexMethod* source, DexMethod* target);
 
@@ -146,6 +151,29 @@ class ClassSplitter final {
   // Methods that appear in the profiles and whose frequency does not exceed
   // the threashold.
   const std::unordered_set<DexMethod*>& m_insufficiently_popular_methods;
+
+  // Set of methods that need to be made static eventually. The destructor
+  // of this class will do the necessary delayed work.
+  std::unordered_set<DexMethod*> m_delayed_make_static;
+
+  // Accumulated visibility changes that must be applied eventually.
+  // This happens locally within prepare().
+  std::unique_ptr<VisibilityChanges> m_delayed_visibility_changes;
+
+  // Potentially registered instrumentation callback.
+  std::function<void(DexMethod*)> m_instrumentation_callback;
+
+  /**
+   * Change visibilities of methods, assuming that`m_visibility_changes` is
+   * non-null.
+   */
+  void delayed_visibility_changes_apply();
+
+  /**
+   * Staticize required methods (stored in `m_delayed_make_static`) and update
+   * opcodes accordingly.
+   */
+  void delayed_invoke_direct_to_static(const Scope& final_scope);
 };
 
 } // namespace class_splitting

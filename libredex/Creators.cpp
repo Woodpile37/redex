@@ -442,25 +442,11 @@ void MethodBlock::init_loc(Location& loc) {
   }
 }
 
-void MethodBlock::binop_lit16(IROpcode op,
-                              const Location& dest,
-                              const Location& src,
-                              int16_t literal) {
-  always_assert(OPCODE_ADD_INT_LIT16 <= op && op <= OPCODE_XOR_INT_LIT16);
-  always_assert(dest.type == src.type);
-  always_assert(dest.type == type::_int());
-  IRInstruction* insn = new IRInstruction(op);
-  insn->set_dest(dest.get_reg());
-  insn->set_src(0, src.get_reg());
-  insn->set_literal(literal);
-  push_instruction(insn);
-}
-
-void MethodBlock::binop_lit8(IROpcode op,
-                             const Location& dest,
-                             const Location& src,
-                             int8_t literal) {
-  always_assert(OPCODE_ADD_INT_LIT8 <= op && op <= OPCODE_USHR_INT_LIT8);
+void MethodBlock::binop_lit(IROpcode op,
+                            const Location& dest,
+                            const Location& src,
+                            int16_t literal) {
+  always_assert(OPCODE_ADD_INT_LIT <= op && op <= OPCODE_USHR_INT_LIT);
   always_assert(dest.type == src.type);
   always_assert(dest.type == type::_int());
   IRInstruction* insn = new IRInstruction(op);
@@ -699,9 +685,9 @@ DexMethod* MethodCreator::create() {
     // Insert a fake position entry for redex generated method when we
     // add debug item.
     auto main_block_it = meth_code->get_param_instructions().end();
-    auto position = std::make_unique<DexPosition>(0);
-    position->bind(DexString::make_string(show(method)),
-                   DexString::make_string("RedexGenerated"));
+    auto position = std::make_unique<DexPosition>(
+        DexString::make_string("RedexGenerated"), 0);
+    position->bind(DexString::make_string(show(method)));
     meth_code->insert_before(main_block_it, std::move(position));
   }
   return method;

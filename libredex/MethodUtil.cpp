@@ -9,6 +9,7 @@
 
 #include "ControlFlow.h"
 #include "EditableCfgAdapter.h"
+#include "RedexContext.h"
 #include "Resolver.h"
 #include "TypeUtil.h"
 
@@ -172,12 +173,23 @@ bool is_clinit(const DexMethodRef* method) {
   return strcmp(method->get_name()->c_str(), "<clinit>") == 0;
 }
 
+bool is_argless_init(const DexMethodRef* method) {
+  return is_init(method) && method->get_proto()->get_args()->empty();
+}
+
 bool is_trivial_clinit(const IRCode& code) {
-  always_assert(!code.editable_cfg_built());
-  auto ii = InstructionIterable(code);
-  return std::none_of(ii.begin(), ii.end(), [](const MethodItemEntry& mie) {
-    return mie.insn->opcode() != OPCODE_RETURN_VOID;
-  });
+  if (!code.editable_cfg_built()) {
+    auto ii = InstructionIterable(code);
+    return std::none_of(ii.begin(), ii.end(), [](const MethodItemEntry& mie) {
+      return mie.insn->opcode() != OPCODE_RETURN_VOID;
+    });
+  } else {
+    auto& cfg = code.cfg();
+    auto ii = cfg::ConstInstructionIterable(cfg);
+    return std::none_of(ii.begin(), ii.end(), [](const MethodItemEntry& mie) {
+      return mie.insn->opcode() != OPCODE_RETURN_VOID;
+    });
+  }
 }
 
 bool is_clinit_invoked_method_benign(const DexMethodRef* method_ref) {
@@ -492,56 +504,26 @@ const DexClass* clinit_may_have_side_effects(
 }
 
 bool no_invoke_super(const IRCode& code) {
-  always_assert(!code.editable_cfg_built());
-  for (const auto& mie : InstructionIterable(code)) {
+  bool has_invoke_super{false};
+  editable_cfg_adapter::iterate(&code, [&](const MethodItemEntry& mie) {
     auto insn = mie.insn;
     if (insn->opcode() == OPCODE_INVOKE_SUPER) {
-      return false;
+      has_invoke_super = true;
+      return editable_cfg_adapter::LOOP_BREAK;
     }
+    return editable_cfg_adapter::LOOP_CONTINUE;
+  });
+  return !has_invoke_super;
+}
+
+#define DEFINE_CACHED_METHOD(func_name, _)                 \
+  DexMethod* func_name() {                                 \
+    return g_redex->pointers_cache().method_##func_name(); \
   }
 
-  return true;
-}
-
-DexMethod* java_lang_Object_ctor() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Object;.<init>:()V"));
-}
-
-DexMethod* java_lang_Enum_ctor() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.<init>:(Ljava/lang/String;I)V"));
-}
-
-DexMethod* java_lang_Enum_ordinal() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.ordinal:()I"));
-}
-
-DexMethod* java_lang_Enum_name() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.name:()Ljava/lang/String;"));
-}
-
-DexMethod* java_lang_Enum_equals() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.equals:(Ljava/lang/Object;)Z"));
-}
-
-DexMethod* java_lang_Integer_valueOf() {
-  return static_cast<DexMethod*>(DexMethod::make_method(
-      "Ljava/lang/Integer;.valueOf:(I)Ljava/lang/Integer;"));
-}
-
-DexMethod* java_lang_Integer_intValue() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Integer;.intValue:()I"));
-}
-
-DexMethod* java_lang_Throwable_fillInStackTrace() {
-  return static_cast<DexMethod*>(DexMethod::make_method(
-      "Ljava/lang/Throwable;.fillInStackTrace:()Ljava/lang/Throwable;"));
-}
+#define FOR_EACH DEFINE_CACHED_METHOD
+WELL_KNOWN_METHODS
+#undef FOR_EACH
 
 DexMethod* kotlin_jvm_internal_Intrinsics_checkParameterIsNotNull() {
   return static_cast<DexMethod*>(DexMethod::get_method(
@@ -566,4 +548,10 @@ DexMethod* kotlin_jvm_internal_Intrinsics_checkNotNullExpressionValue() {
       "Lkotlin/jvm/internal/Intrinsics;.checkNotNullExpressionValue:(Ljava/"
       "lang/Object;Ljava/lang/String;)V"));
 }
+
+DexMethod* redex_internal_checkObjectNotNull() {
+  return static_cast<DexMethod*>(DexMethod::get_method(
+      "Lredex/$NullCheck;.null_check:(Ljava/lang/Object;)V"));
+}
+
 }; // namespace method

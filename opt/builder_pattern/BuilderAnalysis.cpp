@@ -7,11 +7,11 @@
 
 #include "BuilderAnalysis.h"
 
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+
 #include "BaseIRAnalyzer.h"
-#include "ConstantAbstractDomain.h"
-#include "ControlFlow.h"
 #include "Liveness.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
 #include "Resolver.h"
 #include "Show.h"
 #include "Trace.h"
@@ -49,7 +49,7 @@ class NullableConstantDomain final
                : boost::none;
   }
 
-  void join_with(const NullableConstantDomain& other) override {
+  void join_with(const NullableConstantDomain& other) {
     if (is_value() && other.is_value()) {
       if (get_value()->get_constant()->opcode() == OPCODE_CONST &&
           other.get_value()->get_constant()->opcode() != OPCODE_CONST) {
@@ -218,13 +218,14 @@ void BuilderAnalysis::run_analysis() {
     return;
   }
 
-  code->build_cfg(/* editable */ false);
+  always_assert(code->editable_cfg_built());
   cfg::ControlFlowGraph& cfg = code->cfg();
   cfg.calculate_exit_block();
   m_analyzer.reset(new impl::Analyzer(
       cfg, m_builder_types, m_excluded_builder_types, m_accept_excluded));
 
   populate_usage();
+  cfg.recompute_registers_size();
   update_stats();
 }
 
@@ -300,7 +301,7 @@ void BuilderAnalysis::populate_usage() {
   // If the instantiated type is not excluded, updates the usages map.
   // Otherwise, update the excluded instantiation list.
   auto update_usages = [&](const IRInstruction* val,
-                           const IRList::iterator& use) {
+                           const cfg::InstructionIterator& use) {
     if (auto referenced_type = get_instantiated_type(val)) {
       if (m_excluded_builder_types.count(referenced_type) == 0) {
         m_usage[val].push_back(use);
@@ -318,7 +319,7 @@ void BuilderAnalysis::populate_usage() {
   for (cfg::Block* block : cfg.blocks()) {
     auto env = m_analyzer->get_entry_state_at(block);
     for (auto& mie : InstructionIterable(block)) {
-      auto it = code->iterator_to(mie);
+      auto it = block->to_cfg_instruction_iterator(mie);
       IRInstruction* insn = mie.insn;
       m_insn_to_env->emplace(insn, env);
       m_analyzer->analyze_instruction(insn, &env);
@@ -459,11 +460,23 @@ ConstTypeHashSet BuilderAnalysis::non_removable_types() {
 
   // Consider other non-removable usages (for example synchronization usage).
   for (const auto& pair : m_usage) {
-    auto current_instance = get_instantiated_type(pair.first);
+    auto instantiation = pair.first;
+    auto current_instance = get_instantiated_type(instantiation);
 
     if (non_removable_types.count(current_instance)) {
       // Already decided it isn't removable.
       continue;
+    }
+
+    // Check if the instantiation is an invoke and non-inlinable.
+    if (opcode::is_an_invoke(instantiation->opcode())) {
+      auto method = resolve_method(instantiation->get_method(),
+                                   opcode_to_search(instantiation));
+      if (!method || !method->get_code()) {
+        non_removable_types.emplace(current_instance);
+        TRACE(BLD_PATTERN, 3, "non removal instantiation %s",
+              SHOW(instantiation));
+      }
     }
 
     for (const auto& it : pair.second) {
@@ -528,12 +541,13 @@ ConstTypeHashSet BuilderAnalysis::escape_types() {
   liveness_iter.run(LivenessDomain());
 
   for (cfg::Block* block : cfg.blocks()) {
-    auto current_env = m_analyzer->get_exit_state_at(block);
+    const auto& current_env = m_analyzer->get_exit_state_at(block);
 
     for (auto& succ : block->succs()) {
       cfg::Block* block_succ = succ->target();
-      auto entry_env_at_succ = m_analyzer->get_entry_state_at(block_succ);
-      auto live_in_vars_at_succ =
+      const auto& entry_env_at_succ =
+          m_analyzer->get_entry_state_at(block_succ);
+      const auto& live_in_vars_at_succ =
           liveness_iter.get_live_in_vars_at(succ->target());
 
       // Check that live registers, if they hold a builder at the end of block

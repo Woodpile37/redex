@@ -88,10 +88,18 @@ bool MethodProfiles::parse_stats_file(const std::string& csv_filename) {
   std::string line;
   while (std::getline(ifs, line)) {
     bool success = false;
+    if (line.back() == '\n') {
+      line.pop_back();
+    }
+    // Just in case the files were generated on a Windows OS
+    // or with Windows line ending.
+    if (line.back() == '\r') {
+      line.pop_back();
+    }
     if (m_mode == NONE) {
       success = parse_header(line);
     } else {
-      success = parse_line(std::move(line));
+      success = parse_line(line);
     }
     if (!success) {
       return false;
@@ -267,7 +275,44 @@ bool MethodProfiles::apply_main_internal_result(ParsedMain v,
   }
 }
 
-bool MethodProfiles::parse_main(std::string line, std::string* interaction_id) {
+size_t MethodProfiles::derive_stats(DexMethod* target,
+                                    const std::vector<DexMethod*>& sources) {
+  size_t res = 0;
+  for (auto& [interaction_id, method_stats] : m_method_stats) {
+    if (method_stats.count(target)) {
+      // No need to derive anything, we have a match.
+      continue;
+    }
+
+    std::optional<Stats> stats;
+    for (auto* src : sources) {
+      auto it = method_stats.find(src);
+      if (it == method_stats.end()) {
+        continue;
+      }
+      if (!stats) {
+        stats = it->second;
+        continue;
+      }
+      stats->appear_percent =
+          std::max(stats->appear_percent, it->second.appear_percent);
+      stats->call_count += it->second.call_count;
+      stats->order_percent =
+          std::min(stats->order_percent, it->second.order_percent);
+      stats->min_api_level =
+          std::min(stats->min_api_level, it->second.min_api_level);
+    }
+
+    if (stats) {
+      method_stats.emplace(target, *stats);
+      res++;
+    }
+  }
+  return res;
+}
+
+bool MethodProfiles::parse_main(const std::string& line,
+                                std::string* interaction_id) {
   auto result = parse_main_internal(line);
   if (!result) {
     return false;
@@ -276,9 +321,9 @@ bool MethodProfiles::parse_main(std::string line, std::string* interaction_id) {
   return true;
 }
 
-bool MethodProfiles::parse_line(std::string line) {
+bool MethodProfiles::parse_line(const std::string& line) {
   if (m_mode == MAIN) {
-    return parse_main(std::move(line), &m_interaction_id);
+    return parse_main(line, &m_interaction_id);
   } else if (m_mode == METADATA) {
     return parse_metadata(line);
   } else {
@@ -301,6 +346,10 @@ double MethodProfiles::get_process_unresolved_lines_seconds() {
 }
 
 void MethodProfiles::process_unresolved_lines() {
+  if (m_unresolved_lines.empty()) {
+    return;
+  }
+
   auto timer_scope = s_process_unresolved_lines_timer.scope();
 
   std::set<ParsedMain*> resolved;

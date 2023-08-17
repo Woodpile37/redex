@@ -17,6 +17,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -210,6 +211,14 @@ struct RedexContext {
   // This is for convenience.
   bool instrument_mode{false};
 
+  bool ordering_changes_allowed() const { return m_ordering_changes_allowed; }
+  void set_ordering_changes_allowed(bool new_val) {
+    m_ordering_changes_allowed = new_val;
+  }
+
+  ConcurrentSet<const DexClass*> blanket_native_root_classes;
+  ConcurrentSet<const DexMethod*> blanket_native_root_methods;
+
  private:
   struct Strcmp;
   struct TruncatedStringHash;
@@ -338,6 +347,8 @@ struct RedexContext {
 
     typename AType::iterator begin() { return sets.begin(); }
     typename AType::iterator end() { return sets.end(); }
+
+    size_t slots() const { return sets.size(); }
   };
 
   // Hash a 32-byte subsequence of a given string, offset by 32 bytes from the
@@ -438,4 +449,6 @@ struct RedexContext {
   // Return values map specified by Proguard assume value
   ConcurrentMap<DexMethod*, std::unique_ptr<keep_rules::AssumeReturnValue>>
       method_return_values;
+
+  bool m_ordering_changes_allowed{true};
 };

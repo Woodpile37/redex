@@ -13,10 +13,11 @@
 #include <sstream>
 #include <utility>
 
-#include "ConstantAbstractDomain.h"
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/ReducedProductAbstractDomain.h>
+
 #include "Debug.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "ReducedProductAbstractDomain.h"
 
 /*
  * An abstract domain modeling an array that has a fixed, statically determined
@@ -30,10 +31,10 @@
  *     its bindings are no-ops, since we cannot determine if our array reads
  *     and writes are within its bounds.
  */
-template <typename Domain>
+template <typename Domain, typename DefaultValue>
 class ConstantArrayDomain final
     : public sparta::ReducedProductAbstractDomain<
-          ConstantArrayDomain<Domain>,
+          ConstantArrayDomain<Domain, DefaultValue>,
           sparta::ConstantAbstractDomain<uint32_t> /* array length */,
           sparta::PatriciaTreeMapAbstractEnvironment<
               uint32_t,
@@ -42,10 +43,10 @@ class ConstantArrayDomain final
   using ArrayLengthDomain = sparta::ConstantAbstractDomain<uint32_t>;
   using ArrayValuesDomain =
       sparta::PatriciaTreeMapAbstractEnvironment<uint32_t, Domain>;
-  using SuperType =
-      sparta::ReducedProductAbstractDomain<ConstantArrayDomain<Domain>,
-                                           ArrayLengthDomain,
-                                           ArrayValuesDomain>;
+  using SuperType = sparta::ReducedProductAbstractDomain<
+      ConstantArrayDomain<Domain, DefaultValue>,
+      ArrayLengthDomain,
+      ArrayValuesDomain>;
   using typename SuperType::ReducedProductAbstractDomain;
 
   // Some older compilers complain that the class is not default constructible.
@@ -57,34 +58,28 @@ class ConstantArrayDomain final
   static void reduce_product(
       std::tuple<ArrayLengthDomain, ArrayValuesDomain>& domains) {}
 
-  ~ConstantArrayDomain() override {
-    // The destructor is the only method that is guaranteed to be created when
-    // a class template is instantiated. This is a good place to perform all
-    // the sanity checks on the template parameters.
-    static_assert(
-        std::is_same<decltype(Domain::default_value()), Domain>::value,
-        "Domain::default_value() does not exist");
-  }
-
   explicit ConstantArrayDomain(uint32_t length) {
     mutate_array_length(
         [length](ArrayLengthDomain* len) { *len = ArrayLengthDomain(length); });
     mutate_array_values([length](ArrayValuesDomain* values) {
       // default_value should typically be something representing zero, since
       // Java arrays are zero-initialized.
+      Domain default_value = DefaultValue()();
       for (size_t i = 0; i < length; ++i) {
-        values->set(i, Domain::default_value());
+        values->set(i, default_value);
       }
     });
     canonicalize();
   }
 
-  void join_with(const ConstantArrayDomain<Domain>& other_domain) override {
+  void join_with(
+      const ConstantArrayDomain<Domain, DefaultValue>& other_domain) {
     SuperType::join_with(other_domain);
     canonicalize();
   }
 
-  void widen_with(const ConstantArrayDomain<Domain>& other_domain) override {
+  void widen_with(
+      const ConstantArrayDomain<Domain, DefaultValue>& other_domain) {
     SuperType::widen_with(other_domain);
     canonicalize();
   }
@@ -156,14 +151,14 @@ class ConstantArrayDomain final
     return this->template get<1>();
   }
 
-  ConstantArrayDomain<Domain>& mutate_array_length(
+  ConstantArrayDomain<Domain, DefaultValue>& mutate_array_length(
       std::function<void(ArrayLengthDomain*)> f) {
     this->template apply<0>(f);
     canonicalize();
     return *this;
   }
 
-  ConstantArrayDomain<Domain>& mutate_array_values(
+  ConstantArrayDomain<Domain, DefaultValue>& mutate_array_values(
       std::function<void(ArrayValuesDomain*)> f) {
     this->template apply<1>(f);
     return *this;
@@ -180,9 +175,9 @@ class ConstantArrayDomain final
   }
 };
 
-template <typename Domain>
-inline std::ostream& operator<<(std::ostream& o,
-                                const ConstantArrayDomain<Domain>& e) {
+template <typename Domain, typename DefaultValue>
+inline std::ostream& operator<<(
+    std::ostream& o, const ConstantArrayDomain<Domain, DefaultValue>& e) {
   if (e.is_bottom()) {
     o << "_|_";
     return o;
@@ -206,8 +201,8 @@ inline std::ostream& operator<<(std::ostream& o,
   return o;
 }
 
-template <typename Domain>
-inline std::string ConstantArrayDomain<Domain>::str() const {
+template <typename Domain, typename DefaultValue>
+inline std::string ConstantArrayDomain<Domain, DefaultValue>::str() const {
   std::ostringstream ss;
   ss << *this;
   return ss.str();

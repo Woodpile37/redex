@@ -9,6 +9,8 @@
 
 #include <sstream>
 
+#include <sparta/WeakTopologicalOrdering.h>
+
 #include "ConfigFiles.h"
 #include "ControlFlow.h"
 #include "EditableCfgAdapter.h"
@@ -18,7 +20,6 @@
 #include "StlUtil.h"
 #include "Trace.h"
 #include "Walkers.h"
-#include "WeakTopologicalOrdering.h"
 #include "WorkQueue.h"
 
 std::ostream& operator<<(std::ostream& o, const CseLocation& l) {
@@ -429,14 +430,15 @@ get_wto_successors(
   auto get_sorted_impacted_methods = [&impacted_methods]() {
     std::vector<const DexMethod*> successors;
     successors.reserve(impacted_methods.size());
-    std::copy(impacted_methods.begin(), impacted_methods.end(),
-              std::back_inserter(successors));
+    successors.insert(successors.end(), impacted_methods.begin(),
+                      impacted_methods.end());
     std::sort(successors.begin(), successors.end(), compare_dexmethods);
     return successors;
   };
   std::vector<const DexMethod*> wto_nodes{WTO_ROOT};
-  std::copy(impacted_methods.begin(), impacted_methods.end(),
-            std::back_inserter(wto_nodes));
+  wto_nodes.reserve(wto_nodes.size() + impacted_methods.size());
+  wto_nodes.insert(wto_nodes.end(), impacted_methods.begin(),
+                   impacted_methods.end());
 
   if (first_iteration) {
     // In the first iteration, besides computing the sorted root successors, we
@@ -523,10 +525,8 @@ size_t compute_locations_closure(
     }
   });
 
-  std::unordered_map<const DexMethod*, LocationsAndDependencies> method_lads;
-  for (auto& p : concurrent_method_lads) {
-    method_lads.insert(std::move(p));
-  }
+  std::unordered_map<const DexMethod*, LocationsAndDependencies> method_lads =
+      concurrent_method_lads.move_to_container();
 
   // 2. Compute inverse dependencies so that we know what needs to be recomputed
   // during the fixpoint computation, and determine set of methods that are

@@ -7,7 +7,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <boost/optional.hpp>
+
+#include <sparta/WorkQueue.h> // For `default_num_threads`.
+
 // We for now need a larger stack size than the default, and on Mac OS
 // this is the only way (or pthreads directly), as `ulimit -s` does not
 // apply to non-main threads.
@@ -20,7 +24,6 @@
 #include <vector>
 
 #include "Debug.h"
-#include "SpartaWorkQueue.h" // For `default_num_threads`.
 #include "WorkQueue.h" // For redex_queue_exception_handler.
 
 /*
@@ -40,7 +43,7 @@ class PriorityThreadPool {
   std::condition_variable m_work_condition;
   std::condition_variable m_done_condition;
   std::map<int, std::queue<std::function<void()>>> m_pending_work_items;
-  size_t m_running_work_items{0};
+  std::atomic<size_t> m_running_work_items{0};
   std::chrono::duration<double> m_waited_time{0};
   bool m_shutdown{false};
 
@@ -129,10 +132,20 @@ class PriorityThreadPool {
 
  private:
   void run() {
-    for (;;) {
+    for (bool first = true;; first = false) {
       auto highest_priority_f =
           [&]() -> boost::optional<std::function<void()>> {
         std::unique_lock<std::mutex> lock{m_mutex};
+
+        // Notify when *all* work is done, i.e. nothing is running or pending.
+        //
+        // Moving this check here from the end of the loop avoids
+        // potential repeated lock acquisition.
+        if (!first && m_pending_work_items.empty() &&
+            m_running_work_items == 0) {
+          m_done_condition.notify_one();
+        }
+
         // Wait for work or shutdown.
         m_work_condition.wait(lock, [&]() {
           return !m_pending_work_items.empty() || m_shutdown;
@@ -142,16 +155,16 @@ class PriorityThreadPool {
           return boost::none;
         }
 
+        m_running_work_items++;
+
         // Find work item with highest priority
-        auto& p = *m_pending_work_items.rbegin();
-        auto& queue = p.second;
+        const auto& p_it = std::prev(m_pending_work_items.end());
+        auto& queue = p_it->second;
         auto f = queue.front();
         queue.pop();
         if (queue.empty()) {
-          auto highest_priority = p.first;
-          m_pending_work_items.erase(highest_priority);
+          m_pending_work_items.erase(p_it);
         }
-        m_running_work_items++;
         return f;
       }();
       if (!highest_priority_f) {
@@ -166,13 +179,7 @@ class PriorityThreadPool {
         throw;
       }
 
-      // Notify when *all* work is done, i.e. nothing is running or pending.
-      {
-        std::unique_lock<std::mutex> lock{m_mutex};
-        if (--m_running_work_items == 0 && m_pending_work_items.empty()) {
-          m_done_condition.notify_one();
-        }
-      }
+      --m_running_work_items;
     }
   }
 };

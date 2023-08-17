@@ -12,6 +12,7 @@
 #include "ConfigFiles.h"
 #include "ControlFlow.h"
 #include "Creators.h"
+#include "DexUtil.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
 #include "MethodOverrideGraph.h"
@@ -25,6 +26,8 @@
 
 namespace class_splitting {
 
+const int TRAMPOLINE_THRESHOLD_SIZE = 32;
+
 void update_coldstart_classes_order(
     ConfigFiles& conf,
     PassManager& mgr,
@@ -37,7 +40,7 @@ void update_coldstart_classes_order(
   for (const auto& str : previously_relocated_types) {
     auto initial_type = str.substr(0, str.size() - 11) + ";";
 
-    auto type = DexType::get_type(initial_type.c_str());
+    auto type = DexType::get_type(initial_type);
     if (type == nullptr) {
       TRACE(CS, 2,
             "[class splitting] Cannot find previously relocated type %s in "
@@ -79,7 +82,11 @@ ClassSplitter::ClassSplitter(
     : m_config(config),
       m_mgr(mgr),
       m_sufficiently_popular_methods(sufficiently_popular_methods),
-      m_insufficiently_popular_methods(insufficiently_popular_methods) {}
+      m_insufficiently_popular_methods(insufficiently_popular_methods) {
+  // Instead of changing visibility as we split, blocking other work on the
+  // critical path, we do it all in parallel at the end.
+  m_delayed_visibility_changes = std::make_unique<VisibilityChanges>();
+}
 
 void ClassSplitter::configure(const Scope& scope) {
   if (m_config.relocate_non_true_virtual_methods) {
@@ -90,7 +97,7 @@ void ClassSplitter::configure(const Scope& scope) {
 
 DexClass* ClassSplitter::create_target_class(
     const std::string& target_type_name) {
-  DexType* target_type = DexType::make_type(target_type_name.c_str());
+  DexType* target_type = DexType::make_type(target_type_name);
   ++m_stats.relocation_classes;
   ClassCreator cc(target_type);
   cc.set_access(ACC_PUBLIC | ACC_FINAL);
@@ -99,6 +106,13 @@ DexClass* ClassSplitter::create_target_class(
   target_cls->rstate.set_generated();
   target_cls->set_deobfuscated_name(target_type_name);
   return target_cls;
+}
+
+size_t ClassSplitter::get_trampoline_method_cost(DexMethod* method) {
+  // Maybe this can be calculated? Here goes the size of code for pushing
+  // parameters, making the call, adding refs, etc For now, empirically derive
+  // the best value.
+  return TRAMPOLINE_THRESHOLD_SIZE;
 }
 
 DexMethod* ClassSplitter::create_trampoline_method(DexMethod* method,
@@ -147,10 +161,9 @@ bool ClassSplitter::has_source_block_positive_val(DexMethod* method) {
 
 void ClassSplitter::prepare(const DexClass* cls,
                             std::vector<DexMethodRef*>* mrefs,
-                            std::vector<DexType*>* trefs,
-                            bool should_not_relocate_methods_of_class) {
+                            std::vector<DexType*>* trefs) {
   // Bail out if we just cannot or should not relocate methods of this class.
-  if (!can_relocate(cls) || should_not_relocate_methods_of_class) {
+  if (!can_relocate(cls)) {
     return;
   }
   auto cls_has_problematic_clinit = method::clinit_may_have_side_effects(
@@ -160,6 +173,11 @@ void ClassSplitter::prepare(const DexClass* cls,
   always_assert(sc.relocatable_methods.empty());
   auto process_method = [&](DexMethod* method) {
     if (!method->get_code()) {
+      return;
+    }
+    auto& cfg = method->get_code()->cfg();
+    if (get_trampoline_method_cost(method) >= cfg.estimate_code_units()) {
+      m_stats.method_size_too_small++;
       return;
     }
     if (m_sufficiently_popular_methods.count(method)) {
@@ -208,8 +226,9 @@ void ClassSplitter::prepare(const DexClass* cls,
         target_cls = it->second;
       } else {
         auto source_name = source_cls->str();
-        target_cls = create_target_class(
-            source_name.substr(0, source_name.size() - 1) + RELOCATED_SUFFIX);
+        target_cls =
+            create_target_class(source_name.substr(0, source_name.size() - 1) +
+                                CLASS_SPLITTING_RELOCATED_SUFFIX_SEMI);
         m_target_classes_by_source_classes.emplace(source_cls, target_cls);
       }
     }
@@ -228,6 +247,10 @@ void ClassSplitter::prepare(const DexClass* cls,
     }
     TRACE(CS, 4, "[class splitting] Method {%s} will be relocated to {%s}",
           SHOW(method), SHOW(target_cls));
+
+    if (m_instrumentation_callback.target<void (*)(DexMethod*)>() != nullptr) {
+      m_instrumentation_callback(method);
+    }
   };
   auto& dmethods = cls->get_dmethods();
   std::for_each(dmethods.begin(), dmethods.end(), process_method);
@@ -373,9 +396,18 @@ void ClassSplitter::materialize_trampoline_code(DexMethod* source,
                                                 DexMethod* target) {
   // "source" is the original method, still in its original place.
   // "target" is the new trampoline target method, somewhere far away
-  target->set_code(std::make_unique<IRCode>(*source->get_code()));
-  source->set_code(std::make_unique<IRCode>());
+  target->set_code(
+      std::make_unique<IRCode>(std::make_unique<cfg::ControlFlowGraph>()));
   auto code = source->get_code();
+  auto& cfg = code->cfg();
+  auto& target_cfg = target->get_code()->cfg();
+  cfg.deep_copy(&target_cfg);
+  code->clear_cfg();
+  source->set_code(
+      std::make_unique<IRCode>(std::make_unique<cfg::ControlFlowGraph>()));
+  // Create a new block containing all the load instructions.
+  cfg = source->get_code()->cfg();
+  cfg::Block* new_block = cfg.create_block();
   auto invoke_insn = new IRInstruction(OPCODE_INVOKE_STATIC);
   invoke_insn->set_method(target);
   auto proto = target->get_proto();
@@ -386,39 +418,39 @@ void ClassSplitter::materialize_trampoline_code(DexMethod* source,
     IRInstruction* load_param_insn;
     if (type::is_wide_type(t)) {
       load_param_insn = new IRInstruction(IOPCODE_LOAD_PARAM_WIDE);
-      load_param_insn->set_dest(code->allocate_wide_temp());
+      load_param_insn->set_dest(cfg.allocate_wide_temp());
     } else {
       load_param_insn = new IRInstruction(
           type::is_object(t) ? IOPCODE_LOAD_PARAM_OBJECT : IOPCODE_LOAD_PARAM);
-      load_param_insn->set_dest(code->allocate_temp());
+      load_param_insn->set_dest(cfg.allocate_temp());
     }
-    code->push_back(load_param_insn);
+    new_block->push_back(load_param_insn);
     invoke_insn->set_src(i, load_param_insn->dest());
   }
-  code->push_back(invoke_insn);
+  new_block->push_back(invoke_insn);
   IRInstruction* return_insn;
   if (proto->get_rtype() != type::_void()) {
     auto t = proto->get_rtype();
     IRInstruction* move_result_insn;
     if (type::is_wide_type(t)) {
       move_result_insn = new IRInstruction(OPCODE_MOVE_RESULT_WIDE);
-      move_result_insn->set_dest(code->allocate_wide_temp());
+      move_result_insn->set_dest(cfg.allocate_wide_temp());
       return_insn = new IRInstruction(OPCODE_RETURN_WIDE);
     } else {
       move_result_insn = new IRInstruction(
           type::is_object(t) ? OPCODE_MOVE_RESULT_OBJECT : OPCODE_MOVE_RESULT);
-      move_result_insn->set_dest(code->allocate_temp());
+      move_result_insn->set_dest(cfg.allocate_temp());
       return_insn = new IRInstruction(type::is_object(t) ? OPCODE_RETURN_OBJECT
                                                          : OPCODE_RETURN);
     }
-    code->push_back(move_result_insn);
+    new_block->push_back(move_result_insn);
     return_insn->set_src(0, move_result_insn->dest());
   } else {
     return_insn = new IRInstruction(OPCODE_RETURN_VOID);
   }
-  code->push_back(return_insn);
+  new_block->push_back(return_insn);
   TRACE(CS, 5, "[class splitting] New body for {%s}: \n%s", SHOW(source),
-        SHOW(code));
+        SHOW(cfg));
   change_visibility(target);
 }
 
@@ -503,6 +535,10 @@ void ClassSplitter::cleanup(const Scope& final_scope) {
     materialize_trampoline_code(p.first, p.second);
   }
 
+  delayed_visibility_changes_apply();
+  delayed_invoke_direct_to_static(final_scope);
+  m_delayed_make_static.clear();
+
   m_mgr.incr_metric(METRIC_RELOCATION_CLASSES, m_stats.relocation_classes);
   m_mgr.incr_metric(METRIC_RELOCATED_STATIC_METHODS,
                     m_stats.relocated_static_methods);
@@ -519,6 +555,7 @@ void ClassSplitter::cleanup(const Scope& final_scope) {
                     m_stats.source_block_positive_vals);
   m_mgr.incr_metric(METRIC_RELOCATED_METHODS, m_methods_to_relocate.size());
   m_mgr.incr_metric(METRIC_TRAMPOLINES, m_methods_to_trampoline.size());
+  m_mgr.incr_metric(METRIC_TOO_SMALL_METHODS, m_stats.method_size_too_small);
 
   TRACE(CS, 2,
         "[class splitting] Relocated {%zu} methods and created {%zu} "
@@ -551,9 +588,10 @@ bool ClassSplitter::can_relocate(const DexClass* cls) {
 }
 
 bool ClassSplitter::has_unresolvable_or_external_field_ref(const DexMethod* m) {
-  auto code = m->get_code();
+  auto code = const_cast<DexMethod*>(m)->get_code();
   always_assert(code);
-  for (const auto& mie : InstructionIterable(code)) {
+  auto& cfg = code->cfg();
+  for (const auto& mie : cfg::InstructionIterable(cfg)) {
     auto insn = mie.insn;
     if (insn->has_field()) {
       auto field = resolve_field(insn->get_field(),
@@ -604,17 +642,12 @@ bool ClassSplitter::can_relocate(bool cls_has_problematic_clinit,
     }
     return false;
   }
-  if (!get_visibility_changes(m).empty()) {
-    if (log) {
-      m_mgr.incr_metric(
-          "num_class_splitting_limitation_cannot_change_visibility", 1);
-    }
-    return false;
-  }
   if (has_unresolvable_or_external_field_ref(m)) {
     if (log) {
       m_mgr.incr_metric(
-          "num_class_splitting_limitation_cannot_change_visibility", 1);
+          "num_class_splitting_limitation_has_unresolvable_or_external_field_"
+          "ref",
+          1);
     }
     return false;
   }
@@ -659,8 +692,7 @@ bool ClassSplitter::can_relocate(bool cls_has_problematic_clinit,
     }
     if (method::is_init(m)) {
       if (log) {
-        m_mgr.incr_metric(
-            "num_class_splitting_limitation_static_method_is_clinit", 1);
+        m_mgr.incr_metric("num_class_splitting_limitation_method_is_init", 1);
       }
       // TODO: Could be done with trampolines if we remove "final" flag from
       // fields, and carefully deal with super-init calls.
@@ -676,15 +708,79 @@ bool ClassSplitter::can_relocate(bool cls_has_problematic_clinit,
     }
     *requires_trampoline = true;
   }
-  if (*requires_trampoline &&
-      m->get_code()->sum_opcode_sizes() < m_config.trampoline_size_threshold) {
+  if (*requires_trampoline && m->get_code()->estimate_code_units() <
+                                  m_config.trampoline_size_threshold) {
     if (log) {
       m_mgr.incr_metric("num_class_splitting_trampoline_size_threshold_not_met",
                         1);
     }
     return false;
   }
+  VisibilityChanges visibility_changes = get_visibility_changes(m);
+  if (!visibility_changes.empty()) {
+    m_delayed_visibility_changes->insert(visibility_changes);
+  }
   return true;
 }
 
+void ClassSplitter::delayed_visibility_changes_apply() {
+  m_delayed_visibility_changes->apply();
+  // any method that was just made public and isn't virtual or a constructor or
+  // static must be made static
+  for (auto method : m_delayed_visibility_changes->methods) {
+    always_assert(is_public(method));
+    if (!method->is_virtual() && !method::is_init(method) &&
+        !is_static(method)) {
+      always_assert(can_rename(method));
+      always_assert(method->is_concrete());
+      m_delayed_make_static.insert(method);
+    }
+  }
+}
+
+void ClassSplitter::delayed_invoke_direct_to_static(const Scope& final_scope) {
+  if (m_delayed_make_static.empty()) {
+    return;
+  }
+  // We sort the methods here because make_static renames methods on
+  // collision, and which collisions occur is order-dependent. E.g. if we have
+  // the following methods in m_delayed_make_static:
+  //
+  //   Foo Foo::bar()
+  //   Foo Foo::bar(Foo f)
+  //
+  // making Foo::bar() static first would make it collide with Foo::bar(Foo
+  // f), causing it to get renamed to bar$redex0(). But if Foo::bar(Foo f)
+  // gets static-ified first, it becomes Foo::bar(Foo f, Foo f), so when bar()
+  // gets made static later there is no collision. So in the interest of
+  // having reproducible binaries, we sort the methods first.
+  //
+  // Also, we didn't use an std::set keyed by method signature here because
+  // make_static is mutating the signatures. The tree that implements the set
+  // would have to be rebalanced after the mutations.
+  std::vector<DexMethod*> methods(m_delayed_make_static.begin(),
+                                  m_delayed_make_static.end());
+  std::sort(methods.begin(), methods.end(), compare_dexmethods);
+  for (auto method : methods) {
+    TRACE(MMINL, 6, "making %s static", method->get_name()->c_str());
+    mutators::make_static(method);
+  }
+  walk::parallel::opcodes(
+      final_scope, [](DexMethod* meth) { return true; },
+      [&](DexMethod*, IRInstruction* insn) {
+        auto op = insn->opcode();
+        if (op == OPCODE_INVOKE_DIRECT) {
+          auto m = insn->get_method()->as_def();
+          if (m && m_delayed_make_static.count(m)) {
+            insn->set_opcode(OPCODE_INVOKE_STATIC);
+          }
+        }
+      });
+  m_delayed_make_static.clear();
+}
+
+void ClassSplitter::set_instrumentation_callback(
+    std::function<void(DexMethod*)>&& callback) {
+  m_instrumentation_callback = std::move(callback);
+}
 } // namespace class_splitting

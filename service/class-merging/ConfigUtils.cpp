@@ -14,7 +14,7 @@ namespace class_merging {
 namespace utils {
 
 DexType* get_type(const std::string& type_s) {
-  auto type = DexType::get_type(type_s.c_str());
+  auto type = DexType::get_type(type_s);
   if (type == nullptr) {
     TRACE(CLMG, 2, "[ClassMerging] Warning: No type found for target type %s",
           type_s.c_str());
@@ -26,7 +26,9 @@ std::vector<DexType*> get_types(const std::vector<std::string>& target_types) {
   std::vector<DexType*> types;
   for (const auto& type_s : target_types) {
     auto target_type = get_type(type_s);
-    if (target_type == nullptr) continue;
+    if (target_type == nullptr) {
+      continue;
+    }
     types.push_back(target_type);
   }
   return types;

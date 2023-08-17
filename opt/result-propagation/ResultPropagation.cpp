@@ -9,13 +9,14 @@
 
 #include <vector>
 
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+
 #include "BaseIRAnalyzer.h"
-#include "ConstantAbstractDomain.h"
 #include "ControlFlow.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
 #include "PassManager.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
 #include "Resolver.h"
 #include "ScopedCFG.h"
 #include "Show.h"
@@ -264,8 +265,12 @@ boost::optional<ParamIndex> ReturnParamResolver::get_return_param_index(
     return 0;
   }
 
-  const auto callee =
-      resolve_method(method, opcode_to_search(insn), resolved_refs);
+  auto callee = resolve_method(method, opcode_to_search(insn), resolved_refs);
+  if (callee == nullptr && opcode == OPCODE_INVOKE_VIRTUAL) {
+    // There are some invoke-virtual call on methods whose def are
+    // actually in interface.
+    callee = resolve_method(method, MethodSearch::InterfaceVirtual);
+  }
   if (callee == nullptr) {
     return boost::none;
   }
@@ -294,9 +299,18 @@ boost::optional<ParamIndex> ReturnParamResolver::get_return_param_index(
       return boost::none;
     }
 
+    if (opcode == OPCODE_INVOKE_INTERFACE &&
+        is_annotation(type_class(callee->get_class()))) {
+      return boost::none;
+    }
+
     const auto overriding_methods =
         method_override_graph::get_overriding_methods(m_graph, callee);
+    auto static_base_type = method->get_class();
     for (auto* overriding : overriding_methods) {
+      if (!type::check_cast(overriding->get_class(), static_base_type)) {
+        continue;
+      }
       const auto& mwrpit = methods_which_return_parameter.find(overriding);
       if (mwrpit == methods_which_return_parameter.end()) {
         return boost::none;
@@ -421,7 +435,7 @@ boost::optional<ParamIndex> ReturnParamResolver::get_return_param_index(
     if (last == block->end() || !opcode::is_a_return(last->insn->opcode())) {
       continue;
     }
-    const auto env = analyzer.get_exit_state_at(block);
+    const auto& env = analyzer.get_exit_state_at(block);
     const auto& block_return_param_index = env.get(RETURN_VALUE);
     return_param_index.join_with(block_return_param_index);
   }

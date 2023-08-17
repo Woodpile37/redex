@@ -38,10 +38,12 @@ class DexIdx {
   uint32_t m_method_ids_size;
   dex_proto_id* m_proto_ids;
   uint32_t m_proto_ids_size;
+  // The call-site and method-handle tables are optional, so we initialize their
+  // sizes to 0.
   dex_callsite_id* m_callsite_ids;
-  uint32_t m_callsite_ids_size;
+  uint32_t m_callsite_ids_size{0};
   dex_methodhandle_id* m_methodhandle_ids;
-  uint32_t m_methodhandle_ids_size;
+  uint32_t m_methodhandle_ids_size{0};
 
   std::vector<const DexString*> m_string_cache;
   std::vector<DexType*> m_type_cache;
@@ -63,6 +65,7 @@ class DexIdx {
   explicit DexIdx(const dex_header* dh);
 
   const DexString* get_stringidx(uint32_t stridx) {
+    redex_assert(stridx < m_string_ids_size);
     if (m_string_cache[stridx] == nullptr) {
       m_string_cache[stridx] = get_stringidx_fromdex(stridx);
     }
@@ -104,6 +107,8 @@ class DexIdx {
     redex_assert(m_field_cache[fidx]);
     return m_field_cache[fidx];
   }
+
+  uint32_t get_method_ids_size() { return m_method_ids_size; }
 
   DexMethodRef* get_methodidx(uint32_t midx) {
     always_assert_type_log(
@@ -148,6 +153,8 @@ class DexIdx {
     return m_methodhandle_cache[mhidx];
   }
 
+  uint32_t get_proto_ids_size() { return m_proto_ids_size; }
+
   DexProto* get_protoidx(uint32_t pidx) {
     always_assert_type_log(
         pidx < m_proto_ids_size, RedexError::CACHE_INDEX_OUT_OF_BOUND,
@@ -161,13 +168,23 @@ class DexIdx {
     return m_proto_cache[pidx];
   }
 
-  const uint32_t* get_uint_data(uint32_t offset) {
-    always_assert(offset < ((dex_header*)m_dexbase)->file_size);
-    return (uint32_t*)(m_dexbase + offset);
+  uint32_t get_file_size() const { return ((dex_header*)m_dexbase)->file_size; }
+
+  template <typename T>
+  const T* get_data(uint32_t offset) {
+    always_assert(offset < offset + sizeof(T));
+    always_assert(offset + sizeof(T) <= get_file_size());
+    return (T*)(m_dexbase + offset);
   }
 
+  const uint32_t* get_uint_data(uint32_t offset) {
+    return get_data<uint32_t>(offset);
+  }
+
+  const uint8_t* end() const { return m_dexbase + get_file_size(); }
+
   const uint8_t* get_uleb_data(uint32_t offset) {
-    always_assert(offset < ((dex_header*)m_dexbase)->file_size);
+    always_assert(offset < get_file_size()); // Best effort.
     return m_dexbase + offset;
   }
 

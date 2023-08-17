@@ -7,8 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <sparta/PatriciaTreeSet.h>
+
 #include "DexTypeEnvironment.h"
-#include "PatriciaTreeSet.h"
 #include "RedexTest.h"
 
 using TypeSet = sparta::PatriciaTreeSet<const DexType*>;
@@ -51,6 +52,13 @@ class TypeAnalysisTestBase : public RedexIntegrationTest {
 
   DexTypeDomain get_type_domain_simple(const std::string& type_name) {
     return DexTypeDomain(DexType::make_type(DexString::make_string(type_name)));
+  }
+
+  DexTypeDomain get_type_domain_simple(const std::string& type_name,
+                                       const Nullness nullness,
+                                       bool is_dex_type_exact) {
+    return DexTypeDomain(DexType::make_type(DexString::make_string(type_name)),
+                         nullness, is_dex_type_exact);
   }
 
   DexType* get_type_simple(const std::string& type_name) {

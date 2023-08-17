@@ -5,12 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "AbstractDomain.h"
-#include "Analyzer.h"
-#include "FiniteAbstractDomain.h"
-#include "HashedSetAbstractDomain.h"
-#include "MonotonicFixpointIterator.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
+#include <sparta/AbstractDomain.h>
+#include <sparta/Analyzer.h>
+#include <sparta/FiniteAbstractDomain.h>
+#include <sparta/HashedSetAbstractDomain.h>
+#include <sparta/MonotonicFixpointIterator.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -55,7 +55,7 @@ struct ControlPoint {
   explicit ControlPoint(const std::string& l) : label(l) {}
 };
 
-bool operator==(const ControlPoint& cp1, const ControlPoint& cp2) {
+static bool operator==(const ControlPoint& cp1, const ControlPoint& cp2) {
   return cp1.label == cp2.label;
 }
 
@@ -164,7 +164,7 @@ class ControlFlowGraph final {
   friend class ControlFlowGraphInterface;
 };
 
-const ControlFlowGraph& build_cfg(const Function* f) {
+static const ControlFlowGraph& build_cfg(const Function* f) {
   if (f && f->cfg) {
     return *f->cfg;
   }
@@ -314,25 +314,19 @@ std::unordered_map<Program*, CallGraph> AnalysisAdaptorBase::call_graph_cache;
 
 namespace purity_interprocedural {
 
-struct Summary : public sparta::AbstractDomain<Summary> {
+struct Summary final : public sparta::AbstractDomain<Summary> {
   explicit Summary() {
     m_pure = true;
     m_kind = sparta::AbstractValueKind::Bottom;
   }
 
-  virtual bool is_bottom() const {
-    return m_kind == sparta::AbstractValueKind::Bottom;
-  }
+  bool is_bottom() const { return m_kind == sparta::AbstractValueKind::Bottom; }
 
-  virtual bool is_value() const {
-    return m_kind == sparta::AbstractValueKind::Value;
-  }
+  bool is_value() const { return m_kind == sparta::AbstractValueKind::Value; }
 
-  virtual bool is_top() const {
-    return m_kind == sparta::AbstractValueKind::Top;
-  }
+  bool is_top() const { return m_kind == sparta::AbstractValueKind::Top; }
 
-  virtual bool leq(const Summary& other) const {
+  bool leq(const Summary& other) const {
     if (is_bottom()) {
       return true;
     } else if (m_kind == sparta::AbstractValueKind::Value) {
@@ -343,7 +337,7 @@ struct Summary : public sparta::AbstractDomain<Summary> {
     }
   }
 
-  virtual bool equals(const Summary& other) const {
+  bool equals(const Summary& other) const {
     if (m_kind != other.m_kind) {
       return false;
     } else {
@@ -353,23 +347,23 @@ struct Summary : public sparta::AbstractDomain<Summary> {
     }
   }
 
-  virtual void set_to_bottom() { m_kind = sparta::AbstractValueKind::Bottom; }
-  virtual void set_value(bool pure) {
+  void set_to_bottom() { m_kind = sparta::AbstractValueKind::Bottom; }
+  void set_value(bool pure) {
     m_kind = sparta::AbstractValueKind::Value;
     m_pure = pure;
   }
-  virtual void set_to_top() { m_kind = sparta::AbstractValueKind::Top; }
+  void set_to_top() { m_kind = sparta::AbstractValueKind::Top; }
 
-  virtual void join_with(const Summary& other) {
+  void join_with(const Summary& other) {
     if (is_bottom() || other.is_top()) {
       *this = other;
     } else if (is_value() && other.is_value()) {
       m_pure &= other.m_pure;
     }
   }
-  virtual void widen_with(const Summary& other) {}
-  virtual void meet_with(const Summary& other) {}
-  virtual void narrow_with(const Summary& other) {}
+  void widen_with(const Summary& other) {}
+  void meet_with(const Summary& other) {}
+  void narrow_with(const Summary& other) {}
 
   bool pure() { return m_pure; }
 
@@ -379,7 +373,7 @@ struct Summary : public sparta::AbstractDomain<Summary> {
 };
 
 enum Elements { BOTTOM, PURE, IMPURE, TOP };
-using Lattice = sparta::BitVectorLattice<Elements, 4, std::hash<int>>;
+using Lattice = sparta::BitVectorLattice<Elements, /* kCardinality */ 4>;
 Lattice lattice({BOTTOM, PURE, IMPURE, TOP},
                 {{BOTTOM, PURE}, {BOTTOM, IMPURE}, {PURE, TOP}, {IMPURE, TOP}});
 
@@ -603,7 +597,7 @@ using Analysis = sparta::InterproceduralAnalyzer<PurityAnalysisAdaptor>;
 
 } // namespace purity_interprocedural
 
-void test1() {
+static void test1() {
   using namespace language;
 
   Function fun1, fun2, fun3, fun4, fun5, fun6, fun7, mainfun;

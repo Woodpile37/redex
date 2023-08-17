@@ -3,6 +3,9 @@
 <img src="SPARTA.png" width="300" height="300"/> 
 
 [![Support Ukraine](https://img.shields.io/badge/Support-Ukraine-FFD500?style=flat&labelColor=005BBB)](https://opensource.fb.com/support-ukraine)
+![Rust Build](https://github.com/facebook/SPARTA/actions/workflows/rust.yml/badge.svg)
+![C++](https://github.com/facebook/SPARTA/actions/workflows/cmake.yml/badge.svg)
+[![crates.io](https://img.shields.io/crates/v/sparta.svg)](https://crates.io/crates/sparta)
 
 SPARTA is a library of software components specially designed for building high-performance static analyzers based on the theory of Abstract Interpretation.
 
@@ -76,7 +79,7 @@ cmake --build .
 To run the unit tests, please type:
 
 ```
-./run_all_tests.sh
+make test
 ```
 
 To copy the header files into `/usr/local/include/sparta` and set up a cmake library for SPARTA, you can use the following command:

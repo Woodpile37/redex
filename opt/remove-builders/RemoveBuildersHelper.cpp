@@ -633,7 +633,7 @@ bool params_change_regs(DexMethod* method) {
       if (opcode::is_an_iget(op)) {
         DexField* field =
             resolve_field(insn->get_field(), FieldSearch::Instance);
-        if (field->get_class() == arg) {
+        if (field && field->get_class() == arg) {
           continue;
         }
       }
@@ -1096,7 +1096,7 @@ DexType* get_buildee(DexType* builder) {
       !deobfuscated_name.empty() ? deobfuscated_name : builder->str();
 
   auto buildee_name = builder_name.substr(0, builder_name.size() - 9) + ";";
-  return DexType::get_type(buildee_name.c_str());
+  return DexType::get_type(buildee_name);
 }
 
 std::unordered_set<DexMethod*> get_all_methods(IRCode* code, DexType* type) {

@@ -57,8 +57,30 @@ bool returns_reference(const DexMethod* method) {
   return type::is_object(rtype);
 }
 
+void set_encoded_values(const DexClass* cls, DexTypeEnvironment* env) {
+  for (auto* sfield : cls->get_sfields()) {
+    if (sfield->is_external() || !is_reference(sfield)) {
+      continue;
+    }
+    redex_assert(!type::is_primitive(sfield->get_type()));
+    auto value = sfield->get_static_value();
+    if (value == nullptr || value->evtype() == DEVT_NULL) {
+      env->set(sfield, DexTypeDomain::null());
+    } else if (sfield->get_type() == type::java_lang_String() &&
+               value->evtype() == DEVT_STRING) {
+      env->set(sfield, DexTypeDomain(type::java_lang_String()));
+    } else if (sfield->get_type() == type::java_lang_Class() &&
+               value->evtype() == DEVT_TYPE) {
+      env->set(sfield, DexTypeDomain(type::java_lang_Class()));
+    } else {
+      env->set(sfield, DexTypeDomain::top());
+    }
+  }
+}
+
 /*
- * If a static field is not populated in clinit, it is implicitly null.
+ * If a static field is not populated in clinit, it is implicitly null or
+ * unknown.
  */
 void set_sfields_in_partition(const DexClass* cls,
                               const DexTypeEnvironment& env,
@@ -75,10 +97,10 @@ void set_sfields_in_partition(const DexClass* cls,
             SHOW(domain));
       always_assert(field->get_class() == cls->get_type());
     } else {
-      TRACE(TYPE, 5, "%s has null type after <clinit>", SHOW(field));
-      domain = DexTypeDomain::null();
+      // Other encoded value might not be fully supported.
+      TRACE(TYPE, 5, "%s has unknown type after <clinit>", SHOW(field));
     }
-    field_partition->set(field, domain);
+    field_partition->set(field, std::move(domain));
   }
 }
 
@@ -168,6 +190,16 @@ WholeProgramState::WholeProgramState(
   collect(scope, gta);
 }
 
+WholeProgramState::WholeProgramState(
+    const Scope& scope,
+    const global::GlobalTypeAnalyzer& gta,
+    const std::unordered_set<DexMethod*>& non_true_virtuals,
+    const ConcurrentSet<const DexMethod*>& any_init_reachables,
+    std::shared_ptr<const call_graph::Graph> call_graph)
+    : WholeProgramState(scope, gta, non_true_virtuals, any_init_reachables) {
+  m_call_graph = std::move(call_graph);
+}
+
 std::string WholeProgramState::show_field(const DexField* f) { return show(f); }
 std::string WholeProgramState::show_method(const DexMethod* m) {
   return show(m);
@@ -175,8 +207,9 @@ std::string WholeProgramState::show_method(const DexMethod* m) {
 void WholeProgramState::setup_known_method_returns() {
   for (auto& p : STATIC_METHOD_TO_TYPE_MAP) {
     auto method = DexMethod::make_method(p.first);
-    auto type = DexTypeDomain(
-        DexType::make_type(DexString::make_string(p.second)), NOT_NULL);
+    auto type =
+        DexTypeDomain(DexType::make_type(DexString::make_string(p.second)),
+                      NOT_NULL, /* is_dex_type_exact */ true);
     m_known_method_returns.insert(std::make_pair(method, type));
   }
 }
@@ -204,16 +237,24 @@ void WholeProgramState::analyze_clinits_and_ctors(
     const Scope& scope,
     const global::GlobalTypeAnalyzer& gta,
     DexTypeFieldPartition* field_partition) {
-  for (DexClass* cls : scope) {
-    auto clinit = cls->get_clinit();
-    if (clinit) {
-      IRCode* code = clinit->get_code();
-      auto& cfg = code->cfg();
-      auto lta = gta.get_local_analysis(clinit);
-      auto env = lta->get_exit_state_at(cfg.exit_block());
-      set_sfields_in_partition(cls, env, field_partition);
-    } else {
-      set_sfields_in_partition(cls, DexTypeEnvironment::top(), field_partition);
+
+  std::mutex mutex;
+  walk::parallel::classes(scope, [&](auto* cls) {
+    DexTypeFieldPartition cls_field_partition;
+
+    if (!cls->get_sfields().empty()) {
+      auto clinit = cls->get_clinit();
+      if (clinit) {
+        IRCode* code = clinit->get_code();
+        auto& cfg = code->cfg();
+        auto lta = gta.get_local_analysis(clinit);
+        const auto& env = lta->get_exit_state_at(cfg.exit_block());
+        set_sfields_in_partition(cls, env, &cls_field_partition);
+      } else {
+        DexTypeEnvironment env;
+        set_encoded_values(cls, &env);
+        set_sfields_in_partition(cls, env, &cls_field_partition);
+      }
     }
 
     const auto& ctors = cls->get_ctors();
@@ -224,16 +265,19 @@ void WholeProgramState::analyze_clinits_and_ctors(
       IRCode* code = ctor->get_code();
       auto& cfg = code->cfg();
       auto lta = gta.get_local_analysis(ctor);
-      auto env = lta->get_exit_state_at(cfg.exit_block());
-      set_ifields_in_partition(cls, env, field_partition);
+      const auto& env = lta->get_exit_state_at(cfg.exit_block());
+      set_ifields_in_partition(cls, env, &cls_field_partition);
     }
-  }
+
+    std::lock_guard<std::mutex> lock_guard(mutex);
+    field_partition->join_with(cls_field_partition);
+  });
 }
 
 void WholeProgramState::collect(const Scope& scope,
                                 const global::GlobalTypeAnalyzer& gta) {
-  ConcurrentMap<const DexField*, std::vector<DexTypeDomain>> fields_tmp;
-  ConcurrentMap<const DexMethod*, std::vector<DexTypeDomain>> methods_tmp;
+  ConcurrentMap<const DexField*, DexTypeDomain> fields_tmp;
+  ConcurrentMap<const DexMethod*, DexTypeDomain> methods_tmp;
 
   walk::parallel::methods(scope, [&](DexMethod* method) {
     IRCode* code = method->get_code();
@@ -256,25 +300,21 @@ void WholeProgramState::collect(const Scope& scope,
     }
   });
   for (const auto& pair : fields_tmp) {
-    for (auto& type : pair.second) {
-      m_field_partition.update(pair.first, [&type](auto* current_type) {
-        current_type->join_with(type);
-      });
-    }
+    m_field_partition.update(pair.first, [&pair](auto* current_type) {
+      current_type->join_with(pair.second);
+    });
   }
   for (const auto& pair : methods_tmp) {
-    for (auto& type : pair.second) {
-      m_method_partition.update(pair.first, [&type](auto* current_type) {
-        current_type->join_with(type);
-      });
-    }
+    m_method_partition.update(pair.first, [&pair](auto* current_type) {
+      current_type->join_with(pair.second);
+    });
   }
 }
 
 void WholeProgramState::collect_field_types(
     const IRInstruction* insn,
     const DexTypeEnvironment& env,
-    ConcurrentMap<const DexField*, std::vector<DexTypeDomain>>* field_tmp) {
+    ConcurrentMap<const DexField*, DexTypeDomain>* field_tmp) {
   if (!opcode::is_an_sput(insn->opcode()) &&
       !opcode::is_an_iput(insn->opcode())) {
     return;
@@ -289,17 +329,22 @@ void WholeProgramState::collect_field_types(
     ss << type;
     TRACE(TYPE, 5, "collecting field %s -> %s", SHOW(field), ss.str().c_str());
   }
-  field_tmp->update(field,
-                    [type](const DexField*,
-                           std::vector<DexTypeDomain>& s,
-                           bool /* exists */) { s.emplace_back(type); });
+  field_tmp->update(
+      field,
+      [&type](const DexField*, DexTypeDomain& current_type, bool exists) {
+        if (exists) {
+          current_type.join_with(type);
+        } else {
+          current_type = std::move(type);
+        }
+      });
 }
 
 void WholeProgramState::collect_return_types(
     const IRInstruction* insn,
     const DexTypeEnvironment& env,
     const DexMethod* method,
-    ConcurrentMap<const DexMethod*, std::vector<DexTypeDomain>>* method_tmp) {
+    ConcurrentMap<const DexMethod*, DexTypeDomain>* method_tmp) {
   auto op = insn->opcode();
   if (!opcode::is_a_return(op)) {
     return;
@@ -311,8 +356,8 @@ void WholeProgramState::collect_return_types(
     // reachable.
     method_tmp->update(
         method,
-        [](const DexMethod*, std::vector<DexTypeDomain>& s, bool /* exists */) {
-          s.emplace_back(DexTypeDomain::top());
+        [](const DexMethod*, DexTypeDomain& current_type, bool /* exists */) {
+          current_type = DexTypeDomain::top();
         });
     return;
   }
@@ -323,10 +368,14 @@ void WholeProgramState::collect_return_types(
     TRACE(TYPE, 5, "collecting method %s -> %s", SHOW(method),
           ss.str().c_str());
   }
-  method_tmp->update(method,
-                     [type](const DexMethod*,
-                            std::vector<DexTypeDomain>& s,
-                            bool /* exists */) { s.emplace_back(type); });
+  method_tmp->update(method, [&type](const DexMethod*,
+                                     DexTypeDomain& current_type, bool exists) {
+    if (exists) {
+      current_type.join_with(type);
+    } else {
+      current_type = std::move(type);
+    }
+  });
 }
 
 bool WholeProgramState::is_reachable(const global::GlobalTypeAnalyzer& gta,
@@ -432,6 +481,26 @@ bool WholeProgramAwareAnalyzer::analyze_invoke(
   if (known_type) {
     env->set(RESULT_REGISTER, *known_type);
     return false;
+  }
+
+  if (whole_program_state->has_call_graph()) {
+    auto method = resolve_method(insn->get_method(), opcode_to_search(insn));
+    if (method == nullptr && opcode_to_search(insn) == MethodSearch::Virtual) {
+      method =
+          resolve_method(insn->get_method(), MethodSearch::InterfaceVirtual);
+    }
+    if (method == nullptr) {
+      return false;
+    }
+    if (whole_program_state->method_is_dynamic(method)) {
+      return false;
+    }
+    auto type = whole_program_state->get_return_type_from_cg(insn);
+    if (type.is_top()) {
+      return false;
+    }
+    env->set(RESULT_REGISTER, type);
+    return true;
   }
 
   auto method = resolve_method(insn->get_method(), opcode_to_search(insn));

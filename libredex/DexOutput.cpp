@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <bitset>
 #include <boost/filesystem.hpp>
 #include <exception>
 #include <fcntl.h>
@@ -47,8 +48,10 @@
 #include "IRCode.h"
 #include "Macros.h"
 #include "MethodProfiles.h"
-#include "MethodSimilarityOrderer.h"
+#include "MethodSimilarityCompressionConsciousOrderer.h"
+#include "MethodSimilarityGreedyOrderer.h"
 #include "Pass.h"
+#include "RedexOptions.h" // For DebugInfoKind
 #include "Resolver.h"
 #include "Sha1.h"
 #include "Show.h"
@@ -200,12 +203,16 @@ void GatheredTypes::sort_dexmethod_emitlist_method_similarity_order(
     }
   }
 
+  bool use_compression_conscious_order{false};
   MethodSimilarityOrderingConfig* similarity_config{nullptr};
   if (global_config.has_config_by_name("method_similarity_order")) {
     similarity_config =
         global_config.get_config_by_name<MethodSimilarityOrderingConfig>(
             "method_similarity_order");
+    use_compression_conscious_order =
+        similarity_config->use_compression_conscious_order;
   }
+
   if (similarity_config != nullptr &&
       similarity_config->use_class_level_perf_sensitivity) {
     for (auto meth : lmeth) {
@@ -231,8 +238,14 @@ void GatheredTypes::sort_dexmethod_emitlist_method_similarity_order(
       OPUT, 2,
       "Skipping %zu perf sensitive methods, ordering %zu methods by similarity",
       perf_sensitive_methods.size(), remaining_methods.size());
-  MethodSimilarityOrderer method_similarity_orderer;
-  method_similarity_orderer.order(remaining_methods);
+
+  if (use_compression_conscious_order) {
+    MethodSimilarityCompressionConsciousOrderer method_orderer;
+    method_orderer.order(remaining_methods, this);
+  } else {
+    MethodSimilarityGreedyOrderer method_orderer;
+    method_orderer.order(remaining_methods);
+  }
 
   lmeth.clear();
   lmeth.insert(lmeth.end(), perf_sensitive_methods.begin(),
@@ -538,7 +551,7 @@ DexOutput::DexOutput(
     PositionMapper* pos_mapper,
     std::unordered_map<DexMethod*, uint64_t>* method_to_id,
     std::unordered_map<DexCode*, std::vector<DebugLineItem>>* code_debug_lines,
-    PostLowering* post_lowering,
+    const DexOutputConfig& dex_output_config,
     int min_sdk)
     : m_classes(classes),
       m_gtypes(std::move(gtypes)),
@@ -552,7 +565,8 @@ DexOutput::DexOutput(
       m_offset(0),
       m_iodi_metadata(iodi_metadata),
       m_config_files(config_files),
-      m_min_sdk(min_sdk) {
+      m_min_sdk(min_sdk),
+      m_dex_output_config(dex_output_config) {
   // Ensure a clean slate.
   memset(m_output.get(), 0, m_output_size);
 
@@ -560,15 +574,15 @@ DexOutput::DexOutput(
 
   always_assert_log(
       m_dodx->method_to_idx().size() <= kMaxMethodRefs,
-      "Trying to encode too many method refs in dex %s: %lu (limit: %lu). Run "
-      "with `-J ir_type_checker.check_num_of_refs=true`.",
+      "Trying to encode too many method refs in dex %s: %zu (limit: %zu). Run "
+      "with check_properties_deep turned on.",
       boost::filesystem::path(path).filename().c_str(),
       m_dodx->method_to_idx().size(),
       kMaxMethodRefs);
   always_assert_log(
       m_dodx->field_to_idx().size() <= kMaxFieldRefs,
-      "Trying to encode too many field refs in dex %s: %lu (limit: %lu). Run "
-      "with `-J ir_type_checker.check_num_of_refs=true`.",
+      "Trying to encode too many field refs in dex %s: %zu (limit: %zu). Run "
+      "with check_properties_deep turned on.",
       boost::filesystem::path(path).filename().c_str(),
       m_dodx->field_to_idx().size(),
       kMaxFieldRefs);
@@ -588,9 +602,6 @@ DexOutput::DexOutput(
   m_locator_index = locator_index;
   m_normal_primary_dex = normal_primary_dex;
   m_debug_info_kind = debug_info_kind;
-  if (post_lowering) {
-    m_detached_methods = post_lowering->get_detached_methods();
-  }
 }
 
 void DexOutput::insert_map_item(uint16_t maptype,
@@ -886,9 +897,9 @@ void DexOutput::emit_magic_locators() {
 void DexOutput::generate_type_data() {
   always_assert_log(
       m_dodx->type_to_idx().size() < get_max_type_refs(m_min_sdk),
-      "Trying to encode too many type refs in dex %lu: %lu (limit: %lu).\n"
+      "Trying to encode too many type refs in dex %zu: %zu (limit: %zu).\n"
       "NOTE: Please check InterDexPass config flags and set: "
-      "`reserved_trefs: %lu` (or larger, until the issue goes away)",
+      "`reserved_trefs: %zu` (or larger, until the issue goes away)",
       m_dex_number,
       m_dodx->type_to_idx().size(),
       get_max_type_refs(m_min_sdk),
@@ -1006,6 +1017,9 @@ void DexOutput::generate_class_data_items() {
     if (!clz->has_class_data()) continue;
     /* No alignment constraints for this data */
     int size = clz->encode(m_dodx.get(), dco, m_output.get() + m_offset);
+    if (m_dex_output_config.write_class_sizes) {
+      m_stats.class_size[clz] = size;
+    }
     cdefs[i].class_data_offset = m_offset;
     inc_offset(size);
     count += 1;
@@ -1190,15 +1204,14 @@ void DexOutput::generate_static_values() {
     for (uint32_t i = 0; i < callsites.size(); i++) {
       auto callsite = callsites[i];
       auto eva = callsite->as_encoded_value_array();
-      uint32_t offset;
       if (enc_arrays.count(eva)) {
-        offset = m_call_site_items[callsite] = enc_arrays.at(eva);
+        m_call_site_items[callsite] = enc_arrays.at(eva);
       } else {
         uint8_t* output = m_output.get() + m_offset;
         uint8_t* outputsv = output;
         eva.encode(m_dodx.get(), output);
         enc_arrays.emplace(std::move(eva), m_offset);
-        offset = m_call_site_items[callsite] = m_offset;
+        m_call_site_items[callsite] = m_offset;
         inc_offset(output - outputsv);
         m_stats.num_static_values++;
       }
@@ -1351,9 +1364,6 @@ void DexOutput::generate_annotations() {
    * 5) Attach annotation_directories to the classdefs
    */
   std::vector<DexAnnotationDirectory*> lad;
-  int xrefsize = 0;
-  int annodirsize = 0;
-  int xrefcnt = 0;
   std::map<DexAnnotationDirectory*, int> ad_to_classnum;
   annomap_t annomap;
   asetmap_t asetmap;
@@ -1364,9 +1374,6 @@ void DexOutput::generate_annotations() {
     DexClass* clz = m_classes->at(i);
     DexAnnotationDirectory* ad = clz->get_annotation_directory();
     if (ad) {
-      xrefsize += ad->xref_size();
-      annodirsize += ad->annodir_size();
-      xrefcnt += ad->xref_count();
       lad.push_back(ad);
       ad_to_classnum[ad] = i;
     }
@@ -1540,7 +1547,7 @@ struct ParamSizeOrder {
   }
 };
 
-uint32_t emit_instruction_offset_debug_info(
+uint32_t emit_instruction_offset_debug_info_helper(
     DexOutputIdx* dodx,
     PositionMapper* pos_mapper,
     std::vector<CodeItemEmit*>& code_items,
@@ -1570,14 +1577,11 @@ uint32_t emit_instruction_offset_debug_info(
   // method. Hopefully no debug program is > 128k. Its ok to increase this
   // in the future.
   constexpr int TMP_SIZE = 128 * 1024;
-  uint8_t* tmp = (uint8_t*)malloc(TMP_SIZE);
+  auto temporary_buffer = std::make_unique<uint8_t[]>(TMP_SIZE);
+  uint8_t* tmp = temporary_buffer.get();
   std::unordered_map<const DexMethod*, std::vector<const DexMethod*>>
       clustered_methods;
-  // Returns whether this is in a cluster, period, not a "current" cluster in
-  // this iteration.
-  auto is_in_global_cluster = [&](const DexMethod* method) {
-    return iodi_metadata.get_cluster(method).size() > 1;
-  };
+
   for (auto& it : code_items) {
     DexCode* dc = it->code;
     const auto dbg_item = dc->get_debug_item();
@@ -1606,12 +1610,12 @@ uint32_t emit_instruction_offset_debug_info(
                                                   debug_size);
     always_assert_log(res.second, "Failed to insert %s, %d pair", SHOW(method),
                       dc->size());
-    if (is_in_global_cluster(method)) {
+    if (iodi_metadata.is_in_global_cluster(method)) {
       clustered_methods[iodi_metadata.get_canonical_method(method)].push_back(
           method);
     }
   }
-  free((void*)tmp);
+  temporary_buffer = nullptr;
 
   std20::erase_if(clustered_methods,
                   [](auto& p) { return p.second.size() <= 1; });
@@ -2195,7 +2199,7 @@ uint32_t emit_instruction_offset_debug_info(
       //       versions for all of them.
       DebugMetadata no_line_addin_metadata;
       const DebugMetadata* metadata = &method_to_debug_meta.at(method);
-      if (!is_in_global_cluster(method) && line_addin != 0) {
+      if (!iodi_metadata.is_in_global_cluster(method) && line_addin != 0) {
         no_line_addin_metadata =
             calculate_debug_metadata(dbg, dc, it->code_item, pos_mapper,
                                      metadata->num_params, code_debug_map,
@@ -2236,16 +2240,10 @@ uint32_t emit_instruction_offset_debug_info(
   // be encoded.
   const size_t large_bound = iodi_layers ? DexOutput::kIODILayerBound : 1;
 
-  std::unordered_set<const DexMethod*> too_large_cluster_methods;
-  {
-    for (const auto& p : iodi_metadata.get_name_clusters()) {
-      if (p.second.size() > large_bound) {
-        too_large_cluster_methods.insert(p.second.begin(), p.second.end());
-      }
-    }
-  }
-  TRACE(IODI, 1, "%zu methods in too-large clusters.",
-        too_large_cluster_methods.size());
+  const auto& too_large_cluster_canonical_methods =
+      iodi_metadata.get_too_large_cluster_canonical_methods();
+  TRACE(IODI, 1, "%zu too-large method clusters.",
+        too_large_cluster_canonical_methods.size());
 
   std::vector<CodeItemEmit*> code_items_tmp;
   code_items_tmp.reserve(code_items.size());
@@ -2272,18 +2270,20 @@ uint32_t emit_instruction_offset_debug_info(
         code_items.size() - code_items_tmp.size());
   // Remove all unsupported items.
   std::vector<CodeItemEmit*> unsupported_code_items;
-  if (!too_large_cluster_methods.empty()) {
+  if (!too_large_cluster_canonical_methods.empty()) {
     code_items_tmp.erase(
-        std::remove_if(code_items_tmp.begin(), code_items_tmp.end(),
-                       [&](CodeItemEmit* cie) {
-                         bool supported =
-                             too_large_cluster_methods.count(cie->method) == 0;
-                         if (!supported) {
-                           iodi_metadata.mark_method_huge(cie->method);
-                           unsupported_code_items.push_back(cie);
-                         }
-                         return !supported;
-                       }),
+        std::remove_if(
+            code_items_tmp.begin(), code_items_tmp.end(),
+            [&](CodeItemEmit* cie) {
+              bool supported =
+                  too_large_cluster_canonical_methods.count(
+                      iodi_metadata.get_canonical_method(cie->method)) == 0;
+              if (!supported) {
+                iodi_metadata.mark_method_huge(cie->method);
+                unsupported_code_items.push_back(cie);
+              }
+              return !supported;
+            }),
         code_items_tmp.end());
   }
 
@@ -2295,7 +2295,7 @@ uint32_t emit_instruction_offset_debug_info(
       }
       TRACE(IODI, 1, "IODI iteration %zu", i);
       const size_t before_size = code_items_tmp.size();
-      offset += emit_instruction_offset_debug_info(
+      offset += emit_instruction_offset_debug_info_helper(
           dodx, pos_mapper, code_items_tmp, iodi_metadata, i,
           i << DexOutput::kIODILayerShift, store_number, dex_number, output,
           offset, dbgcount, code_debug_map);
@@ -2687,11 +2687,7 @@ const char* deobf_primitive(char type) {
   }
 }
 
-void write_pg_mapping(
-    const std::string& filename,
-    DexClasses* classes,
-    const std::unordered_map<DexClass*, std::vector<DexMethod*>>*
-        detached_methods) {
+void write_pg_mapping(const std::string& filename, DexClasses* classes) {
   if (filename.empty()) return;
 
   auto deobf_class = [&](DexClass* cls) {
@@ -2732,7 +2728,7 @@ void write_pg_mapping(
         } else if (type::is_primitive(type)) {
           return std::string(deobf_primitive(type->c_str()[0]));
         } else {
-          return java_names::internal_to_external(type->c_str());
+          return java_names::internal_to_external(type->str());
         }
       }
     }
@@ -2803,33 +2799,23 @@ void write_pg_mapping(
   for (auto cls : *classes) {
     auto deobf_cls = deobf_class(cls);
     ofs << java_names::internal_to_external(deobf_cls) << " -> "
-        << java_names::internal_to_external(cls->get_type()->c_str()) << ":"
-        << std::endl;
+        << java_names::internal_to_external(cls->get_type()->str()) << ":"
+        << "\n";
     for (auto field : cls->get_ifields()) {
       auto deobf = deobf_field(field);
-      ofs << "    " << deobf << " -> " << field->c_str() << std::endl;
+      ofs << "    " << deobf << " -> " << field->c_str() << "\n";
     }
     for (auto field : cls->get_sfields()) {
       auto deobf = deobf_field(field);
-      ofs << "    " << deobf << " -> " << field->c_str() << std::endl;
+      ofs << "    " << deobf << " -> " << field->c_str() << "\n";
     }
     for (auto meth : cls->get_dmethods()) {
       auto deobf = deobf_meth(meth);
-      ofs << "    " << deobf << " -> " << meth->c_str() << std::endl;
+      ofs << "    " << deobf << " -> " << meth->c_str() << "\n";
     }
     for (auto meth : cls->get_vmethods()) {
       auto deobf = deobf_meth(meth);
-      ofs << "    " << deobf << " -> " << meth->c_str() << std::endl;
-    }
-    if (detached_methods) {
-      auto it = detached_methods->find(cls);
-      if (it != detached_methods->end()) {
-        ofs << "    --- detached methods ---" << std::endl;
-        for (auto meth : it->second) {
-          auto deobf = deobf_meth(meth);
-          ofs << "    " << deobf << " -> " << meth->c_str() << std::endl;
-        }
-      }
+      ofs << "    " << deobf << " -> " << meth->c_str() << "\n";
     }
   }
 }
@@ -2842,27 +2828,27 @@ void write_full_mapping(const std::string& filename,
   std::ofstream ofs(filename.c_str(), std::ofstream::out | std::ofstream::app);
   for (auto cls : *classes) {
     ofs << "type " << cls->get_deobfuscated_name_or_empty() << " -> "
-        << show(cls) << std::endl;
+        << show(cls) << "\n";
     if (store_name) {
       const auto& original_store_name = cls->get_location()->get_store_name();
       ofs << "store " << std::quoted(original_store_name) << " -> "
-          << std::quoted(*store_name) << std::endl;
+          << std::quoted(*store_name) << "\n";
     }
     for (auto field : cls->get_ifields()) {
       ofs << "ifield " << field->get_deobfuscated_name_or_empty() << " -> "
-          << show(field) << std::endl;
+          << show(field) << "\n";
     }
     for (auto field : cls->get_sfields()) {
       ofs << "sfield " << field->get_deobfuscated_name_or_empty() << " -> "
-          << show(field) << std::endl;
+          << show(field) << "\n";
     }
     for (auto method : cls->get_dmethods()) {
       ofs << "dmethod " << method->get_deobfuscated_name_or_empty() << " -> "
-          << show(method) << std::endl;
+          << show(method) << "\n";
     }
     for (auto method : cls->get_vmethods()) {
       ofs << "vmethod " << method->get_deobfuscated_name_or_empty() << " -> "
-          << show(method) << std::endl;
+          << show(method) << "\n";
     }
   }
 }
@@ -2895,7 +2881,7 @@ void DexOutput::write_symbol_files() {
                         hdr.class_defs_size, hdr.signature);
     // XXX: should write_bytecode_offset_mapping be included here too?
   }
-  write_pg_mapping(m_pg_mapping_filename, m_classes, &m_detached_methods);
+  write_pg_mapping(m_pg_mapping_filename, m_classes);
   write_full_mapping(m_full_mapping_filename, m_classes, m_store_name);
   write_bytecode_offset_mapping(m_bytecode_offset_filename,
                                 m_method_bytecode_offsets);
@@ -3029,39 +3015,9 @@ static SortMode make_sort_bytecode(const std::string& sort_bytecode) {
   }
 }
 
-dex_stats_t write_classes_to_dex(
-    const RedexOptions& redex_options,
-    const std::string& filename,
-    DexClasses* classes,
-    std::shared_ptr<GatheredTypes> gtypes,
-    LocatorIndex* locator_index,
-    size_t store_number,
-    const std::string* store_name,
-    size_t dex_number,
-    ConfigFiles& conf,
-    PositionMapper* pos_mapper,
-    std::unordered_map<DexMethod*, uint64_t>* method_to_id,
-    std::unordered_map<DexCode*, std::vector<DebugLineItem>>* code_debug_lines,
-    IODIMetadata* iodi_metadata,
-    const std::string& dex_magic,
-    PostLowering* post_lowering,
-    int min_sdk) {
+std::vector<SortMode> get_code_sort_mode(ConfigFiles& conf,
+                                         const std::string& store_name) {
   const JsonWrapper& json_cfg = conf.get_json_config();
-  bool force_single_dex = json_cfg.get("force_single_dex", false);
-  if (force_single_dex) {
-    always_assert_log(dex_number == 0, "force_single_dex requires one dex");
-  }
-  auto sort_strings = json_cfg.get("string_sort_mode", std::string());
-  SortMode string_sort_mode = SortMode::DEFAULT;
-  if (sort_strings == "class_strings") {
-    string_sort_mode = SortMode::CLASS_STRINGS;
-  } else if (sort_strings == "class_order") {
-    string_sort_mode = SortMode::CLASS_ORDER;
-  }
-
-  auto interdex_config = json_cfg.get("InterDexPass", Json::Value());
-  auto normal_primary_dex =
-      interdex_config.get("normal_primary_dex", false).asBool();
   auto sort_bytecode_cfg = json_cfg.get("bytecode_sort_mode", Json::Value());
   std::vector<SortMode> code_sort_mode;
 
@@ -3080,7 +3036,8 @@ dex_stats_t write_classes_to_dex(
         global_config.get_config_by_name<MethodSimilarityOrderingConfig>(
             "method_similarity_order");
   }
-  if (similarity_config == nullptr || similarity_config->disable) {
+  if (similarity_config == nullptr || similarity_config->disable ||
+      similarity_config->store_name_to_disable == store_name) {
     TRACE(OPUT, 3, "[write_classes_to_dex] disable_method_similarity_order");
     code_sort_mode.erase(
         std::remove_if(
@@ -3092,12 +3049,56 @@ dex_stats_t write_classes_to_dex(
     code_sort_mode.push_back(SortMode::DEFAULT);
   }
 
+  return code_sort_mode;
+}
+
+SortMode get_string_sort_mode(ConfigFiles& conf) {
+  const JsonWrapper& json_cfg = conf.get_json_config();
+  auto sort_strings = json_cfg.get("string_sort_mode", std::string());
+  SortMode string_sort_mode = SortMode::DEFAULT;
+  if (sort_strings == "class_strings") {
+    string_sort_mode = SortMode::CLASS_STRINGS;
+  } else if (sort_strings == "class_order") {
+    string_sort_mode = SortMode::CLASS_ORDER;
+  }
+  return string_sort_mode;
+}
+
+enhanced_dex_stats_t write_classes_to_dex(
+    const std::string& filename,
+    DexClasses* classes,
+    std::shared_ptr<GatheredTypes> gtypes,
+    LocatorIndex* locator_index,
+    size_t store_number,
+    const std::string* store_name,
+    size_t dex_number,
+    ConfigFiles& conf,
+    PositionMapper* pos_mapper,
+    DebugInfoKind debug_info_kind,
+    std::unordered_map<DexMethod*, uint64_t>* method_to_id,
+    std::unordered_map<DexCode*, std::vector<DebugLineItem>>* code_debug_lines,
+    IODIMetadata* iodi_metadata,
+    const std::string& dex_magic,
+    const DexOutputConfig& dex_output_config,
+    int min_sdk,
+    const std::vector<SortMode>& code_sort_mode,
+    SortMode string_sort_mode) {
+  const JsonWrapper& json_cfg = conf.get_json_config();
+  bool force_single_dex = json_cfg.get("force_single_dex", false);
+  if (force_single_dex) {
+    always_assert_log(dex_number == 0, "force_single_dex requires one dex");
+  }
+
+  auto interdex_config = json_cfg.get("InterDexPass", Json::Value());
+  auto normal_primary_dex =
+      interdex_config.get("normal_primary_dex", false).asBool();
+
   TRACE(OPUT, 2, "[write_classes_to_dex][filename] %s", filename.c_str());
 
   DexOutput dout(filename.c_str(), classes, std::move(gtypes), locator_index,
                  normal_primary_dex, store_number, store_name, dex_number,
-                 redex_options.debug_info_kind, iodi_metadata, conf, pos_mapper,
-                 method_to_id, code_debug_lines, post_lowering, min_sdk);
+                 debug_info_kind, iodi_metadata, conf, pos_mapper, method_to_id,
+                 code_debug_lines, dex_output_config, min_sdk);
 
   dout.prepare(string_sort_mode, code_sort_mode, conf, dex_magic);
   dout.write();

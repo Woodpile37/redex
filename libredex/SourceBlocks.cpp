@@ -8,18 +8,22 @@
 #include "SourceBlocks.h"
 
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 
+#include <sparta/S_Expression.h>
+
 #include "ControlFlow.h"
 #include "Debug.h"
 #include "DexClass.h"
 #include "Dominators.h"
+#include "IRList.h"
 #include "IROpcode.h"
 #include "Macros.h"
-#include "S_Expression.h"
+#include "RedexContext.h"
 #include "ScopedCFG.h"
 #include "ScopedMetrics.h"
 #include "Show.h"
@@ -412,8 +416,65 @@ InsertResult insert_source_blocks(DexMethod* method,
                                   const std::vector<ProfileData>& profiles,
                                   bool serialize,
                                   bool insert_after_excs) {
-  InsertHelper helper(&method->get_deobfuscated_name(), profiles, serialize,
-                      insert_after_excs);
+  return insert_source_blocks(&method->get_deobfuscated_name(), cfg, profiles,
+                              serialize, insert_after_excs);
+}
+
+static std::string get_serialized_idom_map(ControlFlowGraph* cfg) {
+  auto doms = dominators::SimpleFastDominators<cfg::GraphInterface>(*cfg);
+  std::stringstream ss_idom_map;
+  auto cfg_blocks = cfg->blocks();
+  bool wrote_first_idom_map_elem = false;
+  auto write_idom_map_elem = [&wrote_first_idom_map_elem,
+                              &ss_idom_map](uint32_t sb_id, uint32_t idom_id) {
+    if (wrote_first_idom_map_elem) {
+      ss_idom_map << ";";
+    }
+    wrote_first_idom_map_elem = true;
+
+    ss_idom_map << sb_id << "->" << idom_id;
+  };
+
+  for (cfg::Block* block : cfg->blocks()) {
+    if (block == cfg->exit_block() &&
+        cfg->get_pred_edge_of_type(block, EDGE_GHOST)) {
+      continue;
+    }
+
+    auto first_sb_in_block = source_blocks::get_first_source_block(block);
+    if (!first_sb_in_block) {
+      continue;
+    }
+
+    auto curr_idom = doms.get_idom(block);
+    if (curr_idom && curr_idom != block) {
+      if (curr_idom != cfg->exit_block() ||
+          !cfg->get_pred_edge_of_type(curr_idom, EDGE_GHOST)) {
+        auto sb_in_idom = source_blocks::get_last_source_block(curr_idom);
+        always_assert(sb_in_idom);
+        write_idom_map_elem(first_sb_in_block->id, sb_in_idom->id);
+      }
+    }
+
+    SourceBlock* prev = nullptr;
+    source_blocks::foreach_source_block(block, [&](const auto& sb) {
+      if (sb != first_sb_in_block) {
+        always_assert(prev);
+        write_idom_map_elem(sb->id, prev->id);
+      }
+      prev = sb;
+    });
+  }
+
+  return ss_idom_map.str();
+}
+
+InsertResult insert_source_blocks(const DexString* method,
+                                  ControlFlowGraph* cfg,
+                                  const std::vector<ProfileData>& profiles,
+                                  bool serialize,
+                                  bool insert_after_excs) {
+  InsertHelper helper(method, profiles, serialize, insert_after_excs);
 
   impl::visit_in_order(
       cfg, [&](Block* cur) { helper.start(cur); },
@@ -422,7 +483,9 @@ InsertResult insert_source_blocks(DexMethod* method,
 
   bool had_failures = helper.wipe_profile_failures(*cfg);
 
-  return {helper.id, helper.oss.str(), !had_failures};
+  auto idom_map = get_serialized_idom_map(cfg);
+
+  return {helper.id, helper.oss.str(), std::move(idom_map), !had_failures};
 }
 
 bool has_source_block_positive_val(const SourceBlock* sb) {
@@ -436,6 +499,50 @@ bool has_source_block_positive_val(const SourceBlock* sb) {
   return any_positive_val;
 }
 
+IRList::iterator find_first_block_insert_point(cfg::Block* b) {
+  // Do not put source blocks before a (pseudo) move result at the head of a
+  // block.
+  auto it = b->begin();
+  if (it == b->end()) {
+    return it;
+  }
+  if (it->type == MFLOW_OPCODE) {
+    auto op = it->insn->opcode();
+    if (opcode::is_a_move_result(op) || opcode::is_a_move_result_pseudo(op) ||
+        opcode::is_move_exception(op)) {
+      ++it;
+    }
+  }
+  return it;
+}
+
+namespace normalize {
+
+size_t num_interactions(const cfg::ControlFlowGraph& cfg,
+                        const SourceBlock* sb) {
+  if (g_redex != nullptr) {
+    return g_redex->num_sb_interaction_indices();
+  }
+
+  auto nums = [](auto* sb) -> std::optional<size_t> {
+    return (sb != nullptr) ? std::optional<size_t>(sb->vals_size)
+                           : std::nullopt;
+  };
+
+  auto caller = nums(sb);
+  if (caller) {
+    return *caller;
+  }
+  auto callee = nums(source_blocks::get_first_source_block(cfg.entry_block()));
+  if (caller) {
+    return *caller;
+  }
+
+  return 0;
+}
+
+} // namespace normalize
+
 namespace {
 
 size_t count_blocks(
@@ -445,6 +552,19 @@ size_t count_blocks(
 size_t count_block_has_sbs(
     Block* b, const dominators::SimpleFastDominators<cfg::GraphInterface>&) {
   return source_blocks::has_source_blocks(b) ? 1 : 0;
+}
+size_t count_block_has_incomplete_sbs(
+    Block* b, const dominators::SimpleFastDominators<cfg::GraphInterface>&) {
+  auto sb = get_first_source_block(b);
+  if (sb == nullptr) {
+    return 0;
+  }
+  for (uint32_t idx = 0; idx < sb->vals_size; idx++) {
+    if (!sb->vals[idx]) {
+      return 1;
+    }
+  }
+  return 0;
 }
 size_t count_all_sbs(
     Block* b, const dominators::SimpleFastDominators<cfg::GraphInterface>&) {
@@ -564,6 +684,7 @@ struct ChainAndDomState {
   size_t violations{0};
 };
 
+template <uint32_t kMaxInteraction>
 void chain_and_dom_update(
     cfg::Block* block,
     const SourceBlock* sb,
@@ -584,8 +705,10 @@ void chain_and_dom_update(
     state.dom_block = nullptr;
   }
 
+  auto limit = std::min(sb->vals_size, kMaxInteraction);
+
   if (state.last != nullptr) {
-    for (size_t i = 0; i != sb->vals_size; ++i) {
+    for (size_t i = 0; i != limit; ++i) {
       auto last_val = state.last->get_val(i);
       auto sb_val = sb->get_val(i);
       if (last_val) {
@@ -611,7 +734,22 @@ size_t chain_and_dom_violations(
 
   bool first = true;
   foreach_source_block(block, [block, &state, &first, &dom](const auto* sb) {
-    chain_and_dom_update(block, sb, first, state, dom);
+    chain_and_dom_update<std::numeric_limits<uint32_t>::max()>(block, sb, first,
+                                                               state, dom);
+    first = false;
+  });
+
+  return state.violations;
+}
+
+size_t chain_and_dom_violations_coldstart(
+    Block* block,
+    const dominators::SimpleFastDominators<cfg::GraphInterface>& dom) {
+  ChainAndDomState state{};
+
+  bool first = true;
+  foreach_source_block(block, [block, &state, &first, &dom](const auto* sb) {
+    chain_and_dom_update<1>(block, sb, first, state, dom);
     first = false;
   });
 
@@ -622,14 +760,18 @@ size_t chain_and_dom_violations(
 using CounterFnPtr = size_t (*)(
     Block*, const dominators::SimpleFastDominators<cfg::GraphInterface>&);
 
-constexpr std::array<std::pair<std::string_view, CounterFnPtr>, 6> gCounters = {
+constexpr std::array<std::pair<std::string_view, CounterFnPtr>, 8> gCounters = {
     {
         {"~blocks~count", &count_blocks},
         {"~blocks~with~source~blocks", &count_block_has_sbs},
+        {"~blocks~with~incomplete-source~blocks",
+         &count_block_has_incomplete_sbs},
         {"~assessment~source~blocks~total", &count_all_sbs},
         {"~flow~violation~in~chain", &chain_hot_violations},
         {"~flow~violation~in~chain~one", &chain_hot_one_violations},
         {"~flow~violation~chain~and~dom", &chain_and_dom_violations},
+        {"~flow~violation~chain~and~dom.cold_start",
+         &chain_and_dom_violations_coldstart},
     }};
 
 constexpr std::array<std::pair<std::string_view, CounterFnPtr>, 3>
@@ -642,15 +784,62 @@ constexpr std::array<std::pair<std::string_view, CounterFnPtr>, 3>
 struct SourceBlocksStats {
   size_t methods_with_sbs{0};
 
-  std::array<size_t, gCounters.size()> global{};
+  struct Data {
+    size_t count{0};
+    size_t methods{0};
+    size_t min{std::numeric_limits<size_t>::max()};
+    size_t max{0};
+    struct Method {
+      const DexMethod* method;
+      size_t num_opcodes;
+    };
+    std::optional<Method> min_method;
+    std::optional<Method> max_method;
 
-  std::array<size_t, gCountersNonEntry.size()> non_entry{};
-  std::array<size_t, gCountersNonEntry.size()> non_entry_methods{};
-  std::array<std::pair<size_t, size_t>, gCountersNonEntry.size()>
-      non_entry_min_max{};
-  std::array<std::pair<const DexMethod*, const DexMethod*>,
-             gCountersNonEntry.size()>
-      non_entry_min_max_methods{};
+    Data& operator+=(const Data& rhs) {
+      count += rhs.count;
+      methods += rhs.methods;
+
+      min = std::min(min, rhs.min);
+      max = std::max(max, rhs.max);
+
+      auto set_min_max = [](auto& lhs, auto& rhs, auto fn) {
+        if (!rhs) {
+          return;
+        }
+        if (!lhs) {
+          lhs = rhs;
+          return;
+        }
+        auto op = fn(lhs->num_opcodes, rhs->num_opcodes);
+        if (op == rhs->num_opcodes &&
+            (op != lhs->num_opcodes ||
+             compare_dexmethods(rhs->method, lhs->method))) {
+          lhs = rhs;
+        }
+      };
+
+      set_min_max(min_method, rhs.min_method,
+                  [](auto lhs, auto rhs) { return std::min(lhs, rhs); });
+      set_min_max(max_method, rhs.max_method,
+                  [](auto lhs, auto rhs) { return std::max(lhs, rhs); });
+
+      return *this;
+    }
+
+    void fill_derived(const DexMethod* m) {
+      methods = count > 0 ? 1 : 0;
+      min = max = count;
+
+      if (count != 0) {
+        size_t num_opcodes = m->get_code()->count_opcodes();
+        min_method = max_method = (Method){m, num_opcodes};
+      }
+    }
+  };
+
+  std::array<Data, gCounters.size()> global{};
+  std::array<Data, gCountersNonEntry.size()> non_entry{};
 
   SourceBlocksStats& operator+=(const SourceBlocksStats& that) {
     methods_with_sbs += that.methods_with_sbs;
@@ -662,58 +851,20 @@ struct SourceBlocksStats {
     for (size_t i = 0; i != non_entry.size(); ++i) {
       non_entry[i] += that.non_entry[i];
     }
-    for (size_t i = 0; i != non_entry_methods.size(); ++i) {
-      non_entry_methods[i] += that.non_entry_methods[i];
-    }
-    for (size_t i = 0; i != non_entry_min_max.size(); ++i) {
-      non_entry_min_max[i].first =
-          std::min(non_entry_min_max[i].first, that.non_entry_min_max[i].first);
-      non_entry_min_max[i].second = std::max(non_entry_min_max[i].second,
-                                             that.non_entry_min_max[i].second);
-    }
-
-    for (size_t i = 0; i != non_entry_min_max_methods.size(); ++i) {
-      auto set_min_max = [](auto& lhs, auto& rhs, auto fn) {
-        if (rhs == nullptr) {
-          return;
-        }
-        if (lhs == nullptr) {
-          lhs = rhs;
-          return;
-        }
-        auto lhs_count = lhs->get_code()->count_opcodes();
-        auto rhs_count = rhs->get_code()->count_opcodes();
-        auto op = fn(lhs_count, rhs_count);
-        if (op == rhs_count &&
-            (op != lhs_count || compare_dexmethods(rhs, lhs))) {
-          lhs = rhs;
-        }
-      };
-
-      set_min_max(non_entry_min_max_methods[i].first,
-                  that.non_entry_min_max_methods[i].first,
-                  [](auto lhs, auto rhs) { return std::min(lhs, rhs); });
-      set_min_max(non_entry_min_max_methods[i].second,
-                  that.non_entry_min_max_methods[i].second,
-                  [](auto lhs, auto rhs) { return std::max(lhs, rhs); });
-    }
 
     return *this;
   }
 
   void fill_derived(const DexMethod* m) {
     static_assert(gCounters[1].first == "~blocks~with~source~blocks");
-    methods_with_sbs = global[1] > 0 ? 1 : 0;
+    methods_with_sbs = global[1].count > 0 ? 1 : 0;
 
-    for (size_t i = 0; i != non_entry.size(); ++i) {
-      non_entry_methods[i] = non_entry[i] > 0 ? 1 : 0;
-      non_entry_min_max[i].first = non_entry[i];
-      non_entry_min_max[i].second = non_entry[i];
+    for (auto& data : global) {
+      data.fill_derived(m);
+    }
 
-      if (non_entry[i] != 0) {
-        non_entry_min_max_methods[i].first = m;
-        non_entry_min_max_methods[i].second = m;
-      }
+    for (auto& data : non_entry) {
+      data.fill_derived(m);
     }
   }
 };
@@ -741,19 +892,20 @@ void track_source_block_coverage(ScopedMetrics& sm,
         bool seen_sb = false;
         for (auto block : cfg.blocks()) {
           for (size_t i = 0; i != gCounters.size(); ++i) {
-            ret.global[i] += (*gCounters[i].second)(block, dominators);
+            ret.global[i].count += (*gCounters[i].second)(block, dominators);
           }
           if (block != cfg.entry_block()) {
             for (size_t i = 0; i != gCountersNonEntry.size(); ++i) {
-              ret.non_entry[i] +=
+              ret.non_entry[i].count +=
                   (*gCountersNonEntry[i].second)(block, dominators);
             }
           }
         }
 
+        code->clear_cfg();
+
         ret.fill_derived(m);
 
-        code->clear_cfg();
         return ret;
       });
 
@@ -764,40 +916,45 @@ void track_source_block_coverage(ScopedMetrics& sm,
 
   sm.set_metric("~assessment~methods~with~sbs", stats.methods_with_sbs);
 
-  for (size_t i = 0; i != gCounters.size(); ++i) {
-    sm.set_metric(gCounters[i].first, stats.global[i]);
-  }
+  auto data_metric = [&sm](const std::string_view& name, const auto& data) {
+    sm.set_metric(name, data.count);
 
-  for (size_t i = 0; i != gCountersNonEntry.size(); ++i) {
-    sm.set_metric(gCountersNonEntry[i].first, stats.non_entry[i]);
+    auto scope = sm.scope(std::string(name));
+    sm.set_metric("methods", data.methods);
+    sm.set_metric("min", data.min);
+    sm.set_metric("max", data.max);
 
-    auto scope = sm.scope(std::string(gCountersNonEntry[i].first));
-    sm.set_metric("methods", stats.non_entry_methods[i]);
-    sm.set_metric("min", stats.non_entry_min_max[i].first);
-    sm.set_metric("max", stats.non_entry_min_max[i].second);
-
-    auto min_max = [&](const DexMethod* m, const char* name) {
-      if (m != nullptr) {
+    auto min_max = [&](const auto& m, const char* name) {
+      if (m) {
         auto min_max_scope = sm.scope(name);
-        sm.set_metric(show_deobfuscated(m), m->get_code()->count_opcodes());
+        sm.set_metric(show_deobfuscated(m->method), m->num_opcodes);
       }
     };
-    min_max(stats.non_entry_min_max_methods[i].first, "min_method");
-    min_max(stats.non_entry_min_max_methods[i].second, "max_method");
+    min_max(data.min_method, "min_method");
+    min_max(data.max_method, "max_method");
+  };
+  for (size_t i = 0; i != gCounters.size(); ++i) {
+    data_metric(gCounters[i].first, stats.global[i]);
+  }
+  for (size_t i = 0; i != gCountersNonEntry.size(); ++i) {
+    data_metric(gCountersNonEntry[i].first, stats.non_entry[i]);
   }
 }
 
 struct ViolationsHelper::ViolationsHelperImpl {
+  size_t top_n;
   std::unordered_map<DexMethod*, size_t> violations_start;
   std::vector<std::string> print;
+  bool processed{false};
 
   using Violation = ViolationsHelper::Violation;
   const Violation v;
 
   ViolationsHelperImpl(Violation v,
                        const Scope& scope,
+                       size_t top_n,
                        std::vector<std::string> to_vis)
-      : print(std::move(to_vis)), v(v) {
+      : top_n(top_n), print(std::move(to_vis)), v(v) {
     {
       std::mutex lock;
       walk::parallel::methods(scope, [this, &lock, v](DexMethod* m) {
@@ -826,7 +983,15 @@ struct ViolationsHelper::ViolationsHelperImpl {
     not_reached();
   }
 
-  ~ViolationsHelperImpl() {
+  ~ViolationsHelperImpl() { process(nullptr); }
+
+  void silence() { processed = true; }
+  void process(ScopedMetrics* sm) {
+    if (processed) {
+      return;
+    }
+    processed = true;
+
     std::atomic<size_t> change_sum{0};
 
     {
@@ -842,7 +1007,6 @@ struct ViolationsHelper::ViolationsHelperImpl {
       };
 
       std::vector<MethodDelta> top_changes;
-      constexpr size_t kTopChanges = 10;
 
       workqueue_run<std::pair<DexMethod*, size_t>>(
           [&](const std::pair<DexMethod*, size_t>& p) {
@@ -860,7 +1024,7 @@ struct ViolationsHelper::ViolationsHelperImpl {
             auto m_delta = val - p.second;
             size_t s = m->get_code()->sum_opcode_sizes();
             std::unique_lock<std::mutex> ulock{lock};
-            if (top_changes.size() < kTopChanges) {
+            if (top_changes.size() < top_n) {
               top_changes.emplace_back(m, m_delta, s);
               return;
             }
@@ -890,15 +1054,48 @@ struct ViolationsHelper::ViolationsHelperImpl {
           },
           violations_start);
 
-      for (auto& t : top_changes) {
+      struct MaybeMetrics {
+        ScopedMetrics* root{nullptr};
+        std::optional<ScopedMetrics::Scope> scope;
+        explicit MaybeMetrics(ScopedMetrics* root) : root(root) {}
+        explicit MaybeMetrics(ScopedMetrics* root, ScopedMetrics::Scope sc)
+            : root(root), scope(std::move(sc)) {}
+        void set_metric(const std::string_view& key, int64_t value) {
+          if (root != nullptr) {
+            root->set_metric(key, value);
+          }
+        }
+        MaybeMetrics sub_scope(std::string key) {
+          if (root == nullptr) {
+            return MaybeMetrics(nullptr);
+          }
+          return MaybeMetrics(root, root->scope(std::move(key)));
+        }
+      };
+      MaybeMetrics mm(sm);
+      auto mm_top_changes = mm.sub_scope("top_changes");
+      for (size_t i = 0; i != top_changes.size(); ++i) {
+        auto& t = top_changes[i];
         TRACE(MMINL, 0, "%s (size %zu): +%zu", SHOW(t.method), t.method_size,
               t.violations_delta);
+        auto mm_top_changes_i = mm_top_changes.sub_scope(std::to_string(i));
+        {
+          auto mm_top_changes_i_size = mm_top_changes_i.sub_scope("size");
+          mm_top_changes_i_size.set_metric(show(t.method), t.method_size);
+        }
+        {
+          auto mm_top_changes_i_size = mm_top_changes_i.sub_scope("delta");
+          mm_top_changes_i_size.set_metric(show(t.method), t.violations_delta);
+        }
       }
     }
 
     print_all();
 
     TRACE(MMINL, 0, "Introduced %zu violations.", change_sum.load());
+    if (sm != nullptr) {
+      sm->set_metric("new_violations", change_sum.load());
+    }
   }
 
   static size_t hot_immediate_dom_not_hot_cfg(cfg::ControlFlowGraph& cfg) {
@@ -1023,7 +1220,8 @@ struct ViolationsHelper::ViolationsHelperImpl {
 
           auto* sb = mie.src_block.get();
 
-          chain_and_dom_update(cur, sb, first_in_block, state, dom);
+          chain_and_dom_update<std::numeric_limits<uint32_t>::max()>(
+              cur, sb, first_in_block, state, dom);
           first_in_block = false;
 
           const bool head_error = state.violations > old_count;
@@ -1031,7 +1229,8 @@ struct ViolationsHelper::ViolationsHelperImpl {
 
           for (auto* cur_sb = sb->next.get(); cur_sb != nullptr;
                cur_sb = cur_sb->next.get()) {
-            chain_and_dom_update(cur, cur_sb, false, state, dom);
+            chain_and_dom_update<std::numeric_limits<uint32_t>::max()>(
+                cur, cur_sb, false, state, dom);
           }
 
           if (state.violations > old_count) {
@@ -1066,9 +1265,104 @@ struct ViolationsHelper::ViolationsHelperImpl {
 
 ViolationsHelper::ViolationsHelper(Violation v,
                                    const Scope& scope,
+                                   size_t top_n,
                                    std::vector<std::string> to_vis)
     : impl(std::make_unique<ViolationsHelperImpl>(
-          v, scope, std::move(to_vis))) {}
+          v, scope, top_n, std::move(to_vis))) {}
 ViolationsHelper::~ViolationsHelper() {}
+
+void ViolationsHelper::process(ScopedMetrics* sm) {
+  if (impl) {
+    impl->process(sm);
+  }
+}
+void ViolationsHelper::silence() {
+  if (impl) {
+    impl->silence();
+  }
+}
+
+ViolationsHelper::ViolationsHelper(ViolationsHelper&& other) noexcept {
+  impl = std::move(other.impl);
+}
+ViolationsHelper& ViolationsHelper::operator=(ViolationsHelper&& rhs) noexcept {
+  impl = std::move(rhs.impl);
+  return *this;
+}
+
+SourceBlock* get_first_source_block_of_method(const DexMethod* m) {
+  auto code = m->get_code();
+  if (code->cfg_built()) {
+    return get_first_source_block(code->cfg().entry_block());
+  } else {
+    for (auto& mie : *code) {
+      if (mie.type == MFLOW_SOURCE_BLOCK) {
+        return mie.src_block.get();
+      }
+    };
+  }
+  return nullptr;
+}
+
+SourceBlock* get_any_first_source_block_of_methods(
+    const std::vector<const DexMethod*>& methods) {
+  for (auto* m : methods) {
+    auto* sb = get_first_source_block_of_method(m);
+    if (sb != nullptr) {
+      return sb;
+    }
+  }
+  return nullptr;
+}
+
+void insert_synthetic_source_blocks_in_method(
+    DexMethod* method,
+    const std::function<std::unique_ptr<SourceBlock>()>& source_block_creator) {
+  auto* code = method->get_code();
+  cfg::ScopedCFG cfg(code);
+
+  for (auto* block : cfg->blocks()) {
+    if (block == cfg->entry_block()) {
+      // Special handling.
+      continue;
+    }
+    auto new_sb = source_block_creator();
+    auto it = block->get_first_insn();
+    if (it != block->end() && opcode::is_move_result_any(it->insn->opcode())) {
+      block->insert_after(it, std::move(new_sb));
+    } else {
+      block->insert_before(it, std::move(new_sb));
+    }
+  }
+
+  auto* block = cfg->entry_block();
+  auto new_sb = source_block_creator();
+  auto it = block->get_first_non_param_loading_insn();
+  block->insert_before(it, std::move(new_sb));
+}
+
+void fill_source_block(SourceBlock& sb,
+                       DexMethod* ref,
+                       uint32_t id,
+                       const SourceBlock::Val& val) {
+  sb.src = ref->get_deobfuscated_name_or_null();
+  sb.id = id;
+  for (size_t i = 0; i < sb.vals_size; i++) {
+    sb.vals[i] = val;
+  }
+}
+
+void fill_source_block(SourceBlock& sb,
+                       DexMethod* ref,
+                       uint32_t id,
+                       const std::optional<SourceBlock::Val>& opt_val) {
+  sb.src = ref->get_deobfuscated_name_or_null();
+  sb.id = id;
+  if (opt_val) {
+    for (size_t i = 0; i < sb.vals_size; i++) {
+      sb.vals[i] = *opt_val;
+    }
+  }
+}
 
 } // namespace source_blocks

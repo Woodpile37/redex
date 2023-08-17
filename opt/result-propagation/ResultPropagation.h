@@ -145,7 +145,17 @@ class ResultPropagationPass : public Pass {
  public:
   ResultPropagationPass() : Pass("ResultPropagationPass") {}
 
-  bool is_editable_cfg_friendly() override { return true; }
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoResolvablePureRefs, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
 
   void bind_config() override {
     bind("callee_blocklist",

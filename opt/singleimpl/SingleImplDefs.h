@@ -20,6 +20,10 @@
 #include "IRList.h"
 #include "SingleImpl.h"
 
+namespace api {
+class AndroidSDK;
+} // namespace api
+
 struct ProguardMap;
 
 /**
@@ -65,6 +69,8 @@ enum EscapeReason : uint32_t {
   FILTERED = 0x80,
   // parent is unknown to redex
   IMPL_PARENT_ESCAPED = 0x100,
+  // interface is reference as a return type of a method
+  HAS_RETURN_REF = 0x200,
   // interface marked DoNotStrip
   DO_NOT_STRIP = 0X400,
   // create a reference across stores that is illegal
@@ -205,4 +211,5 @@ struct OptimizeStats {
 OptimizeStats optimize(std::unique_ptr<SingleImplAnalysis> analysis,
                        const ClassHierarchy& ch,
                        Scope& scope,
-                       const SingleImplConfig& config);
+                       const SingleImplConfig& config,
+                       const api::AndroidSDK& api);

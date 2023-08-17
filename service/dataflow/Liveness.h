@@ -7,9 +7,10 @@
 
 #pragma once
 
+#include <sparta/PatriciaTreeSetAbstractDomain.h>
+
 #include "BaseIRAnalyzer.h"
 #include "ControlFlow.h"
-#include "PatriciaTreeSetAbstractDomain.h"
 
 using LivenessDomain = sparta::PatriciaTreeSetAbstractDomain<reg_t>;
 
@@ -29,11 +30,11 @@ class LivenessFixpointIterator final
     }
   }
 
-  LivenessDomain get_live_in_vars_at(const NodeId& block) const {
+  const LivenessDomain& get_live_in_vars_at(const NodeId& block) const {
     return get_exit_state_at(block);
   }
 
-  LivenessDomain get_live_out_vars_at(const NodeId& block) const {
+  const LivenessDomain& get_live_out_vars_at(const NodeId& block) const {
     return get_entry_state_at(block);
   }
 };

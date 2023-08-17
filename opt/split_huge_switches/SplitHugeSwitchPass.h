@@ -43,23 +43,36 @@ class SplitHugeSwitchPass : public Pass {
     Stats& operator+=(const Stats& rhs);
   };
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   SplitHugeSwitchPass() : Pass("SplitHugeSwitchPass") {}
 
   void bind_config() override;
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
   static Stats run(DexMethod* m,
                    IRCode* code,
-                   size_t insn_threshold,
+                   size_t code_units_threshold,
                    size_t case_threshold,
                    const method_profiles::MethodProfiles& method_profiles,
                    double hotness_threshold);
 
  private:
   std::string m_method_filter;
+  bool m_consider_methods_too_large_for_inlining = false;
   float m_hotness_threshold = 0.0;
   uint32_t m_method_size = 0;
+  uint32_t m_method_size_when_too_large_for_inlining = 0;
   uint32_t m_switch_size = 0;
-  uint32_t m_max_split_methods = 0;
   bool m_debug = false;
 };

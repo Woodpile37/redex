@@ -31,8 +31,16 @@ DexLoader::DexLoader(const DexLocation* location)
 static void validate_dex_header(const dex_header* dh,
                                 size_t dexsize,
                                 int support_dex_version) {
+  always_assert_log(sizeof(dex_header) <= dexsize,
+                    "Header size (%zu) is larger than file size (%zu)\n",
+                    dexsize,
+                    sizeof(dex_header));
   bool supported = false;
   switch (support_dex_version) {
+  case 39:
+    supported = supported ||
+                !memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V39, sizeof(dh->magic));
+    FALLTHROUGH_INTENDED; /* intentional fallthrough to also check for v38 */
   case 38:
     supported = supported ||
                 !memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V38, sizeof(dh->magic));
@@ -56,10 +64,76 @@ static void validate_dex_header(const dex_header* dh,
       "Reported size in header (%zu) does not match file size (%u)\n",
       dexsize,
       dh->file_size);
-  auto off = (uint64_t)dh->class_defs_off;
-  auto limit = off + dh->class_defs_size * sizeof(dex_class_def);
-  always_assert_log(off < dexsize, "class_defs_off out of range");
-  always_assert_log(limit <= dexsize, "invalid class_defs_size");
+
+  auto map_list_off = (uint64_t)dh->map_off;
+  always_assert_log(map_list_off < dexsize, "map_off out of range");
+  const uint8_t* dexbase = (const uint8_t*)dh;
+  const dex_map_list* map_list = (dex_map_list*)(dexbase + dh->map_off);
+  auto map_list_limit = map_list_off + map_list->size * sizeof(dex_map_item);
+  always_assert_log(map_list_limit < dexsize, "inavlid map_list size");
+
+  for (uint32_t i = 0; i < map_list->size; i++) {
+    auto& item = map_list->items[i];
+    switch (item.type) {
+    case TYPE_CALL_SITE_ID_ITEM: {
+      auto callsite_ids_off = (uint64_t)item.offset;
+      always_assert_log(callsite_ids_off < dexsize,
+                        "callsite_ids out of range");
+      dex_callsite_id* callsite_ids =
+          (dex_callsite_id*)((uint8_t*)dh + item.offset);
+      auto callsite_ids_limit =
+          callsite_ids_off + item.size * sizeof(dex_callsite_id);
+      always_assert_log(callsite_ids_limit < dexsize,
+                        "inavlid callsite_ids size");
+    } break;
+    case TYPE_METHOD_HANDLE_ITEM: {
+      auto methodhandle_ids_off = (uint64_t)item.offset;
+      always_assert_log(methodhandle_ids_off < dexsize,
+                        "methodhandle_ids out of range");
+      dex_methodhandle_id* methodhandle_ids =
+          (dex_methodhandle_id*)((uint8_t*)dh + item.offset);
+      auto methodhandle_ids_limit =
+          methodhandle_ids_off + item.size * sizeof(dex_methodhandle_id);
+      always_assert_log(methodhandle_ids_limit < dexsize,
+                        "inavlid methodhandle_ids size");
+    } break;
+    }
+  }
+
+  auto str_ids_off = (uint64_t)dh->string_ids_off;
+  auto str_ids_limit =
+      str_ids_off + dh->string_ids_size * sizeof(dex_string_id);
+  always_assert_log(str_ids_off < dexsize, "string_ids_off out of range");
+  always_assert_log(str_ids_limit <= dexsize, "invalid string_ids_size");
+
+  auto type_ids_off = (uint64_t)dh->type_ids_off;
+  auto type_ids_limit = type_ids_off + dh->type_ids_size * sizeof(dex_type_id);
+  always_assert_log(type_ids_off < dexsize, "type_ids_off out of range");
+  always_assert_log(type_ids_limit <= dexsize, "invalid type_ids_size");
+
+  auto proto_ids_off = (uint64_t)dh->proto_ids_off;
+  auto proto_ids_limit =
+      proto_ids_off + dh->proto_ids_size * sizeof(dex_proto_id);
+  always_assert_log(proto_ids_off < dexsize, "proto_ids_off out of range");
+  always_assert_log(proto_ids_limit <= dexsize, "invalid proto_ids_size");
+
+  auto field_ids_off = (uint64_t)dh->field_ids_off;
+  auto field_ids_limit =
+      field_ids_off + dh->field_ids_size * sizeof(dex_field_id);
+  always_assert_log(field_ids_off < dexsize, "field_ids_off out of range");
+  always_assert_log(field_ids_limit <= dexsize, "invalid field_ids_size");
+
+  auto meth_ids_off = (uint64_t)dh->method_ids_off;
+  auto meth_ids_limit =
+      meth_ids_off + dh->method_ids_size * sizeof(dex_method_id);
+  always_assert_log(meth_ids_off < dexsize, "method_ids_off out of range");
+  always_assert_log(meth_ids_limit <= dexsize, "invalid method_ids_size");
+
+  auto cls_defs_off = (uint64_t)dh->class_defs_off;
+  auto cls_defs_limit =
+      cls_defs_off + dh->class_defs_size * sizeof(dex_class_def);
+  always_assert_log(cls_defs_off < dexsize, "class_defs_off out of range");
+  always_assert_log(cls_defs_limit <= dexsize, "invalid class_defs_size");
 }
 
 void DexLoader::gather_input_stats(dex_stats_t* stats, const dex_header* dh) {
@@ -92,11 +166,13 @@ void DexLoader::gather_input_stats(dex_stats_t* stats, const dex_header* dh) {
     auto anno_off = class_def->annotations_off;
     if (anno_off) {
       const dex_annotations_directory_item* anno_dir =
-          (const dex_annotations_directory_item*)m_idx->get_uint_data(anno_off);
+          m_idx->get_data<dex_annotations_directory_item>(anno_off);
       auto class_anno_off = anno_dir->class_annotations_off;
       if (class_anno_off) {
         const uint32_t* anno_data = m_idx->get_uint_data(class_anno_off);
         uint32_t count = *anno_data++;
+        always_assert(anno_data <= anno_data + count);
+        always_assert((uint8_t*)(anno_data + count) <= m_idx->end());
         for (uint32_t aidx = 0; aidx < count; ++aidx) {
           anno_offsets.insert(anno_data[aidx]);
         }
@@ -116,6 +192,8 @@ void DexLoader::gather_input_stats(dex_stats_t* stats, const dex_header* dh) {
         if (xrefoff != 0) {
           const uint32_t* annoxref = m_idx->get_uint_data(xrefoff);
           uint32_t count = *annoxref++;
+          always_assert(annoxref < annoxref + count);
+          always_assert((uint8_t*)(annoxref + count) <= m_idx->end());
           for (uint32_t j = 0; j < count; j++) {
             uint32_t off = annoxref[j];
             anno_offsets.insert(off);
@@ -448,8 +526,33 @@ void DexLoader::gather_input_stats(dex_stats_t* stats, const dex_header* dh) {
 }
 
 void DexLoader::load_dex_class(int num) {
+  size_t dexsize = m_file->size();
   const dex_class_def* cdef = m_class_defs + num;
-  DexClass* dc = DexClass::create(m_idx.get(), cdef, m_location);
+  auto idx = m_idx.get();
+
+  // Validate dex_class_def layout
+  auto annotations_off = cdef->annotations_off;
+  if (annotations_off != 0) {
+    // Validate dex_annotations_directory_item layout
+    always_assert_log(
+        annotations_off + sizeof(dex_annotations_directory_item) <= dexsize,
+        "Invalid cdef->annotations_off");
+    const dex_annotations_directory_item* annodir =
+        idx->get_data<dex_annotations_directory_item>(annotations_off);
+    auto cls_annos_off = annodir->class_annotations_off;
+    always_assert_log(cls_annos_off < dexsize,
+                      "Invalid annodir->class_annotations_off");
+    if (cls_annos_off != 0) {
+      // annotation_off_item is of size uint. So this is probably precise
+      // enough.
+      const uint32_t* adata = idx->get_uint_data(cls_annos_off);
+      uint32_t count = *adata;
+      always_assert_log(cls_annos_off + count <= dexsize,
+                        "Invalid class annotation set count");
+    }
+  }
+
+  DexClass* dc = DexClass::create(idx, cdef, m_location);
   // We may be inserting a nullptr here. Need to remove them later
   //
   // We're inserting nullptr because we can't mess up the indices of the other

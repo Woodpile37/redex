@@ -13,6 +13,18 @@ class ObfuscatePass : public Pass {
  public:
   ObfuscatePass() : Pass("ObfuscatePass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+    };
+  }
+
+  bool is_cfg_legacy() override { return true; }
+
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
   void bind_config() final { trait(Traits::Pass::unique, true); }
@@ -32,6 +44,7 @@ struct RenameStats {
   size_t dmethods_renamed = 0;
   size_t vmethods_total = 0;
   size_t vmethods_renamed = 0;
+  size_t classes_made_public{0};
 };
 
 void obfuscate(Scope& classes,

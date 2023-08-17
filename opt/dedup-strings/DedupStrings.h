@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "ABExperimentContext.h"
 #include "InterDexPass.h"
 #include "Pass.h"
 #include "PluginRegistry.h"
@@ -16,6 +15,16 @@ namespace method_profiles {
 class MethodProfiles;
 } // namespace method_profiles
 
+enum class DedupStringsPerfMode {
+  // Quirky. Don't use.
+  LEGACY,
+  // Consider method-profiles, if available, otherwise fall back to excluding
+  // all perf-sensitive classes.
+  EXCLUDE_HOT_METHODS_OR_CLASSES,
+  // Also take into account basic-block hotness
+  EXCLUDE_HOT_BLOCKS_IN_HOT_METHODS_OR_CLASSES,
+};
+
 class DedupStrings {
  public:
   struct Stats {
@@ -23,6 +32,8 @@ class DedupStrings {
     size_t non_perf_sensitive_strings{0};
     size_t perf_sensitive_methods{0};
     size_t non_perf_sensitive_methods{0};
+    size_t perf_sensitive_insns{0};
+    size_t non_perf_sensitive_insns{0};
     size_t excluded_duplicate_non_load_strings{0};
     size_t duplicate_strings{0};
     size_t duplicate_strings_size{0};
@@ -35,19 +46,17 @@ class DedupStrings {
 
   DedupStrings(size_t max_factory_methods,
                float method_profiles_appear_percent_threshold,
-               const method_profiles::MethodProfiles& method_profiles,
-               std::unordered_set<const DexString*> ignore_strings = {})
+               DedupStringsPerfMode perf_mode,
+               const method_profiles::MethodProfiles& method_profiles)
       : m_max_factory_methods(max_factory_methods),
         m_method_profiles_appear_percent_threshold(
             method_profiles_appear_percent_threshold),
-        m_method_profiles(method_profiles),
-        m_ignore_strings(std::move(ignore_strings)) {}
+        m_perf_mode(perf_mode),
+        m_method_profiles(method_profiles) {}
 
   const Stats& get_stats() const { return m_stats; }
 
-  void run(
-      DexStoresVector& stores,
-      std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context);
+  void run(DexStoresVector& stores);
 
  private:
   struct DedupStringInfo {
@@ -86,14 +95,13 @@ class DedupStrings {
       const std::unordered_map<const DexMethod*, size_t>& methods_to_dex,
       const std::unordered_set<const DexMethod*>& perf_sensitive_methods,
       const std::unordered_map<const DexString*, DedupStringInfo>&
-          strings_to_dedup,
-      std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context);
+          strings_to_dedup);
 
   mutable Stats m_stats;
   size_t m_max_factory_methods;
   float m_method_profiles_appear_percent_threshold;
+  DedupStringsPerfMode m_perf_mode;
   const method_profiles::MethodProfiles& m_method_profiles;
-  std::unordered_set<const DexString*> m_ignore_strings;
 };
 
 /**
@@ -164,10 +172,21 @@ class DedupStringsPass : public Pass {
  public:
   DedupStringsPass() : Pass("DedupStringsPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, RequiresAndEstablishes},
+    };
+  }
+
   void bind_config() override;
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:
   int64_t m_max_factory_methods;
   float m_method_profiles_appear_percent_threshold{1.f};
+  DedupStringsPerfMode m_perf_mode;
 };

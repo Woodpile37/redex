@@ -6,8 +6,12 @@
  */
 
 #include "GlobalTypeAnalyzer.h"
-
 #include "ConcurrentContainers.h"
+
+#include "ControlFlow.h"
+#include "IRCode.h"
+#include "IRInstruction.h"
+
 #include "Resolver.h"
 #include "Show.h"
 #include "Trace.h"
@@ -54,15 +58,17 @@ void scan_any_init_reachables(
   if (!trace_callbacks && method::is_init(method)) {
     return;
   }
-  auto code = method->get_code();
+  auto code = (const_cast<DexMethod*>(method))->get_code();
   if (!code) {
     return;
   }
+  always_assert(code->editable_cfg_built());
+  auto& cfg = code->cfg();
   // We include all methods reachable from clinits and ctors. Even methods don't
   // access fields can indirectly consume field values through ctor calls.
   reachables.insert(method);
   TRACE(TYPE, 5, "[any init reachables] insert %s", SHOW(method));
-  for (auto& mie : InstructionIterable(code)) {
+  for (auto& mie : cfg::InstructionIterable(cfg)) {
     auto insn = mie.insn;
     if (!opcode::is_an_invoke(insn->opcode())) {
       continue;
@@ -131,6 +137,10 @@ DexTypeEnvironment env_with_params(const IRCode* code,
 void GlobalTypeAnalyzer::analyze_node(
     const call_graph::NodeId& node,
     ArgumentTypePartition* current_partition) const {
+  current_partition->set(CURRENT_PARTITION_LABEL,
+                         ArgumentTypeEnvironment::bottom());
+  always_assert(current_partition->is_bottom());
+
   const DexMethod* method = node->method();
 
   if (method == nullptr) {
@@ -143,10 +153,10 @@ void GlobalTypeAnalyzer::analyze_node(
   auto& cfg = code->cfg();
   auto intra_ta = get_local_analysis(method);
   const auto outgoing_edges =
-      call_graph::GraphInterface::successors(m_call_graph, node);
+      call_graph::GraphInterface::successors(*m_call_graph, node);
   std::unordered_set<IRInstruction*> outgoing_insns;
   for (const auto& edge : outgoing_edges) {
-    if (edge->callee() == m_call_graph.exit()) {
+    if (edge->callee() == m_call_graph->exit()) {
       continue; // ghost edge to the ghost exit node
     }
     outgoing_insns.emplace(edge->invoke_insn());
@@ -186,8 +196,8 @@ std::unique_ptr<local::LocalTypeAnalyzer>
 GlobalTypeAnalyzer::get_local_analysis(const DexMethod* method) const {
   auto args = ArgumentTypePartition::bottom();
 
-  if (m_call_graph.has_node(method)) {
-    args = this->get_entry_state_at(m_call_graph.node(method));
+  if (m_call_graph->has_node(method)) {
+    args = this->get_entry_state_at(m_call_graph->node(method));
   }
   return analyze_method(method,
                         this->get_whole_program_state(),
@@ -197,8 +207,8 @@ GlobalTypeAnalyzer::get_local_analysis(const DexMethod* method) const {
 bool GlobalTypeAnalyzer::is_reachable(const DexMethod* method) const {
   auto args = ArgumentTypePartition::bottom();
 
-  if (m_call_graph.has_node(method)) {
-    args = this->get_entry_state_at(m_call_graph.node(method));
+  if (m_call_graph->has_node(method)) {
+    args = this->get_entry_state_at(m_call_graph->node(method));
   }
   auto args_domain = args.get(CURRENT_PARTITION_LABEL);
   return !args_domain.is_bottom();
@@ -333,7 +343,7 @@ bool is_leaking_this_in_ctor(const DexMethod* caller, const DexMethod* callee) {
 void GlobalTypeAnalysis::find_any_init_reachables(
     const method_override_graph::Graph& method_override_graph,
     const Scope& scope,
-    const call_graph::Graph& cg) {
+    std::shared_ptr<const call_graph::Graph> cg) {
   walk::parallel::methods(scope, [&](DexMethod* method) {
     if (!method::is_any_init(method)) {
       return;
@@ -342,7 +352,8 @@ void GlobalTypeAnalysis::find_any_init_reachables(
       return;
     }
     auto code = method->get_code();
-    for (auto& mie : InstructionIterable(code)) {
+    auto& cfg = code->cfg();
+    for (auto& mie : InstructionIterable(cfg)) {
       auto insn = mie.insn;
       if (!opcode::is_an_invoke(insn->opcode())) {
         continue;
@@ -353,18 +364,18 @@ void GlobalTypeAnalysis::find_any_init_reachables(
           !callee_method_def->is_concrete()) {
         continue;
       }
-      if (!cg.has_node(method)) {
+      if (!cg->has_node(method)) {
         TRACE(TYPE,
               5,
               "[any init reachables] missing node in cg %s",
               SHOW(method));
         continue;
       }
-      auto callees = resolve_callees_in_graph(cg, method, insn);
+      auto callees = resolve_callees_in_graph(*cg, method, insn);
       for (const DexMethod* callee : callees) {
         bool trace_callbacks_in_callee_cls =
             is_leaking_this_in_ctor(method, callee);
-        scan_any_init_reachables(cg,
+        scan_any_init_reachables(*cg,
                                  method_override_graph,
                                  callee,
                                  trace_callbacks_in_callee_cls,
@@ -388,7 +399,7 @@ void GlobalTypeAnalysis::find_any_init_reachables(
         }
       }
       if (overrides_external) {
-        scan_any_init_reachables(cg, method_override_graph, vmethod, false,
+        scan_any_init_reachables(*cg, method_override_graph, vmethod, false,
                                  m_any_init_reachables);
       }
     }
@@ -400,14 +411,14 @@ void GlobalTypeAnalysis::find_any_init_reachables(
 std::unique_ptr<GlobalTypeAnalyzer> GlobalTypeAnalysis::analyze(
     const Scope& scope) {
   auto method_override_graph = mog::build_graph(scope);
-  call_graph::Graph cg =
-      call_graph::single_callee_graph(*method_override_graph, scope);
+  auto cg = std::make_shared<call_graph::Graph>(
+      call_graph::single_callee_graph(*method_override_graph, scope));
   // Rebuild all CFGs here -- this should be more efficient than doing them
   // within FixpointIterator::analyze_node(), since that can get called
   // multiple times for a given method
   walk::parallel::code(scope, [](DexMethod*, IRCode& code) {
     if (!code.cfg_built()) {
-      code.build_cfg(/* editable */ false);
+      code.build_cfg();
     }
     code.cfg().calculate_exit_block();
   });
@@ -416,7 +427,7 @@ std::unique_ptr<GlobalTypeAnalyzer> GlobalTypeAnalysis::analyze(
   // Run the bootstrap. All field value and method return values are
   // represented by Top.
   TRACE(TYPE, 2, "[global] Bootstrap run");
-  auto gta = std::make_unique<GlobalTypeAnalyzer>(std::move(cg));
+  auto gta = std::make_unique<GlobalTypeAnalyzer>(cg);
   gta->run({{CURRENT_PARTITION_LABEL, ArgumentTypeEnvironment()}});
   auto non_true_virtuals =
       mog::get_non_true_virtuals(*method_override_graph, scope);

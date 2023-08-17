@@ -48,7 +48,7 @@ class DexMetadata {
 class DexStore {
   std::vector<DexClasses> m_dexen;
   DexMetadata m_metadata;
-  std::string dex_magic = "";
+  std::string dex_magic;
   bool m_generated = false;
 
  public:
@@ -82,17 +82,17 @@ class DexStore {
                         boost::optional<size_t> dex_id);
 };
 
-class DexStoreClassesIterator
-    : public std::iterator<std::input_iterator_tag, DexClasses> {
-
+class DexStoreClassesIterator {
   using classes_iterator = std::vector<DexClasses>::iterator;
   using store_iterator = std::vector<DexStore>::iterator;
 
-  std::vector<DexStore>& m_stores;
-  store_iterator m_current_store;
-  classes_iterator m_current_classes;
-
  public:
+  using iterator_category = std::input_iterator_tag;
+  using difference_type = std::ptrdiff_t;
+  using value_type = DexClasses;
+  using pointer = value_type*;
+  using reference = value_type&;
+
   explicit DexStoreClassesIterator(std::vector<DexStore>& stores)
       : m_stores(stores),
         m_current_store(stores.begin()),
@@ -139,6 +139,10 @@ class DexStoreClassesIterator
   DexClasses& operator*() { return *m_current_classes; }
 
  private:
+  std::vector<DexStore>& m_stores;
+  store_iterator m_current_store;
+  classes_iterator m_current_classes;
+
   void advance_end_classes() {
     while (m_current_store != m_stores.end() &&
            m_current_classes != m_stores.back().get_dexen().end() &&
@@ -394,6 +398,27 @@ class XDexRefs {
    * Number of dexes.
    */
   size_t num_dexes() const;
+};
+
+class XDexMethodRefs : public XDexRefs {
+  std::vector<std::pair<size_t, const DexClasses*>> m_dex_to_classes;
+
+  struct DexRefs {
+    std::unordered_set<DexMethodRef*> methods;
+    std::unordered_set<DexFieldRef*> fields;
+    std::unordered_set<DexType*> types;
+  };
+
+  std::vector<DexRefs> m_dex_refs;
+
+ public:
+  explicit XDexMethodRefs(const DexStoresVector& stores);
+  ~XDexMethodRefs() = default;
+
+  bool callee_has_cross_dex_refs(
+      DexMethod* caller,
+      DexMethod* callee,
+      const std::unordered_set<DexType*>& refined_init_class_types);
 };
 
 /**

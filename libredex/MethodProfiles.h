@@ -134,6 +134,11 @@ class MethodProfiles {
       const std::unordered_map<dex_member_refs::MethodDescriptorTokens,
                                std::vector<DexMethodRef*>>& map);
 
+  // If there are not observed stats for the target, derive it from the given
+  // sources.
+  size_t derive_stats(DexMethod* target,
+                      const std::vector<DexMethod*>& sources);
+
  private:
   static AccumulatingTimer s_process_unresolved_lines_timer;
   AllInteractions m_method_stats;
@@ -164,10 +169,10 @@ class MethodProfiles {
   bool parse_stats_file(const std::string& csv_filename);
 
   // Read a line of data (not a header)
-  bool parse_line(std::string line);
+  bool parse_line(const std::string& line);
   // Read a line from the main section of the aggregated stats file and put an
   // entry into m_method_stats
-  bool parse_main(std::string line, std::string* interaction_id);
+  bool parse_main(const std::string& line, std::string* interaction_id);
   std::optional<ParsedMain> parse_main_internal(std::string_view line);
   bool apply_main_internal_result(ParsedMain v, std::string* interaction_id);
   // Read a line of data from the metadata section (at the top of the file)

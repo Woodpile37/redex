@@ -18,22 +18,31 @@
 #include "AnalysisUsage.h"
 #include "AssetManager.h"
 #include "DexHasher.h"
-#include "GlobalConfig.h"
 #include "JsonWrapper.h"
-#include "ProguardConfiguration.h"
 #include "RedexOptions.h"
+#include "RedexProperties.h"
+#include "RedexPropertyCheckerRegistry.h"
 #include "Timer.h"
 
 struct ConfigFiles;
 class DexStore;
 class Pass;
+struct PassManagerConfig;
 
 namespace Json {
 class Value;
 } // namespace Json
 
+namespace keep_rules {
+struct ProguardConfiguration;
+} // namespace keep_rules
+
 // Must match DexStore.
 using DexStoresVector = std::vector<DexStore>;
+
+namespace redex_properties {
+class Manager;
+} // namespace redex_properties
 
 class PassManager {
  public:
@@ -47,7 +56,8 @@ class PassManager {
   PassManager(const std::vector<Pass*>& passes,
               std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
               const ConfigFiles& config,
-              const RedexOptions& options = RedexOptions{});
+              const RedexOptions& options = RedexOptions{},
+              redex_properties::Manager* properties_manager = nullptr);
 
   ~PassManager();
 
@@ -60,6 +70,7 @@ class PassManager {
     std::unordered_map<std::string, int64_t> metrics;
     JsonWrapper config;
     boost::optional<hashing::DexHash> hash;
+    redex_properties::PropertyInteractions property_interactions;
   };
 
   void run_passes(DexStoresVector&, ConfigFiles&);
@@ -75,12 +86,8 @@ class PassManager {
   // A temporary hack to return the interdex metrics. Will be removed later.
   const std::unordered_map<std::string, int64_t>& get_interdex_metrics();
 
-  keep_rules::ProguardConfiguration& get_proguard_config() {
+  const keep_rules::ProguardConfiguration& get_proguard_config() {
     return *m_pg_config;
-  }
-
-  bool no_proguard_rules() {
-    return m_pg_config->keep_rules.empty() && !m_testing_mode;
   }
 
   // Call set_testing_mode() in tests that need passes to run which
@@ -97,6 +104,13 @@ class PassManager {
   void record_init_class_lowering() { m_init_class_lowering_has_run = true; }
   bool init_class_lowering_has_run() const {
     return m_init_class_lowering_has_run;
+  }
+
+  void record_materialize_nullchecks() {
+    m_materialize_nullchecks_has_run = true;
+  }
+  bool materialize_nullchecks_has_run() const {
+    return m_materialize_nullchecks_has_run;
   }
 
   void record_running_interdex() { m_interdex_has_run = true; }
@@ -119,20 +133,23 @@ class PassManager {
 
   Pass* find_pass(const std::string& pass_name) const;
 
-  const AssessorConfig& get_assessor_config() const {
-    return m_assessor_config;
-  }
+  struct ActivatedPasses {
+    std::vector<std::pair<Pass*, std::string>> activated_passes;
+    std::vector<std::unique_ptr<Pass>> cloned_passes;
+  };
+  static ActivatedPasses compute_activated_passes(
+      std::vector<Pass*> m_registered_passes,
+      const ConfigFiles& config,
+      PassManagerConfig* pm_config_override = nullptr);
 
  private:
-  void activate_pass(const std::string& name,
-                     const std::string* alias,
-                     const Json::Value& conf);
-
   void init(const ConfigFiles& config);
 
   hashing::DexHash run_hasher(const char* name, const Scope& scope);
 
   void eval_passes(DexStoresVector&, ConfigFiles&);
+
+  void init_property_interactions(ConfigFiles& conf);
 
   AssetManager m_asset_mgr;
   std::vector<Pass*> m_registered_passes;
@@ -143,21 +160,25 @@ class PassManager {
   std::vector<PassManager::PassInfo> m_pass_info;
   PassInfo* m_current_pass_info;
 
-  std::unique_ptr<keep_rules::ProguardConfiguration> m_pg_config;
+  std::unique_ptr<const keep_rules::ProguardConfiguration> m_pg_config;
   const RedexOptions m_redex_options;
   bool m_testing_mode{false};
   bool m_regalloc_has_run{false};
   bool m_init_class_lowering_has_run{false};
+  bool m_materialize_nullchecks_has_run{false};
   bool m_interdex_has_run{false};
   bool m_unreliable_virtual_scopes{false};
-
   Pass* m_malloc_profile_pass{nullptr};
 
   boost::optional<hashing::DexHash> m_initial_hash;
   AccumulatingTimer m_hashers_timer;
   AccumulatingTimer m_check_unique_deobfuscateds_timer;
 
-  AssessorConfig m_assessor_config;
-
   std::vector<std::unique_ptr<Pass>> m_cloned_passes;
+
+  // unique_ptr to avoid header include.
+  struct InternalFields;
+  std::unique_ptr<InternalFields> m_internal_fields;
+
+  redex_properties::Manager* m_properties_manager{nullptr};
 };

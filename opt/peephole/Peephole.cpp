@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include <sparta/WorkQueue.h>
+
 #include "CFGMutation.h"
 #include "ControlFlow.h"
 #include "DexClass.h"
@@ -26,7 +28,6 @@
 #include "PassManager.h"
 #include "RedundantCheckCastRemover.h"
 #include "Show.h"
-#include "SpartaWorkQueue.h"
 #include "Trace.h"
 #include "Walkers.h"
 
@@ -387,7 +388,7 @@ struct Matcher {
       bool retry = (match_index == 1);
       TRACE(PEEPHOLE,
             8,
-            "Not Matched: %s[%lu] != %s",
+            "Not Matched: %s[%zu] != %s",
             pattern.name.c_str(),
             match_index,
             SHOW(insn));
@@ -404,7 +405,7 @@ struct Matcher {
 
     TRACE(PEEPHOLE,
           8,
-          "Matched [%lu/%lu]: %s",
+          "Matched [%zu/%zu]: %s",
           match_index + 1,
           pattern.match.size(),
           SHOW(insn));
@@ -453,8 +454,8 @@ struct Matcher {
       return new IRInstruction(OPCODE_CONST_STRING);
 
     case OPCODE_CONST:
-    case OPCODE_SHR_INT_LIT8:
-    case OPCODE_SHL_INT_LIT8:
+    case OPCODE_SHR_INT_LIT:
+    case OPCODE_SHL_INT_LIT:
       redex_assert(replace.kind == DexPattern::Kind::literal);
       return new IRInstruction((IROpcode)opcode);
 
@@ -642,7 +643,7 @@ struct Matcher {
         }
         default:
           not_reached_log("Unexpected string directive: 0x%x",
-                          replace_info.string);
+                          (int)replace_info.string);
         }
       } else if (replace_info.kind == DexPattern::Kind::literal) {
         switch (replace_info.literal) {
@@ -688,7 +689,8 @@ struct Matcher {
           replace->set_type(matched_types.at(Type::B));
           break;
         default:
-          not_reached_log("Unexpected type directive 0x%x", replace_info.type);
+          not_reached_log("Unexpected type directive 0x%x",
+                          (int)replace_info.type);
         }
       } else if (replace_info.kind == DexPattern::Kind::field) {
         switch (replace_info.field) {
@@ -700,7 +702,7 @@ struct Matcher {
           break;
         default:
           not_reached_log("Unexpected field directive 0x%x",
-                          replace_info.field);
+                          (int)replace_info.field);
         }
       }
     }
@@ -1515,27 +1517,27 @@ bool first_instruction_literal_is_power_of_two(const Matcher& m) {
 }
 
 DexPattern mul_lit(Register src, Register dst) {
-  return {{OPCODE_MUL_INT_LIT8, OPCODE_MUL_INT_LIT16}, {src}, {dst}};
+  return {{OPCODE_MUL_INT_LIT, OPCODE_MUL_INT_LIT}, {src}, {dst}};
 }
 
 DexPattern mul_literal_kind(Register src, Register dst, Literal lit) {
-  return {{OPCODE_MUL_INT_LIT8, OPCODE_MUL_INT_LIT16}, {src}, {dst}, lit};
+  return {{OPCODE_MUL_INT_LIT, OPCODE_MUL_INT_LIT}, {src}, {dst}, lit};
 }
 
 std::vector<DexPattern> div_lit(Register src, Register dst) {
-  return {{{OPCODE_DIV_INT_LIT8, OPCODE_DIV_INT_LIT16}, {src}, {}},
+  return {{{OPCODE_DIV_INT_LIT, OPCODE_DIV_INT_LIT}, {src}, {}},
           {{IOPCODE_MOVE_RESULT_PSEUDO}, {}, {dst}}};
 }
 
 std::vector<DexPattern> div_literal_kind(Register src,
                                          Register dst,
                                          Literal lit) {
-  return {{{OPCODE_DIV_INT_LIT8, OPCODE_DIV_INT_LIT16}, {src}, {}, lit},
+  return {{{OPCODE_DIV_INT_LIT, OPCODE_DIV_INT_LIT}, {src}, {}, lit},
           {{IOPCODE_MOVE_RESULT_PSEUDO}, {}, {dst}}};
 }
 
 DexPattern add_lit(Register src, Register dst) {
-  return {{OPCODE_ADD_INT_LIT8, OPCODE_ADD_INT_LIT16}, {src}, {dst}};
+  return {{OPCODE_ADD_INT_LIT, OPCODE_ADD_INT_LIT}, {src}, {dst}};
 }
 
 std::vector<Pattern> get_arith_patterns() {
@@ -1578,7 +1580,7 @@ std::vector<Pattern> get_arith_patterns() {
           {"Arith_MulLit_Power2",
            {mul_literal_kind(Register::A, Register::B,
                              Literal::Mul_Div_To_Shift_Log2)},
-           {{{OPCODE_SHL_INT_LIT8},
+           {{{OPCODE_SHL_INT_LIT},
              {Register::A},
              {Register::B},
              Literal::Mul_Div_To_Shift_Log2}},
@@ -1588,7 +1590,7 @@ std::vector<Pattern> get_arith_patterns() {
           {"Arith_DivLit_Power2",
            {div_literal_kind(Register::A, Register::B,
                              Literal::Mul_Div_To_Shift_Log2)},
-           {{{OPCODE_SHR_INT_LIT8},
+           {{{OPCODE_SHR_INT_LIT},
              {Register::A},
              {Register::B},
              Literal::Mul_Div_To_Shift_Log2}},
@@ -1850,7 +1852,7 @@ void PeepholePass::run_pass(DexStoresVector& stores,
   }
 
   workqueue_run<DexClass*>(
-      [&peephole_optimizers](sparta::SpartaWorkerState<DexClass*>* state,
+      [&peephole_optimizers](sparta::WorkerState<DexClass*>* state,
                              DexClass* cls) {
         auto& ph = peephole_optimizers[state->worker_id()];
         for (const auto& m : cls->get_dmethods()) {

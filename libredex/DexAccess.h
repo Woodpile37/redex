@@ -33,7 +33,7 @@
   AF(ENUM,         enum,          0x4000)   \
   AF(MODULE,       module,        0x8000)   \
   AF(CONSTRUCTOR,  constructor,  0x10000)   \
-  AF(DECLARED_SYNCHRONIZED, declared_synchronized, 0x2000)
+  AF(DECLARED_SYNCHRONIZED, declared_synchronized, 0x20000)
 // clang-format on
 
 enum DexAccessFlags : uint32_t {
@@ -94,6 +94,12 @@ bool is_public_or_protected(DexMember* m) {
   return m->get_access() & (ACC_PUBLIC | ACC_PROTECTED);
 }
 
+// Only looking at the public, protected and private bits.
+template <typename DexMember>
+DexAccessFlags get_visibility(const DexMember* member) {
+  return member->get_access() & VISIBILITY_MASK;
+}
+
 class DexClass;
 using DexClasses = std::vector<DexClass*>;
 
@@ -133,6 +139,11 @@ void set_final(DexMember* m) {
 template <class DexMember>
 void set_public_final(DexMember* m) {
   m->set_access((m->get_access() & ~VISIBILITY_MASK) | ACC_PUBLIC | ACC_FINAL);
+}
+
+template <class DexMember>
+void set_package_private(DexMember* m) {
+  m->set_access(m->get_access() & ~VISIBILITY_MASK);
 }
 
 inline bool check_required_access_flags(const DexAccessFlags required_set,

@@ -344,12 +344,21 @@ MethodItemEntry* MethodItemEntryCloner::clone(const MethodItemEntry* mie) {
     cloned_mie->centry = new CatchEntry(*cloned_mie->centry);
     cloned_mie->centry->next = clone(cloned_mie->centry->next);
     return cloned_mie;
-  case MFLOW_OPCODE:
-    cloned_mie->insn = new IRInstruction(*cloned_mie->insn);
-    if (cloned_mie->insn->has_data()) {
-      cloned_mie->insn->set_data(cloned_mie->insn->get_data()->clone());
+  case MFLOW_OPCODE: {
+    auto* insn = cloned_mie->insn;
+    if (insn->has_data()) {
+      cloned_mie->insn = new IRInstruction(insn->opcode());
+      always_assert(!insn->has_dest());
+      always_assert(insn->srcs_size() <= 1);
+      if (insn->srcs_size() == 1) {
+        cloned_mie->insn->set_src(0, insn->src(0));
+      }
+      cloned_mie->insn->set_data(insn->get_data()->clone_as_unique_ptr());
+    } else {
+      cloned_mie->insn = new IRInstruction(*insn);
     }
     return cloned_mie;
+  }
   case MFLOW_TARGET:
     cloned_mie->target = new BranchTarget(*cloned_mie->target);
     cloned_mie->target->src = clone(cloned_mie->target->src);
@@ -584,13 +593,28 @@ void IRList::remove_opcode(IRInstruction* insn) {
 }
 
 size_t IRList::sum_opcode_sizes() const {
-  size_t size{0};
+  uint32_t size{0};
   for (const auto& mie : m_list) {
     if (mie.type == MFLOW_OPCODE) {
       size += mie.insn->size();
     }
   }
   return size;
+}
+
+uint32_t IRList::estimate_code_units() const {
+  uint32_t code_units{0};
+  for (const auto& mie : m_list) {
+    if (mie.type == MFLOW_OPCODE) {
+      code_units += mie.insn->size();
+      if (opcode::is_fill_array_data(mie.insn->opcode())) {
+        // fill-array-data-payload
+        auto* data = mie.insn->get_data();
+        code_units += 4 + data->size();
+      }
+    }
+  }
+  return code_units;
 }
 
 size_t IRList::count_opcodes() const {

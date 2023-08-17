@@ -79,26 +79,39 @@ template <typename DexMember,
           typename K>
 DexMember* find_renamable_ref(
     DexMemberRef* ref,
-    std::unordered_map<DexMemberRef*, DexMember*>& ref_def_cache,
+    ConcurrentMap<DexMemberRef*, DexMember*>& ref_def_cache,
     DexElemManager<DexMember*, DexMemberRef*, DexMemberSpec, K>& name_mapping) {
   TRACE(OBFUSCATE, 4, "Found a ref opcode");
   DexMember* def = nullptr;
-  auto member_itr = ref_def_cache.find(ref);
-  if (member_itr != ref_def_cache.end()) {
-    def = member_itr->second;
-  } else {
-    def = name_mapping.def_of_ref(ref);
-  }
-  ref_def_cache[ref] = def;
+  ref_def_cache.update(ref, [&](auto, auto& cache, bool exists) {
+    if (!exists) {
+      cache = name_mapping.def_of_ref(ref);
+    }
+    def = cache;
+  });
   return def;
 }
 
 void update_refs(Scope& scope,
                  DexFieldManager& field_name_mapping,
-                 DexMethodManager& method_name_mapping) {
-  std::unordered_map<DexFieldRef*, DexField*> f_ref_def_cache;
-  std::unordered_map<DexMethodRef*, DexMethod*> m_ref_def_cache;
-  walk::opcodes(scope, [&](DexMethod*, IRInstruction* instr) {
+                 DexMethodManager& method_name_mapping,
+                 size_t* classes_made_public) {
+  ConcurrentMap<DexFieldRef*, DexField*> f_ref_def_cache;
+  ConcurrentMap<DexMethodRef*, DexMethod*> m_ref_def_cache;
+
+  auto maybe_publicize_class = [&](DexMethod* referrer, DexClass* referree) {
+    if (is_public(referree)) {
+      return;
+    }
+    // TODO: Be more conservative here?
+    if (!type::same_package(referrer->get_class(), referree->get_type()) ||
+        is_private(referree)) {
+      set_public(referree);
+      ++(*classes_made_public);
+    }
+  };
+
+  walk::parallel::opcodes(scope, [&](DexMethod* m, IRInstruction* instr) {
     auto op = instr->opcode();
     if (instr->has_field()) {
       DexFieldRef* field_ref = instr->get_field();
@@ -108,6 +121,7 @@ void update_refs(Scope& scope,
       if (field_def != nullptr) {
         TRACE(OBFUSCATE, 4, "Found a ref to fixup %s", SHOW(field_ref));
         instr->set_field(field_def);
+        maybe_publicize_class(m, type_class(field_def->get_class()));
       }
     } else if (instr->has_method() &&
                (opcode::is_invoke_direct(op) || opcode::is_invoke_static(op))) {
@@ -124,6 +138,7 @@ void update_refs(Scope& scope,
       if (method_def != nullptr) {
         TRACE(OBFUSCATE, 4, "Found a ref to fixup %s", SHOW(method_ref));
         instr->set_method(method_def);
+        maybe_publicize_class(m, type_class(method_def->get_class()));
       }
     }
   });
@@ -219,7 +234,8 @@ void obfuscate(Scope& scope,
   // Update any instructions with a member that is a ref to the corresponding
   // def for any field that we are going to rename. This allows us to in-place
   // rename the field def and have that change seen everywhere.
-  update_refs(scope, field_name_manager, method_name_manager);
+  update_refs(scope, field_name_manager, method_name_manager,
+              &stats.classes_made_public);
 
   TRACE(OBFUSCATE, 3, "Finished transforming refs");
 
@@ -233,9 +249,9 @@ void obfuscate(Scope& scope,
   debug_logging(scope);
 
   TRACE(OBFUSCATE, 1,
-        "%s: %ld\n%s: %ld\n"
-        "%s: %ld\n%s: %ld\n"
-        "%s: %ld\n%s: %ld",
+        "%s: %zu\n%s: %zu\n"
+        "%s: %zu\n%s: %zu\n"
+        "%s: %zu\n%s: %zu",
         METRIC_FIELD_TOTAL, stats.fields_total, METRIC_FIELD_RENAMED,
         stats.fields_renamed, METRIC_DMETHODS_TOTAL, stats.dmethods_total,
         METRIC_DMETHODS_RENAMED, stats.dmethods_renamed, METRIC_VMETHODS_TOTAL,
@@ -245,12 +261,6 @@ void obfuscate(Scope& scope,
 void ObfuscatePass::run_pass(DexStoresVector& stores,
                              ConfigFiles& /* conf */,
                              PassManager& mgr) {
-  if (mgr.no_proguard_rules()) {
-    TRACE(OBFUSCATE, 1,
-          "ObfuscatePass not run because no ProGuard configuration was "
-          "provided.");
-    return;
-  }
   auto scope = build_class_scope(stores);
   RenameStats stats;
   auto debug_info_kind = mgr.get_redex_options().debug_info_kind;

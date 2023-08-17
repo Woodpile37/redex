@@ -70,17 +70,17 @@ TEST_F(GlobalTypeAnalysisTest, ConstsAndAGETTest) {
   auto meth_array_comp = get_method("TestB;.getStringArrayComponent",
                                     "[Ljava/lang/String;",
                                     "Ljava/lang/String;");
-  EXPECT_EQ(
-      wps.get_return_type(meth_array_comp),
-      get_type_domain_simple("Ljava/lang/String;").join(DexTypeDomain::null()));
+  EXPECT_EQ(wps.get_return_type(meth_array_comp),
+            get_type_domain_simple("Ljava/lang/String;", Nullness::NN_TOP,
+                                   /* is_dex_type_exact */ false));
 
   auto meth_nested_array_comp =
       get_method("TestB;.getNestedStringArrayComponent",
                  "[[Ljava/lang/String;",
                  "[Ljava/lang/String;");
   EXPECT_EQ(wps.get_return_type(meth_nested_array_comp),
-            get_type_domain_simple("[Ljava/lang/String;")
-                .join(DexTypeDomain::null()));
+            get_type_domain_simple("[Ljava/lang/String;", Nullness::NN_TOP,
+                                   /* is_dex_type_exact */ false));
 }
 
 TEST_F(GlobalTypeAnalysisTest, NullableFieldTypeTest) {
@@ -131,9 +131,9 @@ TEST_F(GlobalTypeAnalysisTest, SmallSetDexTypeDomainTest) {
                                   "Lcom/facebook/redextest/TestE$Base;");
   auto rtype = wps.get_return_type(meth_ret_subs);
   EXPECT_TRUE(rtype.is_nullable());
-  auto single_domain = rtype.get_single_domain();
+  const auto& single_domain = rtype.get_single_domain();
   EXPECT_EQ(single_domain, SingletonDexTypeDomain(get_type("TestE$Base")));
-  auto set_domain = rtype.get_set_domain();
+  const auto& set_domain = rtype.get_set_domain();
   EXPECT_EQ(set_domain.get_types(),
             get_type_set({get_type("TestE$SubOne"), get_type("TestE$SubTwo"),
                           get_type("TestE$SubThree")}));

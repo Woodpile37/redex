@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "ABExperimentContext.h"
 #include "DexStore.h"
 #include "FrameworkApi.h"
 #include "InitClassesWithSideEffects.h"
@@ -41,7 +40,6 @@ struct VirtualMergingStats {
   size_t huge_methods{0};
   size_t caller_size_removed_methods{0};
   size_t removed_virtual_methods{0};
-  size_t experiment_methods{0};
   size_t perf_skipped{0};
 
   VirtualMergingStats& operator+=(const VirtualMergingStats& rhs) {
@@ -66,7 +64,6 @@ struct VirtualMergingStats {
     huge_methods += rhs.huge_methods;
     caller_size_removed_methods += rhs.caller_size_removed_methods;
     removed_virtual_methods += rhs.removed_virtual_methods;
-    experiment_methods += rhs.experiment_methods;
     return *this;
   }
 
@@ -92,7 +89,6 @@ struct VirtualMergingStats {
            huge_methods == rhs.huge_methods &&
            caller_size_removed_methods == rhs.caller_size_removed_methods &&
            removed_virtual_methods == rhs.removed_virtual_methods &&
-           experiment_methods == rhs.experiment_methods &&
            perf_skipped == rhs.perf_skipped;
   }
 };
@@ -113,6 +109,7 @@ class VirtualMerging {
   struct PerfConfig {
     float appear100_threshold;
     float call_count_threshold;
+    std::vector<std::string> interactions{"ColdStart"};
 
     PerfConfig()
         : appear100_threshold(101.0), call_count_threshold(0) {} // Default: off
@@ -128,10 +125,7 @@ class VirtualMerging {
   ~VirtualMerging();
   void run(const method_profiles::MethodProfiles&,
            Strategy strategy,
-           InsertionStrategy insertion_strategy,
-           Strategy ab_strategy = Strategy::kLexicographical,
-           InsertionStrategy ab_insertion_strategy = InsertionStrategy::kJumpTo,
-           ab_test::ABExperimentContext* ab_experiment_context = nullptr);
+           InsertionStrategy insertion_strategy);
   const VirtualMergingStats& get_stats() { return m_stats; }
 
  private:
@@ -140,7 +134,7 @@ class VirtualMerging {
   XDexRefs m_xdexes;
   TypeSystem m_type_system;
   size_t m_max_overriding_method_instructions;
-  ConcurrentMethodRefCache m_concurrent_resolved_refs;
+  ConcurrentMethodResolver m_concurrent_method_resolver;
   inliner::InlinerConfig m_inliner_config;
   init_classes::InitClassesWithSideEffects m_init_classes_with_side_effects;
 
@@ -168,11 +162,8 @@ class VirtualMerging {
       Strategy strategy,
       VirtualMergingStats&) const;
 
-  void merge_methods(const MergablePairsByVirtualScope& mergable_pairs,
-                     const MergablePairsByVirtualScope& exp_mergable_pairs,
-                     ab_test::ABExperimentContext* ab_experiment_context,
-                     InsertionStrategy insertion_strategy,
-                     InsertionStrategy ab_insertion_strategy);
+  void merge_methods(const MergablePairsByVirtualScope& mergeable_pairs,
+                     InsertionStrategy insertion_strategy);
   std::unordered_map<DexClass*, std::vector<const DexMethod*>>
       m_virtual_methods_to_remove;
   std::unordered_map<DexMethod*, DexMethod*> m_virtual_methods_to_remap;
@@ -187,7 +178,19 @@ class VirtualMergingPass : public Pass {
  public:
   VirtualMergingPass() : Pass("VirtualMergingPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, RequiresAndEstablishes},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   void bind_config() override;
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:
@@ -195,10 +198,6 @@ class VirtualMergingPass : public Pass {
   VirtualMerging::Strategy m_strategy{
       VirtualMerging::Strategy::kProfileCallCount};
   VirtualMerging::InsertionStrategy m_insertion_strategy{
-      VirtualMerging::InsertionStrategy::kJumpTo};
-  VirtualMerging::Strategy m_ab_strategy{
-      VirtualMerging::Strategy::kLexicographical};
-  VirtualMerging::InsertionStrategy m_ab_insertion_strategy{
       VirtualMerging::InsertionStrategy::kJumpTo};
   VirtualMerging::PerfConfig m_perf_config;
 };

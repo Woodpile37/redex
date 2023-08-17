@@ -9,12 +9,13 @@
 
 #include <optional>
 
+#include <sparta/PatriciaTreeSetAbstractDomain.h>
+
 #include "ConstantPropagationWholeProgramState.h"
 #include "DexClass.h"
 #include "IRCode.h"
 #include "InitClassesWithSideEffects.h"
 #include "Pass.h"
-#include "PatriciaTreeSetAbstractDomain.h"
 
 class FinalInlinePassV2 : public Pass {
  public:
@@ -26,6 +27,17 @@ class FinalInlinePassV2 : public Pass {
   };
 
   FinalInlinePassV2() : Pass("FinalInlinePassV2") {}
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+        {NoResolvablePureRefs, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
 
   void bind_config() override {
     bind("inline_instance_field", true, m_config.inline_instance_field);
@@ -41,8 +53,9 @@ class FinalInlinePassV2 : public Pass {
   }
 
   struct Stats {
-    size_t inlined_count;
-    size_t init_classes;
+    size_t inlined_count{0};
+    size_t init_classes{0};
+    size_t possible_cycles{0};
   };
   static Stats run(const Scope&,
                    int min_sdk,
@@ -60,6 +73,7 @@ class FinalInlinePassV2 : public Pass {
       const constant_propagation::EligibleIfields& eligible_ifields,
       const Config& config = Config(),
       std::optional<DexStoresVector*> stores = std::nullopt);
+
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:
@@ -68,25 +82,14 @@ class FinalInlinePassV2 : public Pass {
 
 namespace final_inline {
 
-class class_initialization_cycle : public std::exception {
- public:
-  explicit class_initialization_cycle(const DexClass* cls) {
-    m_msg = "Found a class initialization cycle involving " + show(cls);
-  }
-
-  const char* what() const noexcept override { return m_msg.c_str(); }
-
- private:
-  std::string m_msg;
-};
-
 constant_propagation::WholeProgramState analyze_and_simplify_clinits(
     const Scope& scope,
     const init_classes::InitClassesWithSideEffects&
         init_classes_with_side_effects,
     const XStoreRefs* xstores,
-    const std::unordered_set<const DexType*>& blocklist_types = {},
-    const std::unordered_set<std::string>& allowed_opaque_callee_names = {});
+    const std::unordered_set<const DexType*>& blocklist_types,
+    const std::unordered_set<std::string>& allowed_opaque_callee_names,
+    size_t& clinit_cycles);
 
 class StaticFieldReadAnalysis {
  public:

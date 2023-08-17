@@ -14,8 +14,11 @@
 #include <boost/iostreams/device/mapped_file.hpp>
 #include <boost/optional.hpp>
 #include <boost/regex.hpp>
+#include <cstdint>
 #include <fcntl.h>
+#include <fstream>
 #include <map>
+#include <string_view>
 
 #include "Macros.h"
 #if IS_WINDOWS
@@ -33,10 +36,12 @@
 #include "utils/String16.h"
 #include "utils/String8.h"
 #include "utils/TypeHelpers.h"
+#include "utils/Unicode.h"
 #include "utils/Visitor.h"
 
 #include "Debug.h"
 #include "DexUtil.h"
+#include "GlobalConfig.h"
 #include "IOUtil.h"
 #include "ReadMaybeMapped.h"
 #include "RedexMappedFile.h"
@@ -51,20 +56,6 @@
 #endif
 
 namespace apk {
-bool is_valid_global_string(const android::ResStringPool& pool, size_t idx) {
-  size_t u16_len;
-  return pool.stringAt(idx, &u16_len) != nullptr;
-}
-
-std::string get_string_from_pool(const android::ResStringPool& pool,
-                                 size_t idx) {
-  size_t u16_len;
-  auto wide_chars = pool.stringAt(idx, &u16_len);
-  android::String16 s16(wide_chars, u16_len);
-  android::String8 string8(s16);
-  return std::string(string8.string());
-}
-
 bool TableParser::visit_global_strings(android::ResStringPool_header* pool) {
   m_global_pool_header = pool;
   arsc::StringPoolRefVisitor::visit_global_strings(pool);
@@ -308,7 +299,7 @@ std::string TableSnapshot::get_resource_name(uint32_t id) {
     return "";
   }
   auto& pool = m_key_strings.at(package_id);
-  return get_string_from_pool(pool, result);
+  return arsc::get_string_from_pool(pool, result);
 }
 
 size_t TableSnapshot::package_count() {
@@ -319,7 +310,7 @@ void TableSnapshot::get_type_names(uint32_t package_id,
                                    std::vector<std::string>* out) {
   auto& pool = m_type_strings.at(package_id);
   for (size_t i = 0; i < pool.size(); i++) {
-    out->emplace_back(get_string_from_pool(pool, i));
+    out->emplace_back(arsc::get_string_from_pool(pool, i));
   }
 }
 
@@ -330,7 +321,7 @@ void TableSnapshot::get_configurations(
   uint8_t type_id = 0;
   auto& pool = m_type_strings.at(package_id);
   for (size_t i = 0; i < pool.size(); i++) {
-    if (type_name == get_string_from_pool(pool, i)) {
+    if (type_name == arsc::get_string_from_pool(pool, i)) {
       type_id = i + 1;
       break;
     }
@@ -343,7 +334,7 @@ void TableSnapshot::get_configurations(
                         dtohl(c->size));
       android::ResTable_config swapped;
       swapped.copyFromDtoH(*c);
-      out->emplace_back(std::move(swapped));
+      out->emplace_back(swapped);
     }
   }
 }
@@ -501,11 +492,11 @@ void TableSnapshot::collect_resource_values(
 }
 
 bool TableSnapshot::is_valid_global_string_idx(size_t idx) const {
-  return is_valid_global_string(m_global_strings, idx);
+  return arsc::is_valid_string_idx(m_global_strings, idx);
 }
 
 std::string TableSnapshot::get_global_string(size_t idx) const {
-  return get_string_from_pool(m_global_strings, idx);
+  return arsc::get_string_from_pool(m_global_strings, idx);
 }
 
 } // namespace apk
@@ -522,27 +513,24 @@ namespace {
  * ofstream to write to arsc file for input bigger than original
  * file size.
  */
-size_t write_serialized_data_with_expansion(const android::Vector<char>& cVec,
+size_t write_serialized_data_with_expansion(const android::Vector<char>& vector,
                                             RedexMappedFile f) {
-  size_t vec_size = cVec.size();
+  size_t vec_size = vector.size();
   auto filename = f.filename.c_str();
   // Close current opened file.
   f.file.reset();
   // Write to arsc through ofstream
-  std::ofstream ofs(filename,
-                    std::ofstream::out | std::ofstream::trunc |
-                        std::ofstream::binary);
-  ofs.write(&(cVec[0]), vec_size);
+  arsc::write_bytes_to_file(vector, filename);
   return vec_size;
 }
 
-size_t write_serialized_data(const android::Vector<char>& cVec,
+size_t write_serialized_data(const android::Vector<char>& vector,
                              RedexMappedFile f) {
-  size_t vec_size = cVec.size();
+  size_t vec_size = vector.size();
   size_t f_size = f.size();
   always_assert_log(vec_size <= f_size, "Growing file not supported");
   if (vec_size > 0) {
-    memcpy(f.data(), &(cVec[0]), vec_size);
+    memcpy(f.data(), vector.array(), vec_size);
   }
   f.file.reset(); // Close the map.
 #if IS_WINDOWS
@@ -557,6 +545,32 @@ size_t write_serialized_data(const android::Vector<char>& cVec,
 #endif
   redex_assert(trunc_res == 0);
   return vec_size > 0 ? vec_size : f_size;
+}
+
+/*
+ * skip a tag including its nested tags
+ */
+void skip_nested_tags(android::ResXMLTree* parser) {
+  size_t depth{1};
+  while (depth) {
+    auto type = parser->next();
+    switch (type) {
+    case android::ResXMLParser::START_TAG: {
+      ++depth;
+      break;
+    }
+    case android::ResXMLParser::END_TAG: {
+      --depth;
+      break;
+    }
+    case android::ResXMLParser::BAD_DOCUMENT: {
+      not_reached();
+    }
+    default: {
+      break;
+    }
+    }
+  }
 }
 
 /*
@@ -606,6 +620,7 @@ ManifestClassInfo extract_classes_from_manifest(const char* data, size_t size) {
   android::String16 receiver("receiver");
   android::String16 service("service");
   android::String16 instrumentation("instrumentation");
+  android::String16 queries("queries");
   android::String16 intent_filter("intent-filter");
 
   // This is not an unordered_map because String16 doesn't define a hash
@@ -659,6 +674,10 @@ ManifestClassInfo extract_classes_from_manifest(const char* data, size_t size) {
         always_assert(classname.size());
         manifest_classes.instrumentation_classes.emplace(
             java_names::external_to_internal(classname));
+      } else if (tag == queries) {
+        // queries break the logic to find providers below because they don't
+        // declare a name
+        skip_nested_tags(&parser);
       } else if (string_to_tag.count(tag)) {
         std::string classname = get_string_attribute_value(
             parser, tag != activity_alias ? name : target_activity);
@@ -714,13 +733,13 @@ ManifestClassInfo extract_classes_from_manifest(const char* data, size_t size) {
 
   return manifest_classes;
 }
+} // namespace
 
 std::string convert_from_string16(const android::String16& string16) {
   android::String8 string8(string16);
   std::string converted(string8.string());
   return converted;
 }
-} // namespace
 
 // Returns the attribute with the given name for the current XML element
 std::string get_string_attribute_value(
@@ -807,13 +826,6 @@ std::string ApkResources::get_base_assets_dir() {
 }
 
 namespace {
-bool is_binary_xml(const void* data, size_t size) {
-  if (size < sizeof(android::ResChunk_header)) {
-    return false;
-  }
-  return dtohs(((android::ResChunk_header*)data)->type) ==
-         android::RES_XML_TYPE;
-}
 
 std::string read_attribute_name_at_idx(const android::ResXMLTree& parser,
                                        size_t idx) {
@@ -835,16 +847,12 @@ void extract_classes_from_layout(
     const std::unordered_set<std::string>& attributes_to_read,
     std::unordered_set<std::string>* out_classes,
     std::unordered_multimap<std::string, std::string>* out_attributes) {
-  if (!is_binary_xml(data, size)) {
+  if (!arsc::is_binary_xml(data, size)) {
     return;
   }
 
   android::ResXMLTree parser;
   parser.setTo(data, size);
-
-  android::String16 name("name");
-  android::String16 klazz("class");
-  android::String16 target_class("targetClass");
 
   if (parser.getError() != android::NO_ERROR) {
     return;
@@ -857,27 +865,32 @@ void extract_classes_from_layout(
     if (type == android::ResXMLParser::START_TAG) {
       size_t len;
       android::String16 tag(parser.getElementName(&len));
-      std::string classname = convert_from_string16(tag);
-      if (!strcmp(classname.c_str(), "fragment") ||
-          !strcmp(classname.c_str(), "view") ||
-          !strcmp(classname.c_str(), "dialog") ||
-          !strcmp(classname.c_str(), "activity") ||
-          !strcmp(classname.c_str(), "intent")) {
-        classname = get_string_attribute_value(parser, klazz);
-        if (classname.empty()) {
-          classname = get_string_attribute_value(parser, name);
-        }
-        if (classname.empty()) {
-          classname = get_string_attribute_value(parser, target_class);
+      std::string element_name = convert_from_string16(tag);
+      if (resources::KNOWN_ELEMENTS_WITH_CLASS_ATTRIBUTES.count(element_name) >
+          0) {
+        for (const auto& attr : resources::POSSIBLE_CLASS_ATTRIBUTES) {
+          android::String16 attr_name(attr.c_str(), attr.length());
+          auto classname = get_string_attribute_value(parser, attr_name);
+          if (!classname.empty() && classname.find('.') != std::string::npos) {
+            auto internal = java_names::external_to_internal(classname);
+            TRACE(RES, 9,
+                  "Considering %s as possible class in XML "
+                  "resource from element %s",
+                  internal.c_str(), element_name.c_str());
+            out_classes->emplace(internal);
+            break;
+          }
         }
       }
-      std::string converted = std::string("L") + classname + std::string(";");
+      if (element_name.find('.') != std::string::npos) {
+        // Consider the element name itself as a possible class in the
+        // application
+        auto internal = java_names::external_to_internal(element_name);
+        TRACE(RES, 9, "Considering %s as possible class in XML resource",
+              internal.c_str());
+        out_classes->emplace(internal);
+      }
 
-      bool is_classname = converted.find('.') != std::string::npos;
-      if (is_classname) {
-        std::replace(converted.begin(), converted.end(), '.', '/');
-        out_classes->insert(converted);
-      }
       if (!attributes_to_read.empty()) {
         for (size_t i = 0; i < parser.getAttributeCount(); i++) {
           auto ns_id = parser.getAttributeNamespaceID(i);
@@ -919,6 +932,240 @@ void ApkResources::collect_layout_classes_and_attributes_for_file(
     extract_classes_from_layout(data, size, attributes_to_read, out_classes,
                                 out_attributes);
   });
+}
+
+namespace {
+class XmlStringAttributeCollector : public arsc::SimpleXmlParser {
+ public:
+  ~XmlStringAttributeCollector() override {}
+
+  bool visit_typed_data(android::Res_value* value) override {
+    if (value->dataType == android::Res_value::TYPE_STRING) {
+      auto idx = dtohl(value->data);
+      auto& pool = global_strings();
+      if (arsc::is_valid_string_idx(pool, idx)) {
+        auto s = arsc::get_string_from_pool(pool, idx);
+        m_values.emplace(s);
+      }
+    }
+    return true;
+  }
+
+  std::unordered_set<std::string> m_values;
+};
+
+class XmlElementCollector : public arsc::SimpleXmlParser {
+ public:
+  ~XmlElementCollector() override {}
+
+  boost::optional<std::string> get_element_name(
+      android::ResXMLTree_attrExt* extension) {
+    auto ns = dtohl(extension->ns.index);
+    auto name_idx = dtohl(extension->name.index);
+    auto& string_pool = global_strings();
+    if (arsc::is_valid_string_idx(string_pool, name_idx)) {
+      auto element_name = arsc::get_string_from_pool(string_pool, name_idx);
+      if (arsc::is_valid_string_idx(string_pool, ns)) {
+        auto ns_name = arsc::get_string_from_pool(string_pool, ns);
+        return ns_name + ":" + element_name;
+      }
+      return element_name;
+    }
+    return boost::none;
+  }
+
+  bool visit_start_tag(android::ResXMLTree_node* node,
+                       android::ResXMLTree_attrExt* extension) override {
+    auto name = get_element_name(extension);
+    if (name != boost::none) {
+      m_element_names.emplace(*name);
+    }
+    return arsc::SimpleXmlParser::visit_start_tag(node, extension);
+  }
+
+  std::unordered_set<std::string> m_element_names;
+};
+
+// Rewrites node, extension, and attribute list to transform encountered
+// elements into the form: <view class="" ... />
+class NodeAttributeTransformer : public XmlElementCollector {
+ public:
+  ~NodeAttributeTransformer() override {}
+
+  NodeAttributeTransformer(
+      const std::unordered_map<std::string, std::string>& element_to_class_name,
+      const std::unordered_map<std::string, uint32_t>& class_name_to_idx,
+      uint32_t class_attr_idx,
+      uint32_t view_idx)
+      : m_element_to_class_name(element_to_class_name),
+        m_class_name_to_idx(class_name_to_idx),
+        m_class_attr_idx(class_attr_idx),
+        m_view_idx(view_idx) {}
+
+  bool visit(void* data, size_t len) override {
+    m_file_manipulator =
+        std::make_unique<arsc::ResFileManipulator>((char*)data, len);
+    return XmlElementCollector::visit(data, len);
+  }
+
+  bool visit_start_tag(android::ResXMLTree_node* node,
+                       android::ResXMLTree_attrExt* extension) override {
+    auto name = get_element_name(extension);
+    if (name != boost::none) {
+      auto search = m_element_to_class_name.find(*name);
+      if (search != m_element_to_class_name.end()) {
+        // Make the new "class" attribute
+        android::ResXMLTree_attribute new_attr{};
+        new_attr.name.index = htodl(m_class_attr_idx);
+        auto class_name = search->second;
+        auto attribute_value_idx = m_class_name_to_idx.at(class_name);
+        new_attr.ns.index = 0xFFFFFFFF;
+        new_attr.rawValue.index = htodl(attribute_value_idx);
+        new_attr.typedValue.size = htods(sizeof(android::Res_value));
+        new_attr.typedValue.dataType = android::Res_value::TYPE_STRING;
+        new_attr.typedValue.data = htodl(attribute_value_idx);
+        // Find the position at which the "class" attribute should go. It should
+        // not be present, but if it is we will skip it (no idea wtf to do in
+        // that case).
+        auto pool_lookup = [&](uint32_t idx) {
+          auto& pool = global_strings();
+          return arsc::get_string_from_pool(pool, idx);
+        };
+        auto ordinal = arsc::find_attribute_ordinal(
+            node, extension, &new_attr, attribute_count(), pool_lookup);
+        if (ordinal >= 0) {
+          TRACE(RES, 9,
+                "Node has %d attributes, class will be added at ordinal %d",
+                extension->attributeCount, (uint32_t)ordinal);
+          // Make a copy of the extension to begin changes. First, set the
+          // element's name to "view".
+          android::ResXMLTree_attrExt new_extension = *extension;
+          new_extension.name.index = htodl(m_view_idx);
+          new_extension.attributeCount =
+              htods(dtohs(extension->attributeCount) + 1);
+          new_extension.classIndex = htods(ordinal + 1); // this is 1 based
+          if (extension->styleIndex != 0) {
+            // Adjust this count too, as we should be adding before it.
+            new_extension.styleIndex = htods(dtohs(extension->styleIndex) + 1);
+          }
+          TRACE(RES, 9, "Replacing node extension at 0x%lx",
+                get_file_offset(extension));
+          m_file_manipulator->replace_at(extension, new_extension);
+
+          // Note the place where the new attribute should be inserted.
+          auto offset = (char*)arsc::get_attribute_pointer(extension) +
+                        ordinal * sizeof(android::ResXMLTree_attribute);
+          m_file_manipulator->add_at(offset, new_attr);
+
+          // Finally, fix up the node's size to reflect the growing data.
+          android::ResXMLTree_node new_node = *node;
+          new_node.header.size = htodl(dtohl(node->header.size) +
+                                       sizeof(android::ResXMLTree_attribute));
+          TRACE(RES, 9, "Replacing node at 0x%lx", get_file_offset(node));
+          m_file_manipulator->replace_at(node, new_node);
+          m_changes++;
+        } else {
+          TRACE(RES, 9,
+                "Cannot modify node %s; new attribute cannot be inserted",
+                name->c_str());
+        }
+      }
+    }
+    return XmlElementCollector::visit_start_tag(node, extension);
+  }
+
+  size_t change_count() { return m_changes; }
+
+  // Build the final file to the given vector.
+  void serialize(android::Vector<char>* out) {
+    m_file_manipulator->serialize(out);
+  }
+
+  // Offset information about the string pool of the document
+  const std::unordered_map<std::string, std::string>& m_element_to_class_name;
+  const std::unordered_map<std::string, uint32_t>& m_class_name_to_idx;
+  // This is the string pool index for the string "class"
+  uint32_t m_class_attr_idx;
+  // This is the string pool index for the string "view"
+  uint32_t m_view_idx;
+
+  // Tracks ongoing changes and builds the result.
+  std::unique_ptr<arsc::ResFileManipulator> m_file_manipulator;
+  size_t m_changes{0};
+};
+} // namespace
+
+void ApkResources::collect_xml_attribute_string_values_for_file(
+    const std::string& file_path, std::unordered_set<std::string>* out) {
+  redex::read_file_with_contents(file_path, [&](const char* data, size_t size) {
+    if (arsc::is_binary_xml(data, size)) {
+      XmlStringAttributeCollector collector;
+      if (collector.visit((void*)data, size)) {
+        out->insert(collector.m_values.begin(), collector.m_values.end());
+      }
+    }
+  });
+}
+
+void ApkResources::fully_qualify_layout(
+    const std::unordered_map<std::string, std::string>& element_to_class_name,
+    const std::string& file_path,
+    size_t* changes) {
+  // Check if this file has any applicable elements to fully qualify. If any
+  // are found, add their fully qualified element names to the document's
+  // string pool, along with the replacement element name and attribute name
+  // that we'll need.
+  std::set<std::string> strings_to_add;
+  std::unordered_map<std::string, uint32_t> string_to_idx;
+  bool needs_changes = false;
+  android::Vector<char> file_vec;
+
+  redex::read_file_with_contents(file_path, [&](const char* data, size_t size) {
+    XmlElementCollector collector;
+    if (collector.visit((void*)data, size)) {
+      for (const auto& [element, class_name] : element_to_class_name) {
+        if (collector.m_element_names.count(element) > 0) {
+          strings_to_add.emplace(class_name);
+          needs_changes = true;
+        }
+      }
+    }
+    if (needs_changes) {
+      strings_to_add.emplace("class");
+      strings_to_add.emplace("view");
+      auto result = arsc::ensure_strings_in_xml_pool(data, size, strings_to_add,
+                                                     &file_vec, &string_to_idx);
+      always_assert_log(result == android::OK,
+                        "Failed to edit file %s; it may not be valid",
+                        file_path.c_str());
+      // file_data will contain the edited document, or be empty signaling the
+      // original file bytes should suffice. To normalize things in the unusual
+      // case of all the necessary strings being present, we'll just slurp the
+      // original bytes up.
+      if (file_vec.empty()) {
+        file_vec.appendArray(data, size);
+      }
+    }
+  });
+
+  if (!needs_changes) {
+    return;
+  }
+  auto class_idx = string_to_idx.at("class");
+  auto view_idx = string_to_idx.at("view");
+
+  auto file_data = (char*)file_vec.array();
+  NodeAttributeTransformer transformer(element_to_class_name, string_to_idx,
+                                       class_idx, view_idx);
+  auto successful_visit = transformer.visit(file_data, file_vec.size());
+  always_assert_log(successful_visit,
+                    "could not parse xml file after ensuring strings");
+  if (transformer.change_count() > 0) {
+    android::Vector<char> final_bytes;
+    transformer.serialize(&final_bytes);
+    arsc::write_bytes_to_file(final_bytes, file_path);
+    *changes = transformer.change_count();
+  }
 }
 
 namespace {
@@ -1018,56 +1265,14 @@ boost::optional<std::string> ApkResources::get_manifest_package_name() {
 
 std::unordered_set<uint32_t> ApkResources::get_xml_reference_attributes(
     const std::string& filename) {
-  std::unordered_set<uint32_t> result;
   if (is_raw_resource(filename)) {
-    return result;
+    return {};
   }
   auto file = RedexMappedFile::open(filename);
-  android::ResXMLTree parser;
-  parser.setTo(file.const_data(), file.size());
-  if (parser.getError() != android::NO_ERROR) {
-    throw std::runtime_error("Unable to read file: " + filename);
-  }
-
-  android::ResXMLParser::event_code_t type;
-  do {
-    type = parser.next();
-    if (type == android::ResXMLParser::START_TAG) {
-      const size_t attr_count = parser.getAttributeCount();
-      for (size_t i = 0; i < attr_count; ++i) {
-        if (parser.getAttributeDataType(i) ==
-                android::Res_value::TYPE_REFERENCE ||
-            parser.getAttributeDataType(i) ==
-                android::Res_value::TYPE_ATTRIBUTE) {
-          android::Res_value outValue;
-          parser.getAttributeValue(i, &outValue);
-          if (outValue.data > PACKAGE_RESID_START) {
-            result.emplace(outValue.data);
-          }
-        }
-      }
-    }
-  } while (type != android::ResXMLParser::BAD_DOCUMENT &&
-           type != android::ResXMLParser::END_DOCUMENT);
-
-  return result;
+  apk::XmlValueCollector collector;
+  collector.visit((void*)file.const_data(), file.size());
+  return collector.m_ids;
 }
-
-namespace {
-// Insert string data from the given pool at the given index to the builder.
-void add_existing_string_to_builder(const android::ResStringPool& string_pool,
-                                    arsc::ResStringPoolBuilder* builder,
-                                    size_t idx) {
-  size_t length;
-  if (string_pool.isUTF8()) {
-    auto s = string_pool.string8At(idx, &length);
-    builder->add_string(s, length);
-  } else {
-    auto s = string_pool.stringAt(idx, &length);
-    builder->add_string(s, length);
-  }
-}
-} // namespace
 
 int ApkResources::replace_in_xml_string_pool(
     const void* data,
@@ -1075,34 +1280,24 @@ int ApkResources::replace_in_xml_string_pool(
     const std::map<std::string, std::string>& rename_map,
     android::Vector<char>* out_data,
     size_t* out_num_renamed) {
+  int validation_result = arsc::validate_xml_string_pool(data, len);
+  if (validation_result != android::OK) {
+    return validation_result;
+  }
+
   const auto chunk_size = sizeof(android::ResChunk_header);
-  const auto pool_header_size = (uint16_t)sizeof(android::ResStringPool_header);
-
-  // Validate the given bytes.
-  if (len < chunk_size + pool_header_size) {
-    return android::NOT_ENOUGH_DATA;
-  }
-
-  // Layout XMLs will have a ResChunk_header, followed by ResStringPool
-  // representing each XML tag and attribute string.
-  auto chunk = (android::ResChunk_header*)data;
-  LOG_FATAL_IF(dtohl(chunk->size) != len, "Can't read header size");
-
   auto pool_ptr = (android::ResStringPool_header*)((char*)data + chunk_size);
-  if (dtohs(pool_ptr->header.type) != android::RES_STRING_POOL_TYPE) {
-    return android::BAD_TYPE;
-  }
-
   size_t num_replaced = 0;
   android::ResStringPool pool(pool_ptr, dtohl(pool_ptr->header.size));
-  auto flags = pool.isUTF8() ? htodl(android::ResStringPool_header::UTF8_FLAG)
-                             : (uint32_t)0;
+  auto flags = pool.isUTF8()
+                   ? htodl((uint32_t)android::ResStringPool_header::UTF8_FLAG)
+                   : (uint32_t)0;
   arsc::ResStringPoolBuilder pool_builder(flags);
   for (size_t i = 0; i < dtohl(pool_ptr->stringCount); i++) {
-    auto existing_str = apk::get_string_from_pool(pool, i);
+    auto existing_str = arsc::get_string_from_pool(pool, i);
     auto replacement = rename_map.find(existing_str);
     if (replacement == rename_map.end()) {
-      add_existing_string_to_builder(pool, &pool_builder, i);
+      pool_builder.add_string(pool, i);
     } else {
       pool_builder.add_string(replacement->second);
       num_replaced++;
@@ -1170,6 +1365,75 @@ size_t ApkResources::remap_xml_reference_attributes(
   always_assert_log(editor.visit((void*)file.data(), file.size()),
                     "Failed to parse resource xml file %s", filename.c_str());
   return editor.remap(kept_to_remapped_ids) > 0;
+}
+
+namespace {
+
+void obfuscate_xml_attributes(
+    const std::string& filename,
+    const std::unordered_set<std::string>& do_not_obfuscate_elements) {
+  auto file = RedexMappedFile::open(filename, false);
+  apk::XmlFileEditor editor;
+  always_assert_log(editor.visit((void*)file.data(), file.size()),
+                    "Failed to parse resource xml file %s", filename.c_str());
+  auto attribute_count = editor.m_attribute_id_count;
+  auto string_count = dtohl(editor.m_string_pool_header->stringCount);
+  if (attribute_count > 0 && string_count > 0) {
+    TRACE(RES, 9, "Considering file %s for obfuscation", filename.c_str());
+    android::ResStringPool pool;
+    always_assert_log(
+        pool.setTo(editor.m_string_pool_header,
+                   dtohl(editor.m_string_pool_header->header.size),
+                   true) == android::NO_ERROR,
+        "Malformed string pool in file %s", filename.c_str());
+    uint32_t flags =
+        pool.isUTF8() ? android::ResStringPool_header::UTF8_FLAG : 0;
+    android::String8 empty_str("");
+    arsc::ResStringPoolBuilder builder(flags);
+    for (size_t i = 0; i < attribute_count; i++) {
+      builder.add_string(empty_str.string(), empty_str.size());
+    }
+    for (size_t i = attribute_count; i < string_count; i++) {
+      auto element = arsc::get_string_from_pool(pool, i);
+      if (do_not_obfuscate_elements.count(element) > 0) {
+        TRACE(RES, 9, "NOT obfuscating xml file %s", filename.c_str());
+        return;
+      }
+      builder.add_string(element);
+    }
+    android::Vector<char> out;
+    arsc::replace_xml_string_pool((android::ResChunk_header*)file.data(),
+                                  file.size(), builder, &out);
+    write_serialized_data(out, std::move(file));
+  }
+}
+} // namespace
+
+void ApkResources::obfuscate_xml_files(
+    const std::unordered_set<std::string>& allowed_types,
+    const std::unordered_set<std::string>& do_not_obfuscate_elements) {
+  using path_t = boost::filesystem::path;
+  using dir_iterator = boost::filesystem::directory_iterator;
+
+  std::set<std::string> xml_paths;
+  path_t res(m_directory + "/res");
+  if (exists(res) && is_directory(res)) {
+    for (auto it = dir_iterator(res); it != dir_iterator(); ++it) {
+      auto const& entry = *it;
+      const path_t& entry_path = entry.path();
+      const auto& entry_string = entry_path.string();
+      // TODO(T126661220): support obfuscated input.
+      if (is_directory(entry_path) &&
+          can_obfuscate_xml_file(allowed_types, entry_string)) {
+        for (const std::string& layout : get_xml_files(entry_string)) {
+          xml_paths.emplace(layout);
+        }
+      }
+    }
+  }
+  for (const auto& path : xml_paths) {
+    obfuscate_xml_attributes(path, do_not_obfuscate_elements);
+  }
 }
 
 std::unique_ptr<ResourceTableFile> ApkResources::load_res_table() {
@@ -1265,7 +1529,8 @@ void ResourcesArscFile::remap_reorder_and_serialize(
 
         auto configs = table_parser.get_configs(package_id, type_id);
         auto type_definer = std::make_shared<arsc::ResTableTypeDefiner>(
-            package_id, type_id, configs, flags);
+            package_id, type_id, configs, flags, false,
+            arsc::any_sparse_types(type_info.configs));
 
         for (auto& config : configs) {
           for (uint32_t new_entry_id = 0; new_entry_id < entry_count;
@@ -1318,7 +1583,7 @@ class GlobalStringPoolReader : public arsc::ResourceTableVisitor {
     m_global_strings_header = header;
     auto size = m_global_strings->size();
     for (uint32_t i = 0; i < size; i++) {
-      auto value = apk::get_string_from_pool(*m_global_strings, i);
+      auto value = arsc::get_string_from_pool(*m_global_strings, i);
       m_string_to_idx.emplace(value, i);
       TRACE(RES, 9, "GLOBAL STRING [%u] = %s", i, value.c_str());
     }
@@ -1480,19 +1745,27 @@ void add_string_idx_to_builder(
 }
 
 // Copies the string data for the kept indicies from the given pool to the
-// builder. If needed, a remapper function can be run against the spans required
-// by a kept index.
+// builder in the order specified. If needed, a remapper function can be run
+// against the spans required by a kept index.
 void rebuild_string_pool(
     const android::ResStringPool& string_pool,
     const std::unordered_map<uint32_t, uint32_t>& kept_old_to_new,
     const std::function<void(android::ResStringPool_span*)>& span_remapper,
     arsc::ResStringPoolBuilder* builder) {
-  const auto original_string_count = string_pool.size();
   const auto is_utf8 = string_pool.isUTF8();
-  for (size_t idx = 0; idx < original_string_count; idx++) {
-    if (kept_old_to_new.count(idx) == 0) {
-      continue;
-    }
+  const auto new_string_pool_size = kept_old_to_new.size();
+  always_assert_log(new_string_pool_size <= string_pool.size(),
+                    "Pool remapping is too large");
+
+  std::vector<ssize_t> output_order(new_string_pool_size, -1);
+  for (const auto& pair : kept_old_to_new) {
+    always_assert_log(pair.second < new_string_pool_size,
+                      "Pool remap idx out of bounds");
+    always_assert_log(output_order.at(pair.second) == -1,
+                      "Pool remapping is invalid");
+    output_order.at(pair.second) = pair.first;
+  }
+  for (const auto& idx : output_order) {
     size_t length;
     if (is_utf8) {
       auto s = string_pool.string8At(idx, &length);
@@ -1506,18 +1779,55 @@ void rebuild_string_pool(
   }
 }
 
+// Copies the string data for the kept indicies from the given pool to the
+// builder in the order specified.
+void rebuild_string_pool(
+    const android::ResStringPool& string_pool,
+    const std::unordered_map<uint32_t, uint32_t>& kept_old_to_new,
+    arsc::ResStringPoolBuilder* builder) {
+  rebuild_string_pool(
+      string_pool, kept_old_to_new, [](android::ResStringPool_span*) {},
+      builder);
+}
+
 // Given the kept strings, build the mapping from old -> new in the projected
 // new string pool.
 void project_string_mapping(
     const std::unordered_set<uint32_t>& used_strings,
-    const size_t& string_count,
-    std::unordered_map<uint32_t, uint32_t>* kept_old_to_new) {
-  for (size_t i = 0; i < string_count; i++) {
-    if (used_strings.count(i) > 0) {
-      auto new_index = kept_old_to_new->size();
-      TRACE(RES, 9, "MAPPING %zu => %zu", i, new_index);
-      kept_old_to_new->emplace(i, new_index);
+    const android::ResStringPool& string_pool,
+    std::unordered_map<uint32_t, uint32_t>* kept_old_to_new,
+    bool sort_by_string_value = false) {
+  always_assert(kept_old_to_new->empty());
+
+  std::vector<uint32_t> used_indices(used_strings.begin(), used_strings.end());
+  if (!sort_by_string_value) {
+    std::sort(used_indices.begin(), used_indices.end());
+  } else {
+    always_assert_log(string_pool.styleCount() == 0,
+                      "Sorting by string value not supported with styles");
+    // AOSP implementation will perform binary search via strzcmp16; to ensure
+    // proper order this will convert to UTF-16 if needed and run the same
+    // comparison.
+    std::vector<std::u16string_view> pool_items;
+    auto size = string_pool.size();
+    pool_items.reserve(size);
+    for (size_t i = 0; i < size; i++) {
+      size_t len;
+      auto chars = string_pool.stringAt(i, &len);
+      pool_items.emplace_back(chars, len);
     }
+    std::sort(used_indices.begin(), used_indices.end(),
+              [&](uint32_t a, uint32_t b) {
+                const auto& view_a = pool_items.at(a);
+                const auto& view_b = pool_items.at(b);
+                return strzcmp16(view_a.data(), view_a.size(), view_b.data(),
+                                 view_b.size()) < 0;
+              });
+  }
+  for (const auto& i : used_indices) {
+    auto new_index = kept_old_to_new->size();
+    TRACE(RES, 9, "MAPPING %u => %zu", i, new_index);
+    kept_old_to_new->emplace(i, new_index);
   }
 }
 
@@ -1537,7 +1847,7 @@ void rebuild_type_strings(
                     "type strings should not have styles");
   const auto original_string_count = string_pool.size();
   for (size_t idx = 0; idx < original_string_count; idx++) {
-    add_existing_string_to_builder(string_pool, builder, idx);
+    builder->add_string(string_pool, idx);
   }
   for (auto& type_def : added_types) {
     if (type_def.package_id != package_id) {
@@ -1548,17 +1858,13 @@ void rebuild_type_strings(
 }
 } // namespace
 
-void ResourcesArscFile::remove_unreferenced_strings() {
+void ResourcesArscFile::finalize_resource_table(const ResourceConfig& config) {
   // Find the global string pool and read its settings.
   GlobalStringPoolReader string_reader;
   string_reader.visit(m_f.data(), m_arsc_len);
   auto string_pool = string_reader.global_strings();
   TRACE(RES, 9, "Global string pool has %zu styles and %zu total strings",
         string_pool->styleCount(), string_pool->size());
-  auto is_utf8 = string_pool->isUTF8();
-  auto is_sorted = string_pool->isSorted();
-  auto flags = (is_utf8 ? android::ResStringPool_header::UTF8_FLAG : 0) |
-               (is_sorted ? android::ResStringPool_header::SORTED_FLAG : 0);
 
   // 1) Collect all referenced global string indicies and key string indicies.
   PackageStringRefCollector collector;
@@ -1573,8 +1879,7 @@ void ResourcesArscFile::remove_unreferenced_strings() {
 
   // 2) Build the compacted map of old -> new indicies for used global strings.
   std::unordered_map<uint32_t, uint32_t> global_old_to_new;
-  project_string_mapping(used_global_strings, string_pool->size(),
-                         &global_old_to_new);
+  project_string_mapping(used_global_strings, *string_pool, &global_old_to_new);
 
   // 3) Remap all Res_value structs
   auto remap_value = [&global_old_to_new](android::Res_value* value) {
@@ -1604,7 +1909,7 @@ void ResourcesArscFile::remove_unreferenced_strings() {
     }
   };
   std::shared_ptr<arsc::ResStringPoolBuilder> global_strings_builder =
-      std::make_shared<arsc::ResStringPoolBuilder>(flags);
+      std::make_shared<arsc::ResStringPoolBuilder>(POOL_FLAGS(string_pool));
   rebuild_string_pool(*string_pool, global_old_to_new, remap_spans,
                       global_strings_builder.get());
 
@@ -1614,10 +1919,6 @@ void ResourcesArscFile::remove_unreferenced_strings() {
   table_builder.set_global_strings(global_strings_builder);
   for (auto& package_entries : collector.m_package_entries) {
     // 5) Do a similar remapping as above, but for key strings.
-    //
-    //    TODO: also do a similar step for type strings pool, and any empty type
-    //    chunks that had all their entries deleted.
-    //
     auto& package = package_entries.first;
     std::shared_ptr<arsc::ResPackageBuilder> package_builder =
         std::make_shared<arsc::ResPackageBuilder>(package);
@@ -1634,8 +1935,18 @@ void ResourcesArscFile::remove_unreferenced_strings() {
       used_key_strings.emplace(dtohl(ref->index));
     }
     std::unordered_map<uint32_t, uint32_t> key_old_to_new;
-    project_string_mapping(used_key_strings, key_string_pool->size(),
-                           &key_old_to_new);
+    project_string_mapping(used_key_strings, *key_string_pool, &key_old_to_new,
+                           config.sort_key_strings);
+
+    auto& type_strings_header =
+        collector.m_package_type_string_headers.at(package);
+    android::ResStringPool type_strings;
+    always_assert_log(type_strings.setTo(type_strings_header,
+                                         CHUNK_SIZE(type_strings_header),
+                                         true) == android::NO_ERROR,
+                      "Failed to parse type strings!");
+    std::vector<std::string> kept_type_names(type_strings.size());
+    int last_kept_type_name = 0;
 
     // Remap the entries.
     for (auto& ref : refs) {
@@ -1645,25 +1956,53 @@ void ResourcesArscFile::remove_unreferenced_strings() {
     }
 
     // Actually build the key strings pool.
+    auto key_flags = POOL_FLAGS(key_string_pool);
+    if (config.sort_key_strings) {
+      key_flags |= android::ResStringPool_header::SORTED_FLAG;
+    }
     std::shared_ptr<arsc::ResStringPoolBuilder> key_strings_builder =
-        std::make_shared<arsc::ResStringPoolBuilder>(
-            POOL_FLAGS(key_string_pool));
-    rebuild_string_pool(
-        *key_string_pool, key_old_to_new, [](android::ResStringPool_span*) {},
-        key_strings_builder.get());
+        std::make_shared<arsc::ResStringPoolBuilder>(key_flags);
+    rebuild_string_pool(*key_string_pool, key_old_to_new,
+                        key_strings_builder.get());
     package_builder->set_key_strings(key_strings_builder);
-    package_builder->set_type_strings(
-        collector.m_package_type_string_headers.at(package));
-
     // Copy over all existing type data, which has been remapped by the step
     // above.
     auto search = collector.m_package_types.find(package);
     if (search != collector.m_package_types.end()) {
       auto types = search->second;
       for (auto& info : types) {
-        package_builder->add_type(info);
+        std::string type_name;
+        auto type_string_idx = info.spec->id - 1;
+        if (arsc::is_valid_string_idx(type_strings, type_string_idx)) {
+          type_name = arsc::get_string_from_pool(type_strings, type_string_idx);
+        }
+        if (!type_name.empty() &&
+            config.canonical_entry_types.count(type_name) > 0) {
+          TRACE(RES, 9, "Canonical entries enabled for ID 0x%x (%s)",
+                info.spec->id, type_name.c_str());
+          auto type_builder = std::make_shared<arsc::ResTableTypeProjector>(
+              package->id, info.spec, info.configs, true);
+          package_builder->add_type(type_builder);
+        } else {
+          package_builder->add_type(info);
+        }
+        if (dtohl(info.spec->entryCount) > 0) {
+          kept_type_names.at(type_string_idx) = type_name;
+          if (type_string_idx > last_kept_type_name) {
+            last_kept_type_name = type_string_idx;
+          }
+        }
       }
     }
+
+    // Copy all type names that were not fully deleted (or empty strings if they
+    // were).
+    std::shared_ptr<arsc::ResStringPoolBuilder> type_strings_builder =
+        std::make_shared<arsc::ResStringPoolBuilder>(POOL_FLAGS(&type_strings));
+    for (int i = 0; i <= last_kept_type_name; i++) {
+      type_strings_builder->add_string(kept_type_names.at(i));
+    }
+    package_builder->set_type_strings(type_strings_builder);
 
     // Finally, preserve any chunks that we are not parsing.
     auto& unknown_chunks = collector.m_package_unknown_chunks.at(package);
@@ -1710,7 +2049,7 @@ void rebuild_string_pool_with_addition(
   const auto original_string_count = string_pool.size();
   // Add all existing strings in original string pool to builder.
   for (size_t idx = 0; idx < original_string_count; idx++) {
-    add_existing_string_to_builder(string_pool, builder, idx);
+    builder->add_string(string_pool, idx);
   }
   // Add additional strings to builder.
   for (size_t idx = 0; idx < id_to_new_strings.size(); idx++) {
@@ -1725,7 +2064,8 @@ size_t ResourcesArscFile::obfuscate_resource_and_serialize(
     const std::vector<std::string>& /* unused */,
     const std::map<std::string, std::string>& filepath_old_to_new,
     const std::unordered_set<uint32_t>& allowed_types,
-    const std::unordered_set<std::string>& keep_resource_prefixes) {
+    const std::unordered_set<std::string>& keep_resource_prefixes,
+    const std::unordered_set<std::string>& keep_resource_specific) {
   arsc::ResTableBuilder table_builder;
 
   // Find the global string pool and read its settings.
@@ -1821,14 +2161,14 @@ size_t ResourcesArscFile::obfuscate_resource_and_serialize(
       for (auto& ref : refs) {
         auto old = dtohl(ref->index);
         std::string old_string =
-            apk::get_string_from_pool(*key_string_pool, old);
-        if (std::find_if(keep_resource_prefixes.begin(),
+            arsc::get_string_from_pool(*key_string_pool, old);
+        if (keep_resource_specific.count(old_string) > 0 ||
+            std::find_if(keep_resource_prefixes.begin(),
                          keep_resource_prefixes.end(),
                          [&](const std::string& v) {
                            return old_string.find(v) == 0;
                          }) != keep_resource_prefixes.end()) {
-          // Resource name matches one of the block prefix - Don't change the
-          // name
+          // Resource name matches block criteria; don't change the name.
           continue;
         }
         TRACE(RES, 9, "REMAP OLD KEY %u", old);
@@ -2056,8 +2396,9 @@ size_t ResourcesArscFile::serialize() {
         table_parser.m_package_type_string_headers.at(package);
     android::ResStringPool type_strings(
         type_strings_header, dtohl(type_strings_header->header.size));
-    auto type_strings_builder =
-        std::make_shared<arsc::ResStringPoolBuilder>(POOL_FLAGS(&type_strings));
+    auto type_strings_builder = std::make_shared<arsc::ResStringPoolBuilder>(
+        m_added_types.empty() ? POOL_FLAGS(&type_strings)
+                              : POOL_FLAGS_CLEAR_SORT(&type_strings));
     rebuild_type_strings(package_id, type_strings, m_added_types,
                          type_strings_builder.get());
     package_builder->set_type_strings(type_strings_builder);

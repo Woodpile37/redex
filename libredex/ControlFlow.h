@@ -7,18 +7,20 @@
 
 #pragma once
 
-#include <boost/dynamic_bitset.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/range/sub_range.hpp>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <boost/dynamic_bitset.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/range/sub_range.hpp>
+
+#include <sparta/WeakTopologicalOrdering.h>
+
 #include "DexPosition.h"
 #include "IRCode.h"
 #include "SingletonIterable.h"
-#include "WeakTopologicalOrdering.h"
 
 /**
  * A Control Flow Graph is a directed graph of Basic Blocks.
@@ -276,6 +278,12 @@ class Block final {
   IRList::const_iterator end() const;
   IRList::reverse_iterator rbegin() { return IRList::reverse_iterator(end()); }
   IRList::reverse_iterator rend() { return IRList::reverse_iterator(begin()); }
+  IRList::const_reverse_iterator rbegin() const {
+    return IRList::const_reverse_iterator(end());
+  }
+  IRList::const_reverse_iterator rend() const {
+    return IRList::const_reverse_iterator(begin());
+  }
 
   bool is_catch() const;
 
@@ -294,7 +302,7 @@ class Block final {
   void remove_insn(const IRList::iterator& it);
 
   // Any removed instruction will be freed when the cfg is destroyed.
-  void remove_mie(const IRList::iterator& it);
+  IRList::iterator remove_mie(const IRList::iterator& it);
 
   // Removes a subset of MFLOW_DEBUG instructions from the block. valid_regs
   // is an accumulator set of registers used by either DBG_START_LOCAL
@@ -308,7 +316,7 @@ class Block final {
   // acknowledged by the descendant block.
   void cleanup_debug(std::unordered_set<reg_t>& valid_regs);
 
-  opcode::Branchingness branchingness();
+  opcode::Branchingness branchingness() const;
 
   // returns true if there are no MethodItemEntries (not IRInstructions)
   bool empty() const { return m_entries.empty(); }
@@ -317,30 +325,38 @@ class Block final {
 
   uint32_t sum_opcode_sizes() const;
 
+  // similar to sum_opcode_sizes, but takes into account non-opcode payloads
+  uint32_t estimate_code_units() const;
+
   // return an iterator to the last MFLOW_OPCODE, or end() if there are none
   IRList::iterator get_last_insn();
+  IRList::const_iterator get_last_insn() const;
   // return an iterator to the first MFLOW_OPCODE, or end() if there are none
   IRList::iterator get_first_insn();
+  IRList::const_iterator get_first_insn() const;
   // return an iterator to the first non-param-loading MFLOW_OPCODE, or end() if
   // there are none.
   IRList::iterator get_first_non_param_loading_insn();
+  IRList::const_iterator get_first_non_param_loading_insn() const;
   // return an iterator to the last param-loading MFLOW_OPCODE, or end() if
   // there are none.
   IRList::iterator get_last_param_loading_insn();
+  IRList::const_iterator get_last_param_loading_insn() const;
   // return an iterator to the first instruction (except move-result* and goto)
   // if it occurs before the first position, or end() if there are none.
   IRList::iterator get_first_insn_before_position();
+  IRList::const_iterator get_first_insn_before_position() const;
 
   // including move-result-pseudo
-  bool starts_with_move_result();
+  bool starts_with_move_result() const;
 
-  bool starts_with_move_exception();
+  bool starts_with_move_exception() const;
 
-  bool contains_opcode(IROpcode opcode);
+  bool contains_opcode(IROpcode opcode) const;
 
   // returns true iff the block starts with the same MethodItemEntries as the
   // other block.
-  bool begins_with(Block* other);
+  bool begins_with(Block* other) const;
 
   // If this block has a single outgoing edge and it is a goto, return its
   // target. Otherwise, return nullptr
@@ -905,6 +921,13 @@ class ControlFlowGraph {
 
   uint32_t sum_opcode_sizes() const;
 
+  // similar to sum_opcode_sizes, but takes into account non-opcode payloads
+  uint32_t estimate_code_units() const;
+
+  // The editable cfg is missing plain OPCODE_GOTOs; this function computes a
+  // size adjustment to account for that.
+  uint32_t get_size_adjustment(bool assume_no_unreachable_blocks = false);
+
   reg_t allocate_temp() { return m_registers_size++; }
 
   reg_t allocate_wide_temp() {
@@ -971,7 +994,7 @@ class ControlFlowGraph {
    * Set whether this cfg holds the memory ownership of instructions that are
    * removed. (The default is true.)
    */
-  void set_removed_insn_ownerhsip(bool owns_removed_insns) {
+  void set_removed_insn_ownership(bool owns_removed_insns) {
     m_owns_removed_insns = owns_removed_insns;
   }
 
@@ -981,9 +1004,12 @@ class ControlFlowGraph {
   ConstInstructionIterator find_insn(IRInstruction* insn,
                                      Block* hint = nullptr) const;
 
-  // choose an order of blocks for output
+  // choose an order of blocks for output; note that unless
+  // assume_no_unreachable_blocks is set to true, this function may mutate the
+  // cfg by simplifying it
   std::vector<Block*> order(
-      const std::unique_ptr<LinearizationStrategy>& custom_strategy = nullptr);
+      const std::unique_ptr<LinearizationStrategy>& custom_strategy = nullptr,
+      bool assume_no_unreachable_blocks = false);
 
   /*
    * Find the first debug position preceding an instruction
@@ -1274,10 +1300,11 @@ class GraphInterface {
   static NodeId exit(const Graph& graph) {
     return const_cast<NodeId>(graph.exit_block());
   }
-  static std::vector<EdgeId> predecessors(const Graph&, const NodeId& b) {
+  static const std::vector<EdgeId>& predecessors(const Graph&,
+                                                 const NodeId& b) {
     return b->preds();
   }
-  static std::vector<EdgeId> successors(const Graph&, const NodeId& b) {
+  static const std::vector<EdgeId>& successors(const Graph&, const NodeId& b) {
     return b->succs();
   }
   static NodeId source(const Graph&, const EdgeId& e) { return e->src(); }
@@ -1365,8 +1392,13 @@ class InstructionIteratorImpl {
   InstructionIteratorImpl(const InstructionIteratorImpl<false>& rhs)
       : m_cfg(rhs.m_cfg), m_block(rhs.m_block), m_it(rhs.m_it) {}
 
-  InstructionIteratorImpl& operator=(const InstructionIteratorImpl& other) =
-      default;
+  InstructionIteratorImpl& operator=(
+      const InstructionIteratorImpl<false>& rhs) {
+    m_cfg = rhs.m_cfg;
+    m_block = rhs.m_block;
+    m_it = rhs.m_it;
+    return *this;
+  }
 
   InstructionIteratorImpl<is_const>& operator++() {
     assert_not_end();

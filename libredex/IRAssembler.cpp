@@ -95,6 +95,9 @@ s_expr to_s_expr(const IRInstruction* insn, const LabelRefs& label_refs) {
   case opcode::Ref::MethodHandle:
     s_exprs.emplace_back(show(insn->get_methodhandle()));
     break;
+  case opcode::Ref::Proto:
+    s_exprs.emplace_back(show(insn->get_proto()));
+    break;
   }
 
   if (opcode::is_branch(op)) {
@@ -240,7 +243,7 @@ std::unique_ptr<IRInstruction> instruction_from_s_expr(
     std::string type_str;
     s_patn({s_patn(&type_str)}, tail)
         .must_match(tail, "Expecting type specifier for " + opcode_str);
-    DexType* ty = DexType::make_type(type_str.c_str());
+    DexType* ty = DexType::make_type(type_str);
     insn->set_type(ty);
     break;
   }
@@ -250,6 +253,10 @@ std::unique_ptr<IRInstruction> instruction_from_s_expr(
   }
   case opcode::Ref::MethodHandle: {
     not_reached_log("methodhandles currently unsupported in s-exprs");
+    break;
+  }
+  case opcode::Ref::Proto: {
+    not_reached_log("proto currently unsupported in s-exprs");
     break;
   }
   }
@@ -322,14 +329,14 @@ std::unique_ptr<DexDebugInstruction> debug_info_from_s_expr(const s_expr& e) {
     check_arg_num(tail, 3);
     uint32_t register_num = integer_from_s_expr<uint32_t>(tail[0]);
     auto name_idx = DexString::make_string(string_from_s_expr(tail[1]));
-    DexType* type_idx = DexType::make_type(string_from_s_expr(tail[2]).c_str());
+    DexType* type_idx = DexType::make_type(string_from_s_expr(tail[2]));
     return std::make_unique<DexDebugOpcodeStartLocal>(register_num, name_idx,
                                                       type_idx);
   } else if (opcode == "DBG_START_LOCAL_EXTENDED") {
     check_arg_num(tail, 4);
     uint32_t register_num = integer_from_s_expr<uint32_t>(tail[0]);
     auto name_idx = DexString::make_string(string_from_s_expr(tail[1]));
-    DexType* type_idx = DexType::make_type(string_from_s_expr(tail[2]).c_str());
+    DexType* type_idx = DexType::make_type(string_from_s_expr(tail[2]));
     auto sig_idx = DexString::make_string(string_from_s_expr(tail[3]));
     return std::make_unique<DexDebugOpcodeStartLocal>(register_num, name_idx,
                                                       type_idx, sig_idx);
@@ -383,8 +390,8 @@ std::unique_ptr<DexPosition> position_from_s_expr(
   uint32_t line;
   std::istringstream in(line_str);
   in >> line;
-  auto pos = std::make_unique<DexPosition>(line);
-  pos->bind(DexString::make_string(method_str), file);
+  auto pos = std::make_unique<DexPosition>(file, line);
+  pos->bind(DexString::make_string(method_str));
   if (!parent_expr.is_nil()) {
     std::string parent_str;
     s_patn({

@@ -42,7 +42,7 @@ ConstantValue::ConstantValue(const TypeTags* type_tags,
     m_kind = ConstantKind::INT;
     m_int_val = std::stoll(val_str);
   } else if (kind_str == "T") {
-    auto type_val = DexType::get_type(val_str.c_str());
+    auto type_val = DexType::get_type(val_str);
     if (type_val != nullptr && type_tags->has_type_tag(type_val)) {
       m_kind = ConstantKind::TYPE;
       m_int_val = type_tags->get_type_tag(type_val);
@@ -132,7 +132,7 @@ ConstantValues::ConstantValues(const TypeTags* type_tags,
   if (kinds_str.size() > MAX_NUM_CONST_VALUE) {
     TRACE(METH_DEDUP,
           8,
-          "const value: skip large number of const values %ld",
+          "const value: skip large number of const values %zu",
           kinds_str.size());
     return;
   }
@@ -224,7 +224,7 @@ DexMethod* ConstantValues::create_stub_method(DexMethod* callee) {
   // Assuming that callee's proto is already modified by appending the lifted
   // params.
   auto appended_proto = callee->get_proto();
-  auto stub_arg_list = appended_proto->get_args()->pop_front(size());
+  auto stub_arg_list = appended_proto->get_args()->pop_back(size());
   auto stub_proto =
       DexProto::make_proto(appended_proto->get_rtype(), stub_arg_list);
   auto name = DexString::make_string(callee->get_name()->str() + "$stub");

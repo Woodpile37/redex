@@ -7,12 +7,11 @@
 
 #pragma once
 
-#include <boost/functional/hash.hpp>
+#include <sparta/FiniteAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/ReducedProductAbstractDomain.h>
 
 #include "DexClass.h"
-#include "FiniteAbstractDomain.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "ReducedProductAbstractDomain.h"
 
 /*
  * ObjectDomain is an abstract environment coupled with logic that tracks
@@ -33,8 +32,7 @@ enum class EscapeState {
 namespace escape_domain_impl {
 
 using Lattice = sparta::BitVectorLattice<EscapeState,
-                                         /* cardinality */ 4,
-                                         boost::hash<EscapeState>>;
+                                         /* kCardinality */ 4>;
 
 extern Lattice lattice;
 

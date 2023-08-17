@@ -14,6 +14,7 @@
 
 #include "Configurable.h"
 #include "DexStore.h"
+#include "RedexProperties.h"
 #include "Traits.h"
 
 class AnalysisUsage;
@@ -35,13 +36,18 @@ class Pass : public Configurable {
 
   bool is_analysis_pass() const { return m_kind == ANALYSIS; }
 
-  // \returns True means this pass is fully updated to use editable cfg.
-  virtual bool is_editable_cfg_friendly() { return false; }
+  // \returns True means this pass is NOT guaranteed to fully use editable cfg.
+  virtual bool is_cfg_legacy() { return false; }
 
   virtual void destroy_analysis_result() {
     always_assert_log(m_kind != ANALYSIS,
                       "destroy_analysis_result not implemented for %s",
                       m_name.c_str());
+  }
+
+  virtual redex_properties::PropertyInteractions get_property_interactions()
+      const {
+    return {};
   }
 
   /**

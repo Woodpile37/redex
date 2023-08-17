@@ -139,7 +139,7 @@ class FinalInlineImpl {
     }
     TRACE(FINALINLINE,
           1,
-          "Removable fields %lu/%lu",
+          "Removable fields %zu/%zu",
           dead_fields.size(),
           moveable_fields.size());
 
@@ -373,7 +373,7 @@ class FinalInlineImpl {
     // Attach encoded values and remove the clinit
     TRACE(FINALINLINE,
           8,
-          "Replacing <clinit> %s: %lu pairs...",
+          "Replacing <clinit> %s: %zu pairs...",
           SHOW(clinit),
           const_sputs.size());
     for (auto& pair : const_sputs) {
@@ -427,7 +427,7 @@ class FinalInlineImpl {
     }
     TRACE(FINALINLINE,
           1,
-          "Replaced %lu/%lu clinits with encoded values",
+          "Replaced %zu/%zu clinits with encoded values",
           nreplaced,
           ntotal);
     return nreplaced;
@@ -527,7 +527,7 @@ class FinalInlineImpl {
       }
     }
     TRACE(
-        FINALINLINE, 1, "Resolved %lu static finals via const prop", nresolved);
+        FINALINLINE, 1, "Resolved %zu static finals via const prop", nresolved);
     return nresolved;
   }
 
@@ -545,7 +545,7 @@ class FinalInlineImpl {
       find_dependencies(clazz, clinit, result);
     }
     return result;
-  };
+  }
 
   void find_dependencies(
       const DexClass* clazz,
@@ -636,13 +636,6 @@ size_t FinalInlinePass::propagate_constants_for_test(Scope& scope,
 void FinalInlinePass::run_pass(DexStoresVector& stores,
                                ConfigFiles& conf,
                                PassManager& mgr) {
-  if (mgr.no_proguard_rules()) {
-    TRACE(FINALINLINE,
-          1,
-          "FinalInlinePass not run because no ProGuard configuration was "
-          "provided.");
-    return;
-  }
   auto scope = build_class_scope(stores);
 
   FinalInlineImpl impl(scope, m_config);

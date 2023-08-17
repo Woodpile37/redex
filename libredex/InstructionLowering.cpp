@@ -7,15 +7,25 @@
 
 #include "InstructionLowering.h"
 
+#include "ConfigFiles.h"
 #include "Debug.h"
 #include "DexInstruction.h"
 #include "DexOpcodeDefs.h"
 #include "DexStore.h"
 #include "IRInstruction.h"
+#include "MethodProfiles.h"
 #include "Show.h"
 #include "Walkers.h"
+#include <array>
+#include <optional>
 
 namespace instruction_lowering {
+
+namespace {
+
+constexpr double kSparseSwitchHotMethodAppearThreshold = 0.0;
+
+} // namespace
 
 /*
  * Returns whether the given value can fit in an integer of :width bits.
@@ -114,64 +124,48 @@ DexOpcode select_binop_lit_opcode(const IRInstruction* insn) {
   auto literal = insn->get_literal();
   if (signed_int_fits<8>(literal)) { // lit8 -> literal is 8 bits
     switch (op) {
-    case OPCODE_ADD_INT_LIT8:
-    case OPCODE_ADD_INT_LIT16:
+    case OPCODE_ADD_INT_LIT:
       return DOPCODE_ADD_INT_LIT8;
-    case OPCODE_RSUB_INT_LIT8:
-    case OPCODE_RSUB_INT:
+    case OPCODE_RSUB_INT_LIT:
       return DOPCODE_RSUB_INT_LIT8;
-    case OPCODE_MUL_INT_LIT8:
-    case OPCODE_MUL_INT_LIT16:
+    case OPCODE_MUL_INT_LIT:
       return DOPCODE_MUL_INT_LIT8;
-    case OPCODE_DIV_INT_LIT8:
-    case OPCODE_DIV_INT_LIT16:
+    case OPCODE_DIV_INT_LIT:
       return DOPCODE_DIV_INT_LIT8;
-    case OPCODE_REM_INT_LIT8:
-    case OPCODE_REM_INT_LIT16:
+    case OPCODE_REM_INT_LIT:
       return DOPCODE_REM_INT_LIT8;
-    case OPCODE_AND_INT_LIT8:
-    case OPCODE_AND_INT_LIT16:
+    case OPCODE_AND_INT_LIT:
       return DOPCODE_AND_INT_LIT8;
-    case OPCODE_OR_INT_LIT8:
-    case OPCODE_OR_INT_LIT16:
+    case OPCODE_OR_INT_LIT:
       return DOPCODE_OR_INT_LIT8;
-    case OPCODE_XOR_INT_LIT8:
-    case OPCODE_XOR_INT_LIT16:
+    case OPCODE_XOR_INT_LIT:
       return DOPCODE_XOR_INT_LIT8;
-    case OPCODE_SHL_INT_LIT8:
+    case OPCODE_SHL_INT_LIT:
       return DOPCODE_SHL_INT_LIT8;
-    case OPCODE_SHR_INT_LIT8:
+    case OPCODE_SHR_INT_LIT:
       return DOPCODE_SHR_INT_LIT8;
-    case OPCODE_USHR_INT_LIT8:
+    case OPCODE_USHR_INT_LIT:
       return DOPCODE_USHR_INT_LIT8;
     default:
       not_reached();
     }
   } else if (signed_int_fits<16>(literal)) { // lit16 -> literal is 16 bits
     switch (op) {
-    case OPCODE_ADD_INT_LIT8:
-    case OPCODE_ADD_INT_LIT16:
+    case OPCODE_ADD_INT_LIT:
       return DOPCODE_ADD_INT_LIT16;
-    case OPCODE_RSUB_INT_LIT8:
-    case OPCODE_RSUB_INT:
+    case OPCODE_RSUB_INT_LIT:
       return DOPCODE_RSUB_INT;
-    case OPCODE_MUL_INT_LIT8:
-    case OPCODE_MUL_INT_LIT16:
+    case OPCODE_MUL_INT_LIT:
       return DOPCODE_MUL_INT_LIT16;
-    case OPCODE_DIV_INT_LIT8:
-    case OPCODE_DIV_INT_LIT16:
+    case OPCODE_DIV_INT_LIT:
       return DOPCODE_DIV_INT_LIT16;
-    case OPCODE_REM_INT_LIT8:
-    case OPCODE_REM_INT_LIT16:
+    case OPCODE_REM_INT_LIT:
       return DOPCODE_REM_INT_LIT16;
-    case OPCODE_AND_INT_LIT8:
-    case OPCODE_AND_INT_LIT16:
+    case OPCODE_AND_INT_LIT:
       return DOPCODE_AND_INT_LIT16;
-    case OPCODE_OR_INT_LIT8:
-    case OPCODE_OR_INT_LIT16:
+    case OPCODE_OR_INT_LIT:
       return DOPCODE_OR_INT_LIT16;
-    case OPCODE_XOR_INT_LIT8:
-    case OPCODE_XOR_INT_LIT16:
+    case OPCODE_XOR_INT_LIT:
       return DOPCODE_XOR_INT_LIT16;
     default:
       not_reached();
@@ -235,7 +229,7 @@ void check_load_params(DexMethod* method) {
   if (!is_static(method)) {
     auto op = it->insn->opcode();
     always_assert(op == IOPCODE_LOAD_PARAM_OBJECT);
-    it.reset(code->erase(it.unwrap()));
+    it.reset(code->erase_and_dispose(it.unwrap()));
     ++next_ins;
   }
   auto args_it = args_list->begin();
@@ -282,6 +276,11 @@ DexInstruction* create_dex_instruction(const IRInstruction* insn) {
   if (insn->opcode() == IOPCODE_INIT_CLASS) {
     return new DexInstruction(DOPCODE_NOP);
   }
+  // TODO: Assert that this never happens. IOPCODE_INJECTION_ID should never
+  // make it here.
+  if (insn->opcode() == IOPCODE_INJECTION_ID) {
+    return new DexInstruction(DOPCODE_CONST);
+  }
 
   auto op = opcode::to_dex_opcode(insn->opcode());
   switch (opcode::ref(insn->opcode())) {
@@ -302,6 +301,8 @@ DexInstruction* create_dex_instruction(const IRInstruction* insn) {
     return new DexOpcodeCallSite(op, insn->get_callsite());
   case opcode::Ref::MethodHandle:
     return new DexOpcodeMethodHandle(op, insn->get_methodhandle());
+  case opcode::Ref::Proto:
+    return new DexOpcodeProto(op, insn->get_proto());
   }
 }
 
@@ -355,7 +356,7 @@ void lower_fill_array_data(DexMethod*, IRCode* code, IRList::iterator* it_) {
   dex_insn->set_src(0, insn->src(0));
   auto* bt = new BranchTarget(&*it);
   code->push_back(bt);
-  code->push_back(insn->get_data());
+  code->push_back(insn->get_data()->clone());
   it->replace_ir_with_dex(dex_insn);
 }
 
@@ -404,7 +405,7 @@ void lower_simple_instruction(DexMethod*, IRCode*, IRList::iterator* it_) {
     dex_insn = new DexInstruction(select_move_opcode(insn));
   } else if (op >= OPCODE_CONST && op <= OPCODE_CONST_WIDE) {
     dex_insn = new DexInstruction(select_const_opcode(insn));
-  } else if (op >= OPCODE_ADD_INT_LIT16 && op <= OPCODE_USHR_INT_LIT8) {
+  } else if (op >= OPCODE_ADD_INT_LIT && op <= OPCODE_USHR_INT_LIT) {
     dex_insn = new DexInstruction(select_binop_lit_opcode(insn));
   } else {
     dex_insn = create_dex_instruction(insn);
@@ -433,7 +434,7 @@ void lower_simple_instruction(DexMethod*, IRCode*, IRList::iterator* it_) {
 
 } // namespace
 
-Stats lower(DexMethod* method, bool lower_with_cfg) {
+Stats lower(DexMethod* method, bool lower_with_cfg, ConfigFiles* conf) {
   Stats stats;
   auto* code = method->get_code();
   always_assert(code != nullptr);
@@ -470,6 +471,8 @@ Stats lower(DexMethod* method, bool lower_with_cfg) {
     code_begin = code->begin();
   }
 
+  std::optional<bool> method_is_hot = std::nullopt;
+
   for (auto it = code_begin; it != code->end(); ++it) {
     if (it->type != MFLOW_OPCODE) {
       // Remove any source blocks. They are no longer necessary and slow down
@@ -503,9 +506,32 @@ Stats lower(DexMethod* method, bool lower_with_cfg) {
     // its cases are laid out.
     if (op == OPCODE_SWITCH) {
       const auto& keys = case_keys.at(&*it);
-      DexOpcode dop = sufficiently_sparse(keys) ? DOPCODE_SPARSE_SWITCH
-                                                : DOPCODE_PACKED_SWITCH;
+      DexOpcode dop = CaseKeysExtent::from_ordered(keys).sufficiently_sparse()
+                          ? DOPCODE_SPARSE_SWITCH
+                          : DOPCODE_PACKED_SWITCH;
       it->dex_insn->set_opcode(dop);
+      if (dop == DexOpcode::DOPCODE_SPARSE_SWITCH) {
+        if (!method_is_hot) {
+          if (conf != nullptr) {
+            method_is_hot = [&]() {
+              for (auto& p : conf->get_method_profiles().all_interactions()) {
+                auto it = p.second.find(method);
+                if (it != p.second.end() &&
+                    it->second.appear_percent >
+                        kSparseSwitchHotMethodAppearThreshold) {
+                  return true;
+                }
+              }
+              return false;
+            }();
+          } else {
+            method_is_hot = false;
+          }
+        }
+
+        Stats::SparseSwitches::Data data(1, (*method_is_hot) ? 1 : 0);
+        stats.sparse_switches.data[keys.size()] += data;
+      }
     }
   }
   for (auto it = code->begin(); it != code->end(); ++it) {
@@ -518,33 +544,72 @@ Stats lower(DexMethod* method, bool lower_with_cfg) {
   return stats;
 }
 
-Stats run(DexStoresVector& stores, bool lower_with_cfg) {
+Stats run(DexStoresVector& stores, bool lower_with_cfg, ConfigFiles* conf) {
   auto scope = build_class_scope(stores);
-  return walk::parallel::methods<Stats>(scope, [lower_with_cfg](DexMethod* m) {
-    Stats stats;
-    if (m->get_code() == nullptr) {
-      return stats;
-    }
-    return lower(m, lower_with_cfg);
-  });
+  return walk::parallel::methods<Stats>(scope,
+                                        [lower_with_cfg, conf](DexMethod* m) {
+                                          Stats stats;
+                                          if (m->get_code() == nullptr) {
+                                            return stats;
+                                          }
+                                          return lower(m, lower_with_cfg, conf);
+                                        });
+}
+
+CaseKeysExtent CaseKeysExtent::from_ordered(
+    const std::vector<int32_t>& case_keys) {
+  always_assert(!case_keys.empty());
+  always_assert(case_keys.front() <= case_keys.back());
+  return CaseKeysExtent{case_keys.front(), case_keys.back(),
+                        (uint32_t)case_keys.size()};
 }
 
 // Computes number of entries needed for a packed switch, accounting for any
 // holes that might exist
-uint64_t get_packed_switch_size(const std::vector<int32_t>& case_keys) {
-  int32_t first_key = case_keys.front();
-  int32_t last_key = case_keys.back();
+uint64_t CaseKeysExtent::get_packed_switch_size() const {
   always_assert(first_key <= last_key);
+  always_assert(size > 0);
   return (uint64_t)((int64_t)last_key - first_key + 1);
 }
 
 // Whether a sparse switch statement will be more compact than a packed switch
-bool sufficiently_sparse(const std::vector<int32_t>& case_keys) {
-  uint64_t size = get_packed_switch_size(case_keys);
+bool CaseKeysExtent::sufficiently_sparse() const {
+  uint64_t packed_switch_size = get_packed_switch_size();
   // packed switches must have less than 2^16 entries, and
   // sparse switches pay off once there are more holes than entries
-  return size > std::numeric_limits<uint16_t>::max() ||
-         size / 2 > case_keys.size();
+  return packed_switch_size > std::numeric_limits<uint16_t>::max() ||
+         packed_switch_size / 2 > size;
+}
+
+uint32_t CaseKeysExtent::estimate_switch_payload_code_units() const {
+  if (sufficiently_sparse()) {
+    // sparse-switch-payload
+    return 2 + 4 * size;
+  } else {
+    // packed-switch-payload
+    const uint64_t packed_switch_size = get_packed_switch_size();
+    return 4 + packed_switch_size * 2;
+  }
+}
+
+void CaseKeysExtentBuilder::insert(int32_t case_key) {
+  if (!m_info) {
+    m_info = (CaseKeysExtent){case_key, case_key, 1};
+    return;
+  }
+  m_info->first_key = std::min(m_info->first_key, case_key);
+  m_info->last_key = std::max(m_info->last_key, case_key);
+  m_info->size++;
+}
+
+const CaseKeysExtent& CaseKeysExtentBuilder::operator*() const {
+  always_assert(m_info);
+  return *m_info;
+}
+
+const CaseKeysExtent* CaseKeysExtentBuilder::operator->() const {
+  always_assert(m_info);
+  return &*m_info;
 }
 
 } // namespace instruction_lowering

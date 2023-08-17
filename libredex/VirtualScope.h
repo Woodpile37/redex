@@ -7,13 +7,14 @@
 
 #pragma once
 
+#include <map>
+#include <unordered_map>
+#include <vector>
+
 #include "ClassHierarchy.h"
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "Timer.h"
-#include <map>
-#include <unordered_map>
-#include <vector>
 
 /*
  * NOTE: Before using this code, check and see if MethodOverrideGraph.h or
@@ -47,6 +48,8 @@
  *    and so we cannot tell anything about all methods in the branch where that
  *    happened. The method is effectively unknown
  */
+
+namespace virt_scope {
 
 /* clang-format off */
 enum VirtualFlags : uint16_t {
@@ -84,6 +87,26 @@ inline VirtualFlags operator|(const VirtualFlags a, const VirtualFlags b) {
 inline VirtualFlags operator&(const VirtualFlags a, const VirtualFlags b) {
   return static_cast<VirtualFlags>(static_cast<uint16_t>(a) &
                                    static_cast<uint16_t>(b));
+}
+
+inline bool is_top_def(VirtualFlags flags) {
+  return (flags & TOP_DEF) == TOP_DEF;
+}
+
+inline bool is_override(VirtualFlags flags) {
+  return (flags & OVERRIDE) == OVERRIDE;
+}
+
+inline bool is_impl(VirtualFlags flags) { return (flags & IMPL) == IMPL; }
+
+inline bool is_final(VirtualFlags flags) { return (flags & FINAL) == FINAL; }
+
+inline bool is_miranda(VirtualFlags flags) {
+  return (flags & MIRANDA) == MIRANDA;
+}
+
+inline bool is_escaped(VirtualFlags flags) {
+  return (flags & ESCAPED) == ESCAPED;
 }
 
 // (DexMethod, VirtualFlags)
@@ -402,7 +425,7 @@ class ClassScopes {
    * Given a DexMethod return the scope the method is in.
    */
   const VirtualScope& find_virtual_scope(const DexMethod* meth) const {
-    return ::find_virtual_scope(m_sig_map, meth);
+    return virt_scope::find_virtual_scope(m_sig_map, meth);
   }
 
   /**
@@ -448,3 +471,5 @@ struct virtualscopes_comparator {
     return compare_dexmethods(a->methods.at(0).first, b->methods.at(0).first);
   }
 };
+
+} // namespace virt_scope

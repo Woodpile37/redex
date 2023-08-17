@@ -157,7 +157,7 @@ std::vector<DexMethod*> ConstantLifting::lift_constants_from(
   }
   TRACE(METH_DEDUP,
         5,
-        "constant lifting applied to %ld among %ld",
+        "constant lifting applied to %zu among %zu",
         lifted.size(),
         methods.size());
   m_num_const_lifted_methods += lifted.size();
@@ -167,7 +167,7 @@ std::vector<DexMethod*> ConstantLifting::lift_constants_from(
   auto call_sites = method_reference::collect_call_refs(scope, lifted);
   for (const auto& callsite : call_sites) {
     auto meth = callsite.caller;
-    auto insn = callsite.mie->insn;
+    auto* insn = callsite.insn;
     const auto callee =
         resolve_method(insn->get_method(), opcode_to_search(insn));
     always_assert(callee != nullptr);

@@ -6,6 +6,10 @@
  */
 
 #include "VirtualScope.h"
+
+#include <map>
+#include <set>
+
 #include "Creators.h"
 #include "DexAccess.h"
 #include "DexUtil.h"
@@ -13,9 +17,6 @@
 #include "Show.h"
 #include "Timer.h"
 #include "Trace.h"
-
-#include <map>
-#include <set>
 
 namespace {
 
@@ -170,6 +171,8 @@ void create_object_class() {
   }
 }
 
+} // namespace
+
 // map from a proto to the set of interface implementing that sig
 using IntfProtoMap = std::map<const DexProto*, TypeSet, dexprotos_comparator>;
 
@@ -182,6 +185,7 @@ using BaseSigs = std::map<const DexString*,
                           std::set<const DexProto*, dexprotos_comparator>,
                           dexstrings_comparator>;
 
+namespace virt_scope {
 /**
  * Create a BaseSig which is the set of method definitions in a type.
  */
@@ -378,7 +382,7 @@ void merge(const BaseSigs& base_sigs,
           for (const auto& scope : scopes) {
             TRACE(VIRT,
                   4,
-                  "- copy %s (%s:%s): (%ld) %s",
+                  "- copy %s (%s:%s): (%zu) %s",
                   SHOW(scope.type),
                   SHOW(name),
                   SHOW(proto),
@@ -396,7 +400,7 @@ void merge(const BaseSigs& base_sigs,
       always_assert(!virt_scopes.empty());
       TRACE(VIRT,
             4,
-            "- found existing scopes for %s:%s (%ld) - first: %s, %ld, %ld",
+            "- found existing scopes for %s:%s (%zu) - first: %s, %zu, %zu",
             SHOW(name),
             SHOW(proto),
             virt_scopes.size(),
@@ -412,7 +416,7 @@ void merge(const BaseSigs& base_sigs,
         // with that of base which is now the top definition
         TRACE(VIRT,
               4,
-              "-- checking scope type %s(%ld)",
+              "-- checking scope type %s(%zu)",
               SHOW(scope.type),
               scope.methods.size());
         TRACE(VIRT,
@@ -425,7 +429,7 @@ void merge(const BaseSigs& base_sigs,
             !is_interface(type_class(scope.type))) {
           TRACE(VIRT,
                 4,
-                "-- merging with base scopes %s(%ld) : %s",
+                "-- merging with base scopes %s(%zu) : %s",
                 SHOW(virt_scopes[0].type),
                 virt_scopes[0].methods.size(),
                 SHOW(virt_scopes[0].methods[0].first));
@@ -754,7 +758,7 @@ void get_root_scopes(const SignatureMap& sig_map,
                      const DexType* type,
                      Scopes& cls_scopes) {
   const std::vector<DexMethod*>& methods = get_vmethods(type);
-  TRACE(VIRT, 9, "found %ld vmethods for %s", methods.size(), SHOW(type));
+  TRACE(VIRT, 9, "found %zu vmethods for %s", methods.size(), SHOW(type));
   for (const auto meth : methods) {
     const auto& protos = sig_map.find(meth->get_name());
     always_assert(protos != sig_map.end());
@@ -770,8 +774,6 @@ void get_root_scopes(const SignatureMap& sig_map,
   }
   get_rooted_interface_scope(sig_map, type, type_class(type), cls_scopes);
 }
-
-} // namespace
 
 SignatureMap build_signature_map(const ClassHierarchy& class_hierarchy) {
   SignatureMap signature_map;
@@ -919,3 +921,5 @@ InterfaceScope ClassScopes::find_interface_scope(const DexMethod* meth) const {
 }
 
 std::string ClassScopes::show_type(const DexType* type) { return show(type); }
+
+} // namespace virt_scope

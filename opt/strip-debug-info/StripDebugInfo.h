@@ -15,6 +15,18 @@ class StripDebugInfoPass : public Pass {
  public:
   StripDebugInfoPass() : Pass("StripDebugInfoPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+        {UltralightCodePatterns, Preserves},
+    };
+  }
+
   void bind_config() override {
     bind("drop_all_dbg_info", false, m_config.drop_all_dbg_info);
     bind("drop_local_variables", true, m_config.drop_local_variables);
@@ -29,6 +41,7 @@ class StripDebugInfoPass : public Pass {
     bind("drop_synth_conservative", false, m_config.drop_synth_conservative);
   }
 
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
   void set_drop_prologue_end(bool b) { m_config.drop_prologue_end = b; }

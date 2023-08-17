@@ -9,9 +9,10 @@
 
 #include <unordered_map>
 
+#include <sparta/MonotonicFixpointIterator.h>
+
 #include "DexClass.h"
 #include "IRCode.h"
-#include "MonotonicFixpointIterator.h"
 #include "Resolver.h"
 
 namespace method_override_graph {
@@ -96,7 +97,6 @@ class Node {
   explicit Node(NodeType type) : m_method(nullptr), m_type(type) {}
 
   const DexMethod* method() const { return m_method; }
-  bool operator==(const Node& that) const { return method() == that.method(); }
   const Edges& callers() const { return m_predecessors; }
   const Edges& callees() const { return m_successors; }
 
@@ -192,7 +192,6 @@ class SingleCalleeStrategy : public BuildStrategy {
 
   const Scope& m_scope;
   std::unordered_set<DexMethod*> m_non_virtual;
-  mutable MethodRefCache m_resolved_refs;
 };
 
 class MultipleCalleeBaseStrategy : public SingleCalleeStrategy {
@@ -210,7 +209,15 @@ class MultipleCalleeBaseStrategy : public SingleCalleeStrategy {
     return std::vector<const DexMethod*>();
   }
 
+  const std::vector<const DexMethod*>& get_ordered_overriding_methods_with_code(
+      const DexMethod* method) const;
+
   const method_override_graph::Graph& m_method_override_graph;
+
+ private:
+  mutable ConcurrentMap<const DexMethod*,
+                        std::shared_ptr<std::vector<const DexMethod*>>>
+      m_overriding_methods_cache;
 };
 
 class CompleteCallGraphStrategy : public MultipleCalleeBaseStrategy {
@@ -243,10 +250,10 @@ class GraphInterface {
 
   static NodeId entry(const Graph& graph) { return graph.entry(); }
   static NodeId exit(const Graph& graph) { return graph.exit(); }
-  static Edges predecessors(const Graph& graph, const NodeId& m) {
+  static const Edges& predecessors(const Graph& graph, const NodeId& m) {
     return m->callers();
   }
-  static Edges successors(const Graph& graph, const NodeId& m) {
+  static const Edges& successors(const Graph& graph, const NodeId& m) {
     return m->callees();
   }
   static NodeId source(const Graph& graph, const EdgeId& e) {
@@ -261,8 +268,8 @@ MethodSet resolve_callees_in_graph(const Graph& graph,
                                    const DexMethod* method,
                                    const IRInstruction* insn);
 
-MethodSet resolve_callees_in_graph(const Graph& graph,
-                                   const IRInstruction* insn);
+const MethodSet& resolve_callees_in_graph(const Graph& graph,
+                                          const IRInstruction* insn);
 
 bool method_is_dynamic(const Graph& graph, const DexMethod* method);
 

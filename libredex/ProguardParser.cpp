@@ -37,6 +37,7 @@ struct TokenIndex {
 
   void next() {
     redex_assert(it != vec.end());
+    redex_assert(type() != TokenType::eof_token);
     ++it;
     skip_comments();
   }
@@ -882,8 +883,7 @@ bool parse_keep(TokenIndex& idx,
 
 void parse(const std::vector<Token>& vec,
            ProguardConfiguration* pg_config,
-           size_t& parse_errors,
-           size_t& unimplemented,
+           Stats& stats,
            const std::string& filename) {
   bool ok;
   TokenIndex idx{vec, vec.begin()};
@@ -903,6 +903,7 @@ void parse(const std::vector<Token>& vec,
                 << idx.show_context(2) << std::endl;
       idx.next();
       skip_to_next_command(idx);
+      ++stats.unknown_commands;
       continue;
     }
 
@@ -964,7 +965,7 @@ void parse(const std::vector<Token>& vec,
                    line,
                    &ok)) {
       if (!ok) {
-        ++parse_errors;
+        ++stats.parse_errors;
       }
       continue;
     }
@@ -978,7 +979,7 @@ void parse(const std::vector<Token>& vec,
                    line,
                    &ok)) {
       if (!ok) {
-        ++parse_errors;
+        ++stats.parse_errors;
       }
       continue;
     }
@@ -992,7 +993,7 @@ void parse(const std::vector<Token>& vec,
                    line,
                    &ok)) {
       if (!ok) {
-        ++parse_errors;
+        ++stats.parse_errors;
       }
       continue;
     }
@@ -1006,7 +1007,7 @@ void parse(const std::vector<Token>& vec,
                    line,
                    &ok)) {
       if (!ok) {
-        ++parse_errors;
+        ++stats.parse_errors;
       }
       continue;
     }
@@ -1020,7 +1021,7 @@ void parse(const std::vector<Token>& vec,
                    line,
                    &ok)) {
       if (!ok) {
-        ++parse_errors;
+        ++stats.parse_errors;
       }
       continue;
     }
@@ -1034,7 +1035,7 @@ void parse(const std::vector<Token>& vec,
                    line,
                    &ok)) {
       if (!ok) {
-        ++parse_errors;
+        ++stats.parse_errors;
       }
       continue;
     }
@@ -1148,13 +1149,13 @@ void parse(const std::vector<Token>& vec,
         std::cerr << "Unimplemented command (skipping): " << idx.show()
                   << " at line " << idx.line() << std::endl
                   << idx.show_context(2) << std::endl;
-        ++unimplemented;
+        ++stats.unimplemented;
       }
     } else {
       std::cerr << "Unexpected TokenType " << idx.show() << " at line "
                 << idx.line() << std::endl
                 << idx.show_context(2) << std::endl;
-      ++parse_errors;
+      ++stats.parse_errors;
     }
     idx.next();
     skip_to_next_command(idx);
@@ -1185,7 +1186,7 @@ Stats parse(const std::string_view& config,
     return ret;
   }
 
-  parse(tokens, pg_config, ret.parse_errors, ret.unimplemented, filename);
+  parse(tokens, pg_config, ret, filename);
   if (ret.parse_errors == 0) {
     pg_config->ok = ok;
   } else {
@@ -1263,6 +1264,43 @@ size_t remove_blocklisted_rules(const std::string& rules,
     return false;
   });
   return removed;
+}
+
+size_t identify_blanket_native_rules(ProguardConfiguration* pg_config) {
+  // A "blanket native rule" is a rule which keeps all native methods and their
+  // parent classes.  We identify them and move them to a logically* separate
+  // list of keep rules so that we determine their effects on reachability in
+  // isolation.
+  // *Physically, we move their pointers to the end of the
+  // KeepSpecSet's ordered vector and store the iterator pointing at the
+  // beginning.
+  auto blanket_native_rules = R"(
+  -keep class * { native <methods>; }
+  -keepclassmembers class * { native <methods>; }
+  -keepclasseswithmembers class * { native <methods>; }
+  -keepclasseswithmembernames class * { native <methods>; }
+  -keep,includedescriptorclasses class ** { native <methods>; }
+  -keepclassmembers,includedescriptorclasses class ** { native <methods>; }
+  -keepclasseswithmembers,includedescriptorclasses class ** { native <methods>; }
+  -keepclasseswithmembernames,includedescriptorclasses class ** { native <methods>; }
+)";
+
+  ProguardConfiguration tmp_config;
+  parse(blanket_native_rules, &tmp_config, "<blanket native rules>");
+
+  // Partition the keep rules so that blanket native rules are at the end of
+  // the list. (Order is otherwise preserved.)
+  pg_config->keep_rules_native_begin =
+      pg_config->keep_rules.stable_partition([&tmp_config](const auto* ks_ptr) {
+        auto it = std::find_if(
+            tmp_config.keep_rules.begin(),
+            tmp_config.keep_rules.end(),
+            [ks_ptr](auto* ks2_ptr) { return *ks_ptr == *ks2_ptr; });
+        return it == tmp_config.keep_rules.end();
+      });
+
+  return static_cast<size_t>(std::distance(*pg_config->keep_rules_native_begin,
+                                           pg_config->keep_rules.end()));
 }
 
 } // namespace proguard_parser

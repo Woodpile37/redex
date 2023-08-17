@@ -7,12 +7,17 @@
 
 #pragma once
 
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "Pass.h"
 
 class DexMethod;
+
+namespace interdex {
+class InterDexPassPlugin;
+} // namespace interdex
 
 namespace instrument {
 
@@ -21,23 +26,39 @@ enum class ProfileTypeFlags {
   MethodCallCount = 1,
   MethodCallOrder = 2,
   BlockCoverage = 4,
+  BlockCount = 8,
   SimpleMethodTracing = 1 | 2,
   BasicBlockTracing = 1 | 2 | 4,
+  BasicBlockHitCount = 1 | 2 | 4 | 8,
 };
 
 class InstrumentPass : public Pass {
  public:
-  InstrumentPass() : Pass("InstrumentPass") {}
+  InstrumentPass();
+  ~InstrumentPass();
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Requires},
+        {RenameClass, Preserves},
+    };
+  }
 
   void bind_config() override;
   void eval_pass(DexStoresVector& stores,
                  ConfigFiles& conf,
                  PassManager& mgr) override;
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
   // Helper functions for both method and block instrumentations.
   //
   constexpr static const char* STATS_FIELD_NAME = "sMethodStats";
+  constexpr static const char* HIT_STATS_FIELD_NAME = "sHitStats";
 
   static void patch_array_size(DexClass* analysis_cls,
                                const std::string_view array_name,
@@ -79,10 +100,14 @@ class InstrumentPass : public Pass {
     bool instrument_catches;
     bool instrument_blocks_without_source_block;
     bool instrument_only_root_store;
+    bool inline_onBlockHit;
+    bool inline_onNonLoopBlockHit;
+    bool apply_CSE_CopyProp;
   };
 
  private:
   Options m_options;
+  std::unique_ptr<interdex::InterDexPassPlugin> m_plugin;
 };
 
 } // namespace instrument

@@ -33,7 +33,7 @@
 #include "RedexMappedFile.h"
 #include "RedexResources.h"
 #include "Trace.h"
-#include "androidfw/Locale.h"
+#include "androidfw/LocaleValue.h"
 #include "androidfw/ResourceTypes.h"
 
 namespace {
@@ -822,6 +822,44 @@ void apply_rename_map(const std::map<std::string, std::string>& rename_map,
     }
   }
 }
+
+void fully_qualify_element(
+    const std::unordered_map<std::string, std::string>& element_to_class_name,
+    aapt::pb::XmlNode* node,
+    size_t* out_num_changed) {
+  if (node->has_element()) {
+    auto element = node->mutable_element();
+    auto search = element_to_class_name.find(element->name());
+    if (search != element_to_class_name.end()) {
+      bool can_edit = true;
+      auto attr_size = element->attribute_size();
+      for (int i = 0; i < attr_size; i++) {
+        const auto& pb_attr = element->attribute(i);
+        if (pb_attr.name() == "class") {
+          // this would be ambiguous if there is already a class attribute; do
+          // not change this element but consider its children.
+          can_edit = false;
+          break;
+        }
+      }
+      if (can_edit) {
+        element->set_name("view");
+        auto mutable_attributes = element->mutable_attribute();
+        auto class_attribute = new aapt::pb::XmlAttribute();
+        class_attribute->set_name("class");
+        class_attribute->set_value(search->second);
+        mutable_attributes->AddAllocated(class_attribute);
+        (*out_num_changed)++;
+      }
+    }
+
+    auto child_size = element->child_size();
+    for (int i = 0; i < child_size; i++) {
+      auto child = element->mutable_child(i);
+      fully_qualify_element(element_to_class_name, child, out_num_changed);
+    }
+  }
+}
 } // namespace
 
 bool BundleResources::rename_classes_in_layout(
@@ -848,6 +886,29 @@ bool BundleResources::rename_classes_in_layout(
         }
       });
   return !write_failed;
+}
+
+void BundleResources::fully_qualify_layout(
+    const std::unordered_map<std::string, std::string>& element_to_class_name,
+    const std::string& file_path,
+    size_t* changes) {
+  read_protobuf_file_contents(
+      file_path,
+      [&](google::protobuf::io::CodedInputStream& input, size_t size) {
+        aapt::pb::XmlNode pb_node;
+        always_assert_log(pb_node.ParseFromCodedStream(&input),
+                          "BundleResoource failed to read %s",
+                          file_path.c_str());
+        size_t elements_changed = 0;
+        fully_qualify_element(element_to_class_name, &pb_node,
+                              &elements_changed);
+        if (elements_changed > 0) {
+          std::ofstream out(file_path, std::ofstream::binary);
+          if (pb_node.SerializeToOstream(&out)) {
+            *changes = elements_changed;
+          }
+        }
+      });
 }
 
 namespace {
@@ -881,15 +942,6 @@ std::string BundleResources::get_base_assets_dir() {
 }
 
 namespace {
-const std::unordered_set<std::string> NON_CLASS_ELEMENTS = {
-    "fragment", "view", "dialog", "activity", "intent",
-};
-const std::vector<std::string> CLASS_XML_ATTRIBUTES = {
-    "class",
-    "name",
-    "targetClass",
-};
-
 // Collect all resource ids referred in an given xml element.
 // attr->compiled_item->ref->id
 void collect_rids_for_element(const aapt::pb::XmlElement& element,
@@ -915,8 +967,9 @@ void collect_layout_classes_and_attributes_for_element(
     std::unordered_set<std::string>* out_classes,
     std::unordered_multimap<std::string, std::string>* out_attributes) {
   const auto& element_name = element.name();
-  if (NON_CLASS_ELEMENTS.count(element_name) > 0) {
-    for (const auto& attr : CLASS_XML_ATTRIBUTES) {
+  // XML element could itself be a class, with classes in its attribute values.
+  if (resources::KNOWN_ELEMENTS_WITH_CLASS_ATTRIBUTES.count(element_name) > 0) {
+    for (const auto& attr : resources::POSSIBLE_CLASS_ATTRIBUTES) {
       auto classname = get_string_attribute_value(element, attr);
       if (!classname.empty() && classname.find('.') != std::string::npos) {
         auto internal = java_names::external_to_internal(classname);
@@ -928,7 +981,8 @@ void collect_layout_classes_and_attributes_for_element(
         break;
       }
     }
-  } else if (element_name.find('.') != std::string::npos) {
+  }
+  if (element_name.find('.') != std::string::npos) {
     // Consider the element name itself as a possible class in the
     // application
     auto internal = java_names::external_to_internal(element_name);
@@ -1193,6 +1247,49 @@ void BundleResources::collect_layout_classes_and_attributes_for_file(
                 collect_layout_classes_and_attributes_for_element(
                     element, ns_uri_to_prefix, attributes_to_read, out_classes,
                     out_attributes);
+                return true;
+              });
+        }
+      });
+}
+
+void BundleResources::collect_xml_attribute_string_values_for_file(
+    const std::string& file_path, std::unordered_set<std::string>* out) {
+  if (is_raw_resource(file_path)) {
+    return;
+  }
+  TRACE(RES,
+        9,
+        "BundleResources collecting xml attribute string values for file: %s",
+        file_path.c_str());
+  read_protobuf_file_contents(
+      file_path,
+      [&](google::protobuf::io::CodedInputStream& input, size_t size) {
+        aapt::pb::XmlNode pb_node;
+        always_assert_log(pb_node.ParseFromCodedStream(&input),
+                          "BundleResoource failed to read %s",
+                          file_path.c_str());
+        if (pb_node.has_element()) {
+          const auto& root = pb_node.element();
+          traverse_element_and_children(
+              root, [&](const aapt::pb::XmlElement& element) {
+                for (const auto& pb_attr : element.attribute()) {
+                  if (pb_attr.has_compiled_item()) {
+                    const auto& pb_item = pb_attr.compiled_item();
+                    if (pb_item.has_str()) {
+                      const auto& val = pb_item.str().value();
+                      if (!val.empty()) {
+                        out->emplace(val);
+                      }
+                    } else if (pb_item.has_raw_str()) {
+                      TRACE(RES, 9,
+                            "Not considering %s as a possible string value",
+                            pb_item.raw_str().value().c_str());
+                    }
+                  } else {
+                    out->emplace(pb_attr.value());
+                  }
+                }
                 return true;
               });
         }
@@ -1482,7 +1579,8 @@ size_t ResourcesPbFile::obfuscate_resource_and_serialize(
     const std::vector<std::string>& resource_files,
     const std::map<std::string, std::string>& filepath_old_to_new,
     const std::unordered_set<uint32_t>& allowed_types,
-    const std::unordered_set<std::string>& keep_resource_prefixes) {
+    const std::unordered_set<std::string>& keep_resource_prefixes,
+    const std::unordered_set<std::string>& keep_resource_specific) {
   if (allowed_types.empty() && filepath_old_to_new.empty()) {
     TRACE(RES, 9, "BundleResources: Nothing to change, returning");
     return 0;
@@ -1542,10 +1640,11 @@ size_t ResourcesPbFile::obfuscate_resource_and_serialize(
                 remap_entry_file_paths(remap_filepaths, res_id,
                                        type->mutable_entry(k));
                 if (!is_allow_type ||
-                    find_prefix_match(keep_resource_prefixes, entry_name)) {
+                    find_prefix_match(keep_resource_prefixes, entry_name) ||
+                    keep_resource_specific.count(entry_name) > 0) {
                   TRACE(RES,
                         9,
-                        "BundleResources: skipping annonymize entry %s",
+                        "BundleResources: keeping entry name %s",
                         entry_name.c_str());
                   continue;
                 }
@@ -1772,8 +1871,8 @@ void ResourcesPbFile::collect_resource_data_for_file(
 }
 
 void ResourcesPbFile::get_type_names(std::vector<std::string>* type_names) {
-  always_assert(m_type_id_to_names.size() > 0);
-  always_assert_log(type_names->size() == 0,
+  always_assert(!m_type_id_to_names.empty());
+  always_assert_log(type_names->empty(),
                     "Must provide an empty vector, for documented indexing "
                     "scheme to be valid");
   auto highest_type_id = m_type_id_to_names.rbegin()->first;
@@ -1789,7 +1888,7 @@ void ResourcesPbFile::get_type_names(std::vector<std::string>* type_names) {
 
 std::unordered_set<uint32_t> ResourcesPbFile::get_types_by_name(
     const std::unordered_set<std::string>& type_names) {
-  always_assert(m_type_id_to_names.size() > 0);
+  always_assert(!m_type_id_to_names.empty());
   std::unordered_set<uint32_t> type_ids;
   for (const auto& pair : m_type_id_to_names) {
     if (type_names.count(pair.second) == 1) {
@@ -1801,7 +1900,7 @@ std::unordered_set<uint32_t> ResourcesPbFile::get_types_by_name(
 
 std::unordered_set<uint32_t> ResourcesPbFile::get_types_by_name_prefixes(
     const std::unordered_set<std::string>& type_name_prefixes) {
-  always_assert(m_type_id_to_names.size() > 0);
+  always_assert(!m_type_id_to_names.empty());
   std::unordered_set<uint32_t> type_ids;
   for (const auto& pair : m_type_id_to_names) {
     const auto& type_name = pair.second;
@@ -2115,6 +2214,88 @@ bool ResourcesPbFile::resource_value_identical(uint32_t a_id, uint32_t b_id) {
     }
   }
   return true;
+}
+
+namespace {
+
+void maybe_obfuscate_element(
+    const std::unordered_set<std::string>& do_not_obfuscate_elements,
+    aapt::pb::XmlElement* pb_element,
+    size_t* change_count) {
+  if (do_not_obfuscate_elements.count(pb_element->name()) > 0) {
+    return;
+  }
+  auto attr_count = pb_element->attribute_size();
+  for (int i = 0; i < attr_count; i++) {
+    auto pb_attr = pb_element->mutable_attribute(i);
+    if (pb_attr->resource_id() > 0) {
+      pb_attr->set_name("");
+      (*change_count)++;
+    }
+  }
+  auto child_size = pb_element->child_size();
+  for (int i = 0; i < child_size; i++) {
+    auto pb_child = pb_element->mutable_child(i);
+    if (pb_child->has_element()) {
+      auto pb_child_element = pb_child->mutable_element();
+      maybe_obfuscate_element(do_not_obfuscate_elements, pb_child_element,
+                              change_count);
+    }
+  }
+}
+
+void obfuscate_xml_attributes(
+    const std::string& filename,
+    const std::unordered_set<std::string>& do_not_obfuscate_elements) {
+  read_protobuf_file_contents(
+      filename,
+      [&](google::protobuf::io::CodedInputStream& input, size_t /* unused */) {
+        aapt::pb::XmlNode pb_node;
+        always_assert_log(pb_node.ParseFromCodedStream(&input),
+                          "BundleResource failed to read %s",
+                          filename.c_str());
+        size_t change_count = 0;
+        if (pb_node.has_element()) {
+          auto pb_element = pb_node.mutable_element();
+          maybe_obfuscate_element(do_not_obfuscate_elements, pb_element,
+                                  &change_count);
+        }
+        if (change_count > 0) {
+          std::ofstream out(filename, std::ofstream::binary);
+          always_assert(pb_node.SerializeToOstream(&out));
+        }
+      });
+}
+} // namespace
+
+void BundleResources::obfuscate_xml_files(
+    const std::unordered_set<std::string>& allowed_types,
+    const std::unordered_set<std::string>& do_not_obfuscate_elements) {
+  using path_t = boost::filesystem::path;
+  using dir_iterator = boost::filesystem::directory_iterator;
+
+  std::set<std::string> xml_paths;
+  path_t dir(m_directory);
+  for (auto& module_entry : boost::make_iterator_range(
+           boost::filesystem::directory_iterator(dir), {})) {
+    path_t res = module_entry.path() / "/res";
+    if (exists(res) && is_directory(res)) {
+      for (auto it = dir_iterator(res); it != dir_iterator(); ++it) {
+        auto const& entry = *it;
+        const path_t& entry_path = entry.path();
+        const auto& entry_string = entry_path.string();
+        if (is_directory(entry_path) &&
+            can_obfuscate_xml_file(allowed_types, entry_string)) {
+          for (const std::string& layout : get_xml_files(entry_string)) {
+            xml_paths.emplace(layout);
+          }
+        }
+      }
+    }
+  }
+  for (const auto& path : xml_paths) {
+    obfuscate_xml_attributes(path, do_not_obfuscate_elements);
+  }
 }
 
 ResourcesPbFile::~ResourcesPbFile() {}

@@ -5,11 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
 #include <boost/functional/hash.hpp>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <vector>
 
+#include "androidfw/TypeWrappers.h"
 #include "utils/ByteOrder.h"
 #include "utils/Debug.h"
 #include "utils/Log.h"
@@ -18,6 +21,7 @@
 #include "utils/String8.h"
 #include "utils/Unicode.h"
 #include "utils/Vector.h"
+#include "utils/Visitor.h"
 
 namespace arsc {
 
@@ -85,7 +89,8 @@ void encode_string8(const char* string,
   push_u8_length(u16_len, vec);
   push_u8_length(len, vec);
   // Push each char
-  for (auto c = (char*)string; *c; c++) {
+  size_t i = 0;
+  for (auto c = (char*)string; i < len; c++, i++) {
     vec->push_back(*c);
   }
   vec->push_back('\0');
@@ -106,7 +111,8 @@ void encode_string16(const char16_t* s,
   } else {
     push_short((uint16_t)len, vec);
   }
-  for (uint16_t* c = (uint16_t*)s; *c; c++) {
+  size_t i = 0;
+  for (uint16_t* c = (uint16_t*)s; i < len; c++, i++) {
     push_short(*c, vec);
   }
   push_short('\0', vec);
@@ -194,6 +200,71 @@ bool are_configs_equivalent(android::ResTable_config* a,
   return false;
 }
 
+ssize_t find_attribute_ordinal(
+    android::ResXMLTree_node* node,
+    android::ResXMLTree_attrExt* extension,
+    android::ResXMLTree_attribute* new_attr,
+    const size_t& attribute_id_count,
+    const std::function<std::string(uint32_t)>& pool_lookup) {
+  std::vector<android::ResXMLTree_attribute*> attributes;
+  collect_attributes(extension, &attributes);
+  if (attributes.empty()) {
+    return 0;
+  }
+  // Attributes are sorted first by id, when available, or sorted
+  // lexographically by string name when the attribute does not
+  // have an id. This is modelled after the aapt2 logic.
+  // https://cs.android.com/android/platform/superproject/+/android-13.0.0_r1:frameworks/base/tools/aapt2/format/binary/XmlFlattener.cpp;l=45
+  auto less_than = [&](android::ResXMLTree_attribute* this_attr,
+                       android::ResXMLTree_attribute* that_attr) {
+    auto this_name = dtohl(this_attr->name.index);
+    auto this_uri = dtohl(this_attr->ns.index);
+    auto this_has_id = this_name < attribute_id_count;
+
+    auto that_name = dtohl(that_attr->name.index);
+    auto that_uri = dtohl(that_attr->ns.index);
+    auto that_has_id = that_name < attribute_id_count;
+
+    if (this_has_id != that_has_id) {
+      return this_has_id;
+    } else if (this_has_id) {
+      // names are offsets into id array, which is sorted, just compare name
+      // index.
+      return this_name < that_name;
+    } else {
+      // Compare uri first, if equal go to actual string name. Honestly this
+      // does not make much sense since it is unclear how an attribute can have
+      // a namespace and not an id. Hmmmmmmmmm.
+      auto this_uri_str =
+          this_uri != NO_VALUE ? pool_lookup(this_uri) : std::string("");
+      auto that_uri_str =
+          that_uri != NO_VALUE ? pool_lookup(that_uri) : std::string("");
+      auto diff = this_uri_str.compare(that_uri_str);
+      if (diff < 0) {
+        return true;
+      }
+      if (diff > 0) {
+        return false;
+      }
+      auto this_str = pool_lookup(this_name);
+      auto that_str = pool_lookup(that_name);
+      return this_str < that_str;
+    }
+  };
+  // Find the first element that is greater than or equal to the new attribute.
+  auto it = std::lower_bound(attributes.begin(), attributes.end(), new_attr,
+                             less_than);
+  if (it == attributes.end()) {
+    return attributes.size();
+  } else {
+    // Check if the item we found is actually equal; this should be unsupported.
+    if (!less_than(new_attr, *it)) {
+      return -1;
+    }
+    return it - attributes.begin();
+  }
+}
+
 float complex_value(uint32_t complex) {
   const float MANTISSA_MULT =
       1.0f / (1 << android::Res_value::COMPLEX_MANTISSA_SHIFT);
@@ -256,12 +327,50 @@ void CanonicalEntries::record(EntryValueData data,
   search->second.emplace_back(p);
 }
 
+bool ResTableTypeBuilder::should_encode_offsets_as_sparse(
+    const std::vector<uint32_t>& offsets, size_t entry_data_size) {
+  if (!m_enable_sparse_encoding) {
+    return false;
+  }
+  if (entry_data_size / 4 > std::numeric_limits<uint16_t>::max()) {
+    return false;
+  }
+  size_t total_non_empty = 0;
+  for (const auto& i : offsets) {
+    if (i != android::ResTable_type::NO_ENTRY) {
+      if (i % 4 != 0) {
+        // this should probably be fatal
+        return false;
+      }
+      total_non_empty++;
+    }
+  }
+  // See
+  // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r1:frameworks/base/tools/aapt2/format/binary/TableFlattener.cpp;l=382
+  return (100 * total_non_empty) / offsets.size() < 60;
+}
+
+void ResTableTypeBuilder::encode_offsets_as_sparse(
+    std::vector<uint32_t>* offsets) {
+  std::vector<uint32_t> copy;
+  copy.insert(copy.begin(), offsets->begin(), offsets->end());
+  offsets->clear();
+  uint16_t entry_id = 0;
+  for (const auto& i : copy) {
+    if (i != android::ResTable_type::NO_ENTRY) {
+      android::ResTable_sparseTypeEntry entry;
+      entry.idx = htods(entry_id);
+      entry.offset = htods(i / 4);
+      offsets->emplace_back(entry.entry);
+    }
+    entry_id++;
+  }
+}
+
 void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
                                            size_t last_non_deleted,
                                            android::Vector<char>* out) {
-  auto original_entries = dtohl(type->entryCount);
-  auto original_entries_start = dtohs(type->entriesStart);
-  if (original_entries == 0 || original_entries_start == 0) {
+  if (dtohl(type->entryCount) == 0 || dtohs(type->entriesStart) == 0) {
     // Wonky input data, omit this config.
     ALOGD("Wonky config for type %d, dropping!", type->id);
     return;
@@ -270,13 +379,13 @@ void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
   // config has everything deleted, skip emitting data.
   {
     size_t num_non_deleted_non_empty_entries = 0;
-    uint32_t* entry_offsets =
-        (uint32_t*)((uint8_t*)type + dtohs(type->header.headerSize));
-    for (size_t i = 0; i < original_entries; i++) {
+    android::TypeVariant tv(type);
+    uint16_t i = 0;
+    for (auto it = tv.beginEntries(); it != tv.endEntries(); ++it, ++i) {
+      auto entry_ptr = const_cast<android::ResTable_entry*>(*it);
       auto id = make_id(i);
       auto is_deleted = m_ids_to_remove.count(id) != 0;
-      uint32_t offset = dtohl(entry_offsets[i]);
-      if (!is_deleted && offset != android::ResTable_type::NO_ENTRY) {
+      if (!is_deleted && entry_ptr != nullptr) {
         num_non_deleted_non_empty_entries++;
       }
     }
@@ -290,17 +399,16 @@ void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
   android::Vector<char> temp;
   std::vector<uint32_t> offsets;
   CanonicalEntries canonical_entries;
-  // Pointer to the first Res_entry
-  uint32_t* entry_offsets =
-      (uint32_t*)((uint8_t*)type + dtohs(type->header.headerSize));
-  for (size_t i = 0; i < original_entries; i++) {
+  // iterate again, now that we know it's useful
+  android::TypeVariant tv(type);
+  uint16_t i = 0;
+  for (auto it = tv.beginEntries(); it != tv.endEntries(); ++it, ++i) {
+    auto entry_ptr = const_cast<android::ResTable_entry*>(*it);
     auto id = make_id(i);
     if (m_ids_to_remove.count(id) == 0) {
-      uint32_t offset = dtohl(entry_offsets[i]);
-      if (offset == android::ResTable_type::NO_ENTRY) {
+      if (entry_ptr == nullptr) {
         offsets.push_back(htodl(android::ResTable_type::NO_ENTRY));
       } else {
-        auto entry_ptr = (uint8_t*)type + dtohs(type->entriesStart) + offset;
         uint32_t total_size =
             compute_entry_value_length((android::ResTable_entry*)entry_ptr);
         if (!m_enable_canonical_entries) {
@@ -309,7 +417,7 @@ void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
           push_data_no_swap(entry_ptr, total_size, &temp);
         } else {
           // Check if we have already emitted identical data.
-          EntryValueData ev(entry_ptr, total_size);
+          EntryValueData ev((uint8_t*)entry_ptr, total_size);
           size_t hash;
           uint32_t prev_offset;
           if (canonical_entries.find(ev, &hash, &prev_offset)) {
@@ -330,6 +438,11 @@ void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
       offsets.push_back(htodl(android::ResTable_type::NO_ENTRY));
     }
   }
+  uint8_t type_flags{0};
+  if (should_encode_offsets_as_sparse(offsets, temp.size())) {
+    encode_offsets_as_sparse(&offsets);
+    type_flags |= android::ResTable_type::FLAG_SPARSE;
+  }
   // Header and actual data structure
   push_short(android::RES_TABLE_TYPE_TYPE, out);
   // Derive the header size from the input data (guard against inputs generated
@@ -339,19 +452,19 @@ void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
   auto type_header_size =
       sizeof(android::ResChunk_header) + sizeof(uint32_t) * 3 + config_size;
   push_short(type_header_size, out);
-  auto num_entries = offsets.size();
-  auto entries_start = type_header_size + num_entries * sizeof(uint32_t);
+  auto num_offsets = offsets.size();
+  auto entries_start = type_header_size + num_offsets * sizeof(uint32_t);
   auto total_size = entries_start + temp.size();
   push_long(total_size, out);
   out->push_back(m_type);
+  out->push_back(type_flags);
   out->push_back(0); // pad to 4 bytes
   out->push_back(0);
-  out->push_back(0);
-  push_long(num_entries, out);
+  push_long(num_offsets, out);
   push_long(entries_start, out);
   auto cp = &type->config;
   push_data_no_swap(cp, config_size, out);
-  for (size_t i = 0; i < num_entries; i++) {
+  for (size_t i = 0; i < num_offsets; i++) {
     push_long(offsets[i], out);
   }
   push_vec(temp, out);
@@ -359,8 +472,8 @@ void ResTableTypeProjector::serialize_type(android::ResTable_type* type,
 
 void ResTableTypeProjector::serialize(android::Vector<char>* out) {
   // Basic validation of the inputs given.
-  LOG_ALWAYS_FATAL_IF(
-      m_configs.size() == 0, "No configs given for type %d", m_type);
+  LOG_ALWAYS_FATAL_IF(m_configs.empty(), "No configs given for type %d",
+                      m_type);
   // Check if all entries in this type have been marked for deletion. If so, no
   // data is emitted.
   auto original_entries = dtohl(m_spec->entryCount);
@@ -455,50 +568,57 @@ void ResTableTypeDefiner::serialize(android::Vector<char>* out) {
       continue;
     }
     auto& data = m_data.at(config);
-    // Write the type header
-    push_short(android::RES_TABLE_TYPE_TYPE, out);
-    auto config_size = dtohs(config->size);
-    auto type_header_size =
-        sizeof(android::ResChunk_header) + sizeof(uint32_t) * 3 + config_size;
-    push_short(type_header_size, out);
-    auto entries_start = type_header_size + data.size() * sizeof(uint32_t);
-    // Write the final size later
-    auto total_size_pos = out->size();
-    push_long(FILL_IN_LATER, out);
-    out->push_back(m_type);
-    out->push_back(0); // pad to 4 bytes
-    out->push_back(0);
-    out->push_back(0);
-    push_long(data.size(), out);
-    push_long(entries_start, out);
-    push_data_no_swap(config, config_size, out);
-    // Compute and write offsets.
+    // Compute offsets and entry/value data size.
     CanonicalEntries canonical_entries;
     android::Vector<char> entry_data;
+    std::vector<uint32_t> offsets;
     uint32_t offset = 0;
     for (auto& ev : data) {
       if (is_empty(ev)) {
-        push_long(dtohl(android::ResTable_type::NO_ENTRY), out);
+        offsets.emplace_back(android::ResTable_type::NO_ENTRY);
       } else if (!m_enable_canonical_entries) {
-        push_long(offset, out);
+        offsets.emplace_back(offset);
         offset += ev.value;
         push_data_no_swap(ev.key, ev.value, &entry_data);
       } else {
         size_t hash;
         uint32_t prev_offset;
         if (canonical_entries.find(ev, &hash, &prev_offset)) {
-          push_long(prev_offset, out);
+          offsets.emplace_back(prev_offset);
         } else {
           canonical_entries.record(ev, hash, offset);
-          push_long(offset, out);
+          offsets.emplace_back(offset);
           offset += ev.value;
           push_data_no_swap(ev.key, ev.value, &entry_data);
         }
       }
     }
-    // Actual data.
+    uint8_t type_flags{0};
+    if (should_encode_offsets_as_sparse(offsets, entry_data.size())) {
+      encode_offsets_as_sparse(&offsets);
+      type_flags |= android::ResTable_type::FLAG_SPARSE;
+    }
+    // Write the type header
+    push_short(android::RES_TABLE_TYPE_TYPE, out);
+    auto config_size = dtohs(config->size);
+    auto type_header_size =
+        sizeof(android::ResChunk_header) + sizeof(uint32_t) * 3 + config_size;
+    push_short(type_header_size, out);
+    auto entries_start = type_header_size + offsets.size() * sizeof(uint32_t);
+    auto total_size = entries_start + entry_data.size();
+    push_long(total_size, out);
+    out->push_back(m_type);
+    out->push_back(type_flags);
+    out->push_back(0); // pad to 4 bytes
+    out->push_back(0);
+    push_long(offsets.size(), out);
+    push_long(entries_start, out);
+    push_data_no_swap(config, config_size, out);
+    // Actual offsets and data.
+    for (const auto& i : offsets) {
+      push_long(i, out);
+    }
     push_vec(entry_data, out);
-    write_long_at_pos(total_size_pos, entries_start + entry_data.size(), out);
   }
 }
 
@@ -803,6 +923,81 @@ void replace_xml_string_pool(android::ResChunk_header* data,
   write_long_at_pos(total_size_pos, out->size() - initial_vec_size, out);
 }
 
+int ensure_string_in_xml_pool(const void* data,
+                              const size_t len,
+                              const std::string& new_string,
+                              android::Vector<char>* out_data,
+                              size_t* idx) {
+  std::unordered_map<std::string, uint32_t> out_idx;
+  auto ret =
+      ensure_strings_in_xml_pool(data, len, {new_string}, out_data, &out_idx);
+  if (ret == android::OK) {
+    *idx = out_idx.at(new_string);
+  }
+  return ret;
+}
+
+int ensure_strings_in_xml_pool(
+    const void* data,
+    const size_t len,
+    const std::set<std::string>& strings_to_add,
+    android::Vector<char>* out_data,
+    std::unordered_map<std::string, uint32_t>* string_to_idx) {
+  LOG_ALWAYS_FATAL_IF(!string_to_idx->empty(),
+                      "string_to_idx should start empty");
+  int validation_result = validate_xml_string_pool(data, len);
+  if (validation_result != android::OK) {
+    return validation_result;
+  }
+  SimpleXmlParser parser;
+  LOG_ALWAYS_FATAL_IF(!parser.visit((void*)data, len), "Invalid file");
+  auto& pool = parser.global_strings();
+  size_t pool_size = pool.size();
+  // Check if there is already a non-attribute with the given value.
+  for (size_t i = parser.attribute_count(); i < pool_size; i++) {
+    if (is_valid_string_idx(pool, i)) {
+      auto s = get_string_from_pool(pool, i);
+      if (strings_to_add.count(s) > 0) {
+        string_to_idx->emplace(s, i);
+      }
+    }
+  }
+
+  if (strings_to_add.size() == string_to_idx->size()) {
+    // Everything was already present, just return and do no futher work.
+    // Convention to leave out_data unchanged in this case.
+    return android::OK;
+  }
+
+  // Add given strings to the end of a new pool.
+  auto flags = pool.isUTF8()
+                   ? htodl((uint32_t)android::ResStringPool_header::UTF8_FLAG)
+                   : (uint32_t)0;
+  arsc::ResStringPoolBuilder pool_builder(flags);
+  for (size_t i = 0; i < pool_size; i++) {
+    size_t length;
+    if (pool.isUTF8()) {
+      auto s = pool.string8At(i, &length);
+      pool_builder.add_string(s, length);
+    } else {
+      auto s = pool.stringAt(i, &length);
+      pool_builder.add_string(s, length);
+    }
+  }
+
+  for (const auto& s : strings_to_add) {
+    if (string_to_idx->count(s) == 0) {
+      auto idx = pool_builder.string_count();
+      pool_builder.add_string(s);
+      string_to_idx->emplace(s, idx);
+    }
+  }
+  // Serialize new string pool into out data.
+  replace_xml_string_pool((android::ResChunk_header*)data, len, pool_builder,
+                          out_data);
+  return android::OK;
+}
+
 bool is_empty(const EntryValueData& ev) {
   if (ev.getKey() == nullptr) {
     LOG_ALWAYS_FATAL_IF(ev.getValue() != 0, "Invalid pointer, length pair");
@@ -825,5 +1020,55 @@ PtrLen<uint8_t> get_value_data(const EntryValueData& ev) {
   }
   auto ptr = (uint8_t*)entry + entry_size;
   return {ptr, entry_and_value_len - entry_size};
+}
+
+void ResFileManipulator::serialize(android::Vector<char>* out) {
+  auto vec_start = out->size();
+  ssize_t final_size = m_length;
+  for (const auto& [c, block] : m_additions) {
+    final_size += block.size;
+  }
+  for (const auto& [c, size] : m_deletions) {
+    final_size -= size;
+  }
+  LOG_ALWAYS_FATAL_IF(final_size < 0, "final size went negative");
+  // Copy the original data, applying our edits along the way.
+  char* current = m_data;
+  size_t i = 0;
+  auto emit = [&](const Block& block) {
+    out->appendArray((const char*)block.buffer.get(), block.size);
+  };
+  auto advance = [&](size_t amount) {
+    i += amount;
+    current += amount;
+  };
+  while (i < m_length) {
+    auto addition = m_additions.find(current);
+    if (addition != m_additions.end()) {
+      emit(addition->second);
+    }
+    auto deletion = m_deletions.find(current);
+    if (deletion != m_deletions.end()) {
+      advance(deletion->second);
+      continue;
+    }
+    out->push_back(*current);
+    advance(1);
+  }
+  // Lastly, check if there is a request to add at the very end of the file.
+  auto addition = m_additions.find(m_data + m_length);
+  if (addition != m_additions.end()) {
+    emit(addition->second);
+  }
+  // Assert everything is good.
+  auto actual_size = out->size() - vec_start;
+  LOG_ALWAYS_FATAL_IF(
+      actual_size != final_size,
+      "did not write expected number of bytes; wrote %zu, expected %zu",
+      actual_size, (size_t)final_size);
+  // Fix up the file size, assuming our original data starts in a proper chunk.
+  if (actual_size >= sizeof(android::ResChunk_header)) {
+    write_long_at_pos(vec_start + sizeof(uint16_t) * 2, final_size, out);
+  }
 }
 } // namespace arsc

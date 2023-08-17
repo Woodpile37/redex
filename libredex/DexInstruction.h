@@ -34,6 +34,7 @@ class DexInstruction : public Gatherable {
     REF_METHOD,
     REF_CALLSITE,
     REF_METHODHANDLE,
+    REF_PROTO,
   } m_ref_type{REF_NONE};
 
  private:
@@ -45,6 +46,7 @@ class DexInstruction : public Gatherable {
 
   // use clone() instead
   DexInstruction(const DexInstruction&) = default;
+  DexInstruction& operator=(const DexInstruction&) = default;
 
   // Ref-less opcodes, largest size is 5 insns.
   // If the constructor is called with a non-numeric
@@ -97,6 +99,7 @@ class DexInstruction : public Gatherable {
   bool has_method() const { return m_ref_type == REF_METHOD; }
   bool has_callsite() const { return m_ref_type == REF_CALLSITE; }
   bool has_methodhandle() const { return m_ref_type == REF_METHODHANDLE; }
+  bool has_proto() const { return m_ref_type == REF_PROTO; }
 
   bool has_range() const { return dex_opcode::has_range(opcode()); }
   bool has_literal() const { return dex_opcode::has_literal(opcode()); }
@@ -278,10 +281,8 @@ class DexOpcodeMethodHandle : public DexInstruction {
     return new DexOpcodeMethodHandle(*this);
   }
 
-  DexOpcodeMethodHandle(DexOpcode opcode,
-                        DexMethodHandle* methodhandle,
-                        uint16_t arg = 0)
-      : DexInstruction(opcode, arg) {
+  DexOpcodeMethodHandle(DexOpcode opcode, DexMethodHandle* methodhandle)
+      : DexInstruction(opcode) {
     m_methodhandle = methodhandle;
     m_ref_type = REF_METHODHANDLE;
   }
@@ -303,6 +304,9 @@ class DexOpcodeData : public DexInstruction {
   size_t size() const override;
   void encode(DexOutputIdx* dodx, uint16_t*& insns) const override;
   DexOpcodeData* clone() const override { return new DexOpcodeData(*this); }
+  std::unique_ptr<DexOpcodeData> clone_as_unique_ptr() const {
+    return std::make_unique<DexOpcodeData>(*this);
+  }
 
   DexOpcodeData(const uint16_t* opcodes, size_t count)
       : DexInstruction(opcodes, 0),
@@ -338,10 +342,32 @@ class DexOpcodeData : public DexInstruction {
   size_t data_size() const { return m_data_count; }
 };
 
+class DexOpcodeProto : public DexInstruction {
+ private:
+  DexProto* m_proto;
+
+ public:
+  size_t size() const override;
+  void encode(DexOutputIdx* dodx, uint16_t*& insns) const override;
+  void gather_strings(std::vector<const DexString*>& lstring) const override;
+
+  DexOpcodeProto* clone() const override { return new DexOpcodeProto(*this); }
+
+  DexOpcodeProto(DexOpcode opcode, DexProto* proto) : DexInstruction(opcode) {
+    m_proto = proto;
+    m_ref_type = REF_PROTO;
+  }
+
+  DexProto* get_proto() const { return m_proto; }
+
+  void set_proto(DexProto* proto) { m_proto = proto; }
+};
+
 // helper function to create fill-array-data-payload according to
 // https://source.android.com/devices/tech/dalvik/dalvik-bytecode#fill-array
 template <typename IntType>
-DexOpcodeData* encode_fill_array_data_payload(const std::vector<IntType>& vec) {
+std::unique_ptr<DexOpcodeData> encode_fill_array_data_payload(
+    const std::vector<IntType>& vec) {
   static_assert(std::is_integral<IntType>::value,
                 "fill-array-data-payload can only contain integral values.");
   int width = sizeof(IntType);
@@ -356,7 +382,7 @@ DexOpcodeData* encode_fill_array_data_payload(const std::vector<IntType>& vec) {
   *(uint32_t*)(ptr + 2) = vec.size();
   uint8_t* data_bytes = (uint8_t*)(ptr + 4);
   memcpy(data_bytes, (void*)vec.data(), total_copy_size);
-  return new DexOpcodeData(data);
+  return std::make_unique<DexOpcodeData>(data);
 }
 
 template <typename IntType>

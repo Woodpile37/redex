@@ -5,10 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "MonotonicFixpointIterator.h"
-#include "HashedSetAbstractDomain.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "PatriciaTreeSet.h"
+#include <sparta/HashedSetAbstractDomain.h>
+#include <sparta/MonotonicFixpointIterator.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/PatriciaTreeSet.h>
 
 #include <functional>
 #include <gmock/gmock.h>
@@ -593,21 +593,21 @@ class IntegerSetAbstractDomain final
     return IntegerSetAbstractDomain(/* top */ true);
   }
 
-  bool is_bottom() const override { return !m_top && m_set.empty(); }
+  bool is_bottom() const { return !m_top && m_set.empty(); }
 
-  bool is_top() const override { return m_top; }
+  bool is_top() const { return m_top; }
 
-  void set_to_bottom() override {
+  void set_to_bottom() {
     m_set.clear();
     m_top = false;
   }
 
-  void set_to_top() override {
+  void set_to_top() {
     m_set.clear();
     m_top = true;
   }
 
-  bool leq(const IntegerSetAbstractDomain& other) const override {
+  bool leq(const IntegerSetAbstractDomain& other) const {
     if (is_bottom() || other.is_top()) {
       return true;
     } else if (is_top() || other.is_bottom()) {
@@ -617,7 +617,7 @@ class IntegerSetAbstractDomain final
     }
   }
 
-  bool equals(const IntegerSetAbstractDomain& other) const override {
+  bool equals(const IntegerSetAbstractDomain& other) const {
     if (is_bottom()) {
       return other.is_bottom();
     } else if (is_top()) {
@@ -627,7 +627,7 @@ class IntegerSetAbstractDomain final
     }
   }
 
-  void join_with(const IntegerSetAbstractDomain& other) override {
+  void join_with(const IntegerSetAbstractDomain& other) {
     if (is_top() || other.is_bottom()) {
       return;
     } else if (is_bottom() || other.is_top()) {
@@ -637,7 +637,7 @@ class IntegerSetAbstractDomain final
     }
   }
 
-  void widen_with(const IntegerSetAbstractDomain& other) override {
+  void widen_with(const IntegerSetAbstractDomain& other) {
     if (is_top() || other.is_bottom()) {
       return;
     } else if (is_bottom() || other.is_top()) {
@@ -649,11 +649,11 @@ class IntegerSetAbstractDomain final
     }
   }
 
-  void meet_with(const IntegerSetAbstractDomain& other) override {
+  void meet_with(const IntegerSetAbstractDomain& other) {
     // Never used.
   }
 
-  void narrow_with(const IntegerSetAbstractDomain& other) override {
+  void narrow_with(const IntegerSetAbstractDomain& other) {
     // Never used.
   }
 

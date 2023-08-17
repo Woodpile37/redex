@@ -12,8 +12,9 @@
 
 #include <boost/optional/optional.hpp>
 
-#include "MonotonicFixpointIterator.h"
-#include "PatriciaTreeSetAbstractDomain.h"
+#include <sparta/MonotonicFixpointIterator.h>
+#include <sparta/PatriciaTreeSetAbstractDomain.h>
+
 #include "Show.h"
 #include "Trace.h"
 
@@ -171,8 +172,6 @@ struct InconsistentDFGNodesAnalysis
 };
 
 } // namespace
-
-InstructionMatcher::~InstructionMatcher() = default;
 
 const Constraint::Src& Constraint::src(src_index_t ix) const {
   if (ix < m_srcs.size()) {
@@ -427,7 +426,7 @@ void DataFlowGraph::propagate_flow_constraints(
   // (1) Erase inconsistent nodes.
   for (auto it = m_adjacencies.begin(), end = m_adjacencies.end(); it != end;) {
     auto& node = it->first;
-    auto part = analysis.get_exit_state_at(node);
+    const auto& part = analysis.get_exit_state_at(node);
 
     if (part.get(node_loc(node)).contains(node_insn(node))) {
       TRACE(MFLOW, 6, "propagate_flow_constraints: %s inconsistent for L%zu",
@@ -457,7 +456,8 @@ void DataFlowGraph::propagate_flow_constraints(
 
 DataFlowGraph instruction_graph(cfg::ControlFlowGraph& cfg,
                                 const std::vector<Constraint>& constraints,
-                                const std::unordered_set<LocationIx>& roots) {
+                                const std::unordered_set<LocationIx>& roots,
+                                Order* order) {
   if (!cfg.exit_block()) {
     // The instruction constraint analysis runs backwards and so requires a
     // single exit block to start from.
@@ -542,6 +542,9 @@ DataFlowGraph instruction_graph(cfg::ControlFlowGraph& cfg,
         }
       }
 
+      if (order) {
+        order->emplace(insn, order->size());
+      }
       analysis.analyze_instruction(insn, &env);
     }
   }

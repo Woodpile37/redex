@@ -9,7 +9,6 @@
 import argparse
 import errno
 import glob
-import hashlib
 import json
 import logging
 import os
@@ -21,13 +20,13 @@ import sys
 import tempfile
 import timeit
 import typing
-import zipfile
 from os.path import abspath, dirname, getsize, isdir, isfile, join
 from pipes import quote
 
 import pyredex.bintools as bintools
 import pyredex.logger as logger
 from pyredex.buck import BuckConnectionScope, BuckPartScope
+from pyredex.packer import compress_entries, CompressionEntry, CompressionLevel
 from pyredex.unpacker import (
     LibraryManager,
     unpack_tar_xz,
@@ -37,15 +36,18 @@ from pyredex.unpacker import (
 )
 from pyredex.utils import (
     add_android_sdk_path,
+    add_tool_override,
     argparse_yes_no_flag,
     dex_glob,
-    find_android_build_tool,
+    find_zipalign,
     get_android_sdk_path,
     get_file_ext,
     make_temp_dir,
-    move_dexen_to_directories,
+    omit_sdk_tool_discovery,
+    relocate_dexen_to_directories,
     remove_comments,
     sign_apk,
+    verify_dexes,
     with_temp_cleanup,
 )
 
@@ -189,6 +191,16 @@ class ExceptionMessageFormatter:
         )
 
 
+class DexenSnapshot(object):
+    def __init__(self, dex_dir: str) -> None:
+        self.files_and_sizes: typing.Dict[str, int] = {
+            dexpath: os.path.getsize(dexpath) for dexpath in dex_glob(dex_dir)
+        }
+
+    def equals(self, other: "DexenSnapshot") -> bool:
+        return self.files_and_sizes == other.files_and_sizes
+
+
 class State(object):
     # This structure is only used for passing arguments between prepare_redex,
     # launch_redex_binary, finalize_redex
@@ -204,6 +216,7 @@ class State(object):
         lib_manager: typing.Optional[LibraryManager],
         unpack_manager: typing.Optional[UnpackManager],
         zip_manager: typing.Optional[ZipManager],
+        dexen_initial_state: typing.Optional[DexenSnapshot],
     ) -> None:
         self.args = args
         self.config_dict = config_dict
@@ -215,6 +228,7 @@ class State(object):
         self.lib_manager = lib_manager
         self.unpack_manager = unpack_manager
         self.zip_manager = zip_manager
+        self.dexen_initial_state = dexen_initial_state
 
 
 class RedexRunException(Exception):
@@ -278,8 +292,8 @@ def run_redex_binary(
     if state.args.is_art_build:
         args += ["--is-art-build"]
 
-    if state.args.redacted:
-        args += ["--redacted"]
+    if state.args.post_lowering:
+        args += ["--post-lowering"]
 
     if state.args.disable_dex_hasher:
         args += ["--disable-dex-hasher"]
@@ -414,7 +428,7 @@ def zipalign(
     # Align zip and optionally perform good compression.
     try:
         zipalign = [
-            find_android_build_tool("zipalign.exe" if IS_WINDOWS else "zipalign"),
+            find_zipalign(),
             "4",
             unaligned_apk_path,
             output_apk_path,
@@ -451,6 +465,7 @@ def align_and_sign_output_apk(
     key_alias: str,
     key_password: str,
     ignore_zipalign: bool,
+    ignore_apksigner: bool,
     page_align: bool,
 ) -> None:
     if isfile(output_apk_path):
@@ -469,7 +484,7 @@ def align_and_sign_output_apk(
 
     # Add new signature
     if sign:
-        sign_apk(keystore, key_password, key_alias, output_apk_path)
+        sign_apk(keystore, key_password, key_alias, output_apk_path, ignore_apksigner)
 
 
 def copy_file_to_out_dir(
@@ -498,13 +513,27 @@ def copy_all_file_to_out_dir(
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.sign:
-        for arg_name in ["keystore", "keyalias", "keypass"]:
-            if getattr(args, arg_name) is None:
-                raise argparse.ArgumentTypeError(
-                    "Could not find a suitable default for --{} and no value "
-                    "was provided.  This argument is required when --sign "
-                    "is used".format(arg_name)
-                )
+
+        def raise_error(arg_name: str) -> None:
+            raise argparse.ArgumentTypeError(
+                "Could not find a suitable default for --{} and no value "
+                "was provided.  This argument is required when --sign "
+                "is used".format(arg_name)
+            )
+
+        if not args.keystore:
+            raise_error("keystore")
+
+        if not args.keyalias:
+            raise_error("keyalias")
+
+        if not args.keypass:
+            raise_error("keypass")
+
+        if not isfile(args.keystore):
+            raise argparse.ArgumentTypeError(
+                f'Keystore path "{args.keystore}" is invalid.'
+            )
 
 
 def arg_parser(
@@ -638,6 +667,11 @@ Given an APK, produce a better APK!
         "--ignore-zipalign", action="store_true", help="Ignore if zipalign is not found"
     )
     parser.add_argument(
+        "--ignore-apksigner",
+        action="store_true",
+        help="Ignore if apksigner is not found",
+    )
+    parser.add_argument(
         "--verify-none-mode",
         action="store_true",
         help="Enable verify-none mode on redex",
@@ -653,10 +687,10 @@ Given an APK, produce a better APK!
         help="States that this is an art only build",
     )
     parser.add_argument(
-        "--redacted",
+        "--post-lowering",
         action="store_true",
         default=False,
-        help="Specifies how dex files should be laid out",
+        help="Specifies whether post lowering processing should be done",
     )
     parser.add_argument(
         "--disable-dex-hasher", action="store_true", help="Disable DexHasher"
@@ -722,6 +756,12 @@ Given an APK, produce a better APK!
     )
 
     parser.add_argument(
+        "--omit-sdk-tool-discovery",
+        action="store_true",
+        help="Do not look attempt to search for SDK tools via path construction. Use the provided tool path overrides or the buck defaults",
+    )
+
+    parser.add_argument(
         "--log-level",
         default="warning",
         help="Specify the python logging level",
@@ -734,15 +774,68 @@ Given an APK, produce a better APK!
     )
 
     parser.add_argument(
+        "--secondary-packed-profiles",
+        type=str,
+        help="Path to packed secondary profiles (expects tar.xz)",
+    )
+
+    parser.add_argument(
         "--jni-summary",
         default=None,
         type=str,
         help="Path to JNI summary directory of json files.",
     )
 
+    parser.add_argument(
+        "--verify-dexes", type=str, help="Verify dex files with the supplied command"
+    )
+
+    # Manual tool paths.
+
+    # Must be subclassed.
+    class ToolAction(argparse.Action):
+        def __init__(
+            self, tool_name, option_strings, dest, nargs=None, type=None, **kwargs
+        ):
+            if nargs is not None:
+                raise ValueError("nargs not allowed")
+            if type is not None:
+                raise ValueError("type not allowed")
+            super().__init__(option_strings, dest, type=str, **kwargs)
+            self.tool_name = tool_name
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            if values is not None:
+                add_tool_override(self.tool_name, values)
+
+    class ZipAlignToolAction(ToolAction):
+        def __init__(self, **kwargs):
+            super().__init__("zipalign", **kwargs)
+
+    parser.add_argument(
+        "--zipalign-path",
+        default=None,
+        action=ZipAlignToolAction,
+        help="Path to zipalign executable.",
+    )
+
+    class ApkSignerToolAction(ToolAction):
+        def __init__(self, *args, **kwargs):
+            super().__init__("apksigner", *args, **kwargs)
+
+    parser.add_argument(
+        "--apksigner-path",
+        default=None,
+        action=ApkSignerToolAction,
+        help="Path to apksigner executable.",
+    )
+
     # Passthrough mode.
     parser.add_argument("--outdir", type=str)
     parser.add_argument("--dex-files", nargs="+", default=[])
+
+    parser.add_argument("--trace", type=str)
+    parser.add_argument("--trace-file", type=str)
 
     return parser
 
@@ -765,7 +858,7 @@ def _has_android_library_jars(pg_file: str) -> bool:
     return False
 
 
-def _check_android_sdk(args: argparse.Namespace) -> None:
+def _check_android_sdk_jar(args: argparse.Namespace) -> None:
     if args.suppress_android_jar_check:
         logging.debug("No SDK jar check done")
         return
@@ -782,8 +875,14 @@ def _check_android_sdk(args: argparse.Namespace) -> None:
 
     # Check whether we can find and add one.
     logging.info(
-        "No SDK jar found, attempting to find one. If the detection is wrong, add `--suppress-android-jar-check`."
+        "No SDK jar found. If the detection is wrong, add `--suppress-android-jar-check`."
     )
+    if args.omit_sdk_tool_discovery:
+        raise RuntimeError(
+            "SDK tool discovery explicitly disabled, not attempting to locate SDK jar via SDK path. Failing due to no SDK jar provided."
+        )
+
+    logging.info("Attempting to find an SDK-looking jar via SDK path")
 
     try:
         sdk_path = get_android_sdk_path()
@@ -921,12 +1020,42 @@ def _handle_profiles(args: argparse.Namespace) -> None:
         logging.info("No block profiles found in %s", args.packed_profiles)
 
 
+def _handle_secondary_method_profiles(args: argparse.Namespace) -> None:
+    if not args.secondary_packed_profiles:
+        return
+
+    directory = make_temp_dir(".redex_profiles", False)
+    unpack_tar_xz(args.secondary_packed_profiles, directory)
+
+    # Create input for secondary method profiles.
+    secondary_method_profiles_str = ", ".join(
+        f'"{f.path}"'
+        for f in os.scandir(directory)
+        if f.is_file()
+        and ("secondary_method_stats" in f.name or "secondary_stats" in f.name)
+    )
+    if secondary_method_profiles_str:
+        logging.debug(
+            "Found secondary_method profiles: %s", secondary_method_profiles_str
+        )
+        args.passthru_json.append(
+            f"secondary_method_stats_files=[{secondary_method_profiles_str}]"
+        )
+    else:
+        logging.info(
+            "No secondary method profiles found in %s", args.secondary_packed_profiles
+        )
+
+
 def prepare_redex(args: argparse.Namespace) -> State:
     logging.debug("Preparing...")
     debug_mode = args.unpack_only or args.debug
 
     if args.android_sdk_path:
         add_android_sdk_path(args.android_sdk_path)
+
+    if args.omit_sdk_tool_discovery:
+        omit_sdk_tool_discovery()
 
     # avoid accidentally mixing up file formats since we now support
     # both apk files and Android bundle files
@@ -1031,11 +1160,17 @@ def prepare_redex(args: argparse.Namespace) -> State:
 
     # Unpack profiles, if they exist.
     _handle_profiles(args)
+    _handle_secondary_method_profiles(args)
 
     logging.debug("Moving contents to expected structure...")
     # Move each dex to a separate temporary directory to be operated by
     # redex.
-    dexen = move_dexen_to_directories(dex_dir, dex_glob(dex_dir))
+    preserve_input_dexes = config_dict.get("preserve_input_dexes")
+    dexen = relocate_dexen_to_directories(
+        dex_dir, dex_glob(dex_dir), preserve_input_dexes
+    )
+    dexen_initial_state = DexenSnapshot(dex_dir) if preserve_input_dexes else None
+
     for store in sorted(store_files):
         dexen.append(store)
     logging.debug(
@@ -1079,8 +1214,8 @@ def prepare_redex(args: argparse.Namespace) -> State:
     # Check for shrinker heuristics.
     _check_shrinker_heuristics(args)
 
-    # Scan for SDK jar. If not found, warn and add if available.
-    _check_android_sdk(args)
+    # Scan for SDK jar provided. If not found, warn and add if available and allowed.
+    _check_android_sdk_jar(args)
 
     logging.debug("Running redex-all on %d dex files ", len(dexen))
     if args.lldb:
@@ -1101,15 +1236,92 @@ def prepare_redex(args: argparse.Namespace) -> State:
         lib_manager=lib_manager,
         unpack_manager=unpack_manager,
         zip_manager=zip_manager,
+        dexen_initial_state=dexen_initial_state,
     )
 
 
+def get_compression_list() -> typing.List[CompressionEntry]:
+    return [
+        CompressionEntry(
+            "Redex Instrumentation Metadata",
+            lambda args: args.enable_instrument_pass,
+            True,
+            ["redex-instrument-metadata.txt"],
+            [
+                "redex-source-block-method-dictionary.csv",
+                "redex-source-blocks.csv",
+                "redex-source-block-idom-maps.csv",
+                "unique-idom-maps.txt",
+            ],
+            "redex-instrument-metadata.zip",
+            "redex-instrument-checksum.txt",
+            CompressionLevel.BETTER,  # Not as time-sensitive.
+        ),
+        CompressionEntry(
+            "Redex Class Sizes",
+            lambda args: True,
+            True,
+            [],
+            ["redex-class-sizes.csv"],
+            None,
+            None,
+            CompressionLevel.DEFAULT,  # May be large.
+        ),
+        CompressionEntry(
+            "Redex Stats",
+            lambda args: True,
+            False,
+            ["redex-stats.txt"],
+            [],
+            None,
+            None,
+            CompressionLevel.BETTER,  # Usually small enough.
+        ),
+        CompressionEntry(
+            "Redex Class Dependencies",
+            lambda args: True,
+            True,
+            [],
+            ["redex-class-dependencies.txt"],
+            None,
+            None,
+            CompressionLevel.FAST,  # May be quite large.
+        ),
+        CompressionEntry(
+            "Redex Unsafe Enums List",
+            lambda args: True,
+            True,
+            [],
+            ["redex-unsafe-enums.txt"],
+            None,
+            None,
+            CompressionLevel.BETTER,  # Usually small enough.
+        ),
+    ]
+
+
 def finalize_redex(state: State) -> None:
+    if state.args.verify_dexes:
+        verify_dexes(state.dex_dir, state.args.verify_dexes)
+
+    if state.dexen_initial_state is not None:
+        dexen_final_state = DexenSnapshot(state.dex_dir)
+        assert _assert_val(state.dexen_initial_state).equals(
+            dexen_final_state
+        ), "initial state of preserved dex files does not match final state"
+
     _assert_val(state.lib_manager).__exit__(*sys.exc_info())
 
     repack_start_time = timer()
 
     _assert_val(state.unpack_manager).__exit__(*sys.exc_info())
+
+    meta_file_dir = join(state.dex_dir, "meta/")
+    assert os.path.isdir(meta_file_dir), "meta dir %s does not exist" % meta_file_dir
+
+    resource_file_mapping = join(meta_file_dir, "resource-mapping.txt")
+    if os.path.exists(resource_file_mapping):
+        _assert_val(state.zip_manager).set_resource_file_mapping(resource_file_mapping)
     _assert_val(state.zip_manager).__exit__(*sys.exc_info())
 
     align_and_sign_output_apk(
@@ -1122,6 +1334,7 @@ def finalize_redex(state: State) -> None:
         state.args.keyalias,
         state.args.keypass,
         state.args.ignore_zipalign,
+        state.args.ignore_apksigner,
         state.args.page_align_libs,
     )
 
@@ -1131,47 +1344,16 @@ def finalize_redex(state: State) -> None:
         )
     )
 
-    meta_file_dir = join(state.dex_dir, "meta/")
-    assert os.path.isdir(meta_file_dir), "meta dir %s does not exist" % meta_file_dir
+    compress_entries(
+        get_compression_list(),
+        meta_file_dir,
+        os.path.dirname(state.args.out),
+        state.args,
+    )
 
     copy_all_file_to_out_dir(
         meta_file_dir, state.args.out, "*", "all redex generated artifacts"
     )
-
-    if state.args.enable_instrument_pass:
-        logging.debug("Creating redex-instrument-metadata.zip")
-        zipfile_path = join(dirname(state.args.out), "redex-instrument-metadata.zip")
-
-        FILES_MUST = [
-            join(dirname(state.args.out), f) for f in ("redex-instrument-metadata.txt",)
-        ]
-
-        FILES_MAY = [
-            join(dirname(state.args.out), f)
-            for f in (
-                "redex-source-block-method-dictionary.csv",
-                "redex-source-blocks.csv",
-            )
-        ]
-        FILES_ACTUALLY = [
-            *FILES_MUST,
-            *[f for f in FILES_MAY if os.path.exists(f)],
-        ]
-
-        # Write a checksum file.
-        hash = hashlib.md5()
-        for f in FILES_ACTUALLY:
-            hash.update(open(f, "rb").read())
-        checksum_path = join(dirname(state.args.out), "redex-instrument-checksum.txt")
-        with open(checksum_path, "w") as f:
-            f.write(f"{hash.hexdigest()}\n")
-
-        with zipfile.ZipFile(zipfile_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            for f in [*FILES_ACTUALLY, checksum_path]:
-                z.write(f, os.path.basename(f))
-
-        for f in [*FILES_ACTUALLY, checksum_path]:
-            os.remove(f)
 
     redex_stats_filename = state.config_dict.get("stats_output", "redex-stats.txt")
     redex_stats_file = join(dirname(meta_file_dir), redex_stats_filename)
@@ -1211,7 +1393,10 @@ def _init_logging(level_str: str) -> None:
         "debug": logging.DEBUG,
     }
     level = levels[level_str]
-    logging.basicConfig(level=level)
+    logging.basicConfig(
+        level=level,
+        format="[%(levelname)-8s] %(message)s",
+    )
 
 
 def run_redex_passthrough(
@@ -1233,6 +1418,7 @@ def run_redex_passthrough(
         lib_manager=None,
         unpack_manager=None,
         zip_manager=None,
+        dexen_initial_state=None,
     )
     run_redex_binary(state, exception_formatter, output_line_handler)
 
@@ -1242,9 +1428,6 @@ def run_redex(
     exception_formatter: typing.Optional[ExceptionMessageFormatter] = None,
     output_line_handler: typing.Optional[typing.Callable[[str], str]] = None,
 ) -> None:
-    # This is late, but hopefully early enough.
-    _init_logging(args.log_level)
-
     with BuckConnectionScope():
         if exception_formatter is None:
             exception_formatter = ExceptionMessageFormatter()
@@ -1268,6 +1451,18 @@ def run_redex(
         finalize_redex(state)
 
 
+def early_apply_args(args: argparse.Namespace) -> None:
+    # This is late, but hopefully early enough.
+    _init_logging(args.log_level)
+
+    # Translate these to the regular environment variables.
+    if args.trace:
+        os.environ["TRACE"] = args.trace
+
+    if args.trace_file:
+        os.environ["TRACEFILE"] = args.trace_file
+
+
 if __name__ == "__main__":
     keys: typing.Dict[str, str] = {}
     try:
@@ -1279,5 +1474,6 @@ if __name__ == "__main__":
     except Exception:
         pass
     args: argparse.Namespace = arg_parser(**keys).parse_args()
+    early_apply_args(args)
     validate_args(args)
     with_temp_cleanup(lambda: run_redex(args), args.always_clean_up)

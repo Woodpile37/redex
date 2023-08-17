@@ -11,13 +11,15 @@
 #include <unordered_set>
 #include <utility>
 
+#include <sparta/MonotonicFixpointIterator.h>
+
+#include "BaseIRAnalyzer.h"
 #include "ConcurrentContainers.h"
 #include "ConstantEnvironment.h"
 #include "IRCode.h"
 #include "InstructionAnalyzer.h"
 #include "KotlinNullCheckMethods.h"
 #include "MethodUtil.h"
-#include "MonotonicFixpointIterator.h"
 
 class DexMethodRef;
 
@@ -30,8 +32,7 @@ boost::optional<size_t> get_null_check_object_index(
 namespace intraprocedural {
 
 class FixpointIterator final
-    : public sparta::MonotonicFixpointIterator<cfg::GraphInterface,
-                                               ConstantEnvironment> {
+    : public ir_analyzer::BaseEdgeAwareIRAnalyzer<ConstantEnvironment> {
  public:
   /*
    * The fixpoint iterator takes an optional WholeProgramState argument that
@@ -41,27 +42,30 @@ class FixpointIterator final
                    InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
                    bool imprecise_switches = false);
 
-  ConstantEnvironment analyze_edge(
-      const EdgeId&,
-      const ConstantEnvironment& exit_state_at_source) const override;
-
-  void analyze_instruction(const IRInstruction* insn,
-                           ConstantEnvironment* env,
-                           bool is_last) const;
-
-  void analyze_instruction_no_throw(const IRInstruction* insn,
-                                    ConstantEnvironment* current_state) const;
-
-  void analyze_node(const NodeId& block,
-                    ConstantEnvironment* state_at_entry) const override;
-
   void clear_switch_succ_cache() const { m_switch_succs.clear(); }
+
+ protected:
+  void analyze_instruction_normal(const IRInstruction* insn,
+                                  ConstantEnvironment* env) const override;
+
+  void analyze_if(const IRInstruction* insn,
+                  cfg::Edge* const& edge,
+                  ConstantEnvironment* env) const override;
+
+  void analyze_switch(const IRInstruction* insn,
+                      cfg::Edge* const& edge,
+                      ConstantEnvironment* env) const override;
+
+  void analyze_no_throw(const IRInstruction* insn,
+                        ConstantEnvironment* env) const override;
 
  private:
   using SwitchSuccs = std::unordered_map<int32_t, uint32_t>;
   mutable std::unordered_map<cfg::Block*, SwitchSuccs> m_switch_succs;
   InstructionAnalyzer<ConstantEnvironment> m_insn_analyzer;
   const std::unordered_set<DexMethodRef*>& m_kotlin_null_check_assertions;
+  const DexMethodRef* m_redex_null_check_assertion;
+
   const bool m_imprecise_switches;
 
   const SwitchSuccs& find_switch_succs(cfg::Block* block) const {
@@ -141,6 +145,13 @@ class PrimitiveAnalyzer final
                                   ConstantEnvironment* env);
 };
 
+class InjectionIdAnalyzer final
+    : public InstructionAnalyzerBase<InjectionIdAnalyzer, ConstantEnvironment> {
+ public:
+  static bool analyze_injection_id(const IRInstruction* insn,
+                                   ConstantEnvironment* env);
+};
+
 // This is the most common use of constant propagation, so we define this alias
 // for our convenience.
 using ConstantPrimitiveAnalyzer =
@@ -169,9 +180,9 @@ class HeapEscapeAnalyzer final
  * Handle non-escaping arrays.
  *
  * This Analyzer should typically be used followed by the
- * HeapEscapeAnalyzer in a combined analysis -- LocalArrayAnalyzer only
- * handles the creation and mutation of array values, but does not account for
- * how they may escape.
+ * HeapEscapeAnalyzer in a combined analysis -- LocalArrayAnalyzer
+ * only handles the creation and mutation of array values, but does not account
+ * for how they may escape.
  */
 class LocalArrayAnalyzer final
     : public InstructionAnalyzerBase<LocalArrayAnalyzer, ConstantEnvironment> {
@@ -307,8 +318,12 @@ struct ImmutableAttributeAnalyzerState {
   ConcurrentSet<DexMethod*> attribute_methods;
   ConcurrentSet<DexField*> attribute_fields;
   std::unordered_map<DexMethod*, CachedBoxedObjects> cached_boxed_objects;
+  ConcurrentSet<DexType*> initialized_types;
+  mutable ConcurrentMap<DexType*, std::optional<bool>> may_be_initialized_types;
 
   ImmutableAttributeAnalyzerState();
+
+  // Immutable state should not be updated in parallel with analysis!
 
   Initializer& add_initializer(DexMethod* initialize_method, DexMethod* attr);
   Initializer& add_initializer(DexMethod* initialize_method, DexField* attr);
@@ -320,6 +335,8 @@ struct ImmutableAttributeAnalyzerState {
   bool is_jvm_cached_object(DexMethod* initialize_method, long value) const;
 
   static DexType* initialized_type(const DexMethod* initialize_method);
+
+  bool may_be_initialized_type(DexType* type) const;
 };
 
 class ImmutableAttributeAnalyzer final
@@ -383,6 +400,8 @@ class StringAnalyzer
     env->set(RESULT_REGISTER, StringDomain(insn->get_string()));
     return true;
   }
+
+  static bool analyze_invoke(const IRInstruction*, ConstantEnvironment*);
 };
 
 class ConstantClassObjectAnalyzer
@@ -413,6 +432,32 @@ class ApiLevelAnalyzer final
   static bool analyze_sget(const ApiLevelAnalyzerState& state,
                            const IRInstruction* insn,
                            ConstantEnvironment* env);
+};
+
+class NewObjectAnalyzer
+    : public InstructionAnalyzerBase<NewObjectAnalyzer,
+                                     ConstantEnvironment,
+                                     ImmutableAttributeAnalyzerState*> {
+  static bool ignore_type(const ImmutableAttributeAnalyzerState* state,
+                          DexType* type);
+
+ public:
+  static bool analyze_new_instance(const ImmutableAttributeAnalyzerState* state,
+                                   const IRInstruction* insn,
+                                   ConstantEnvironment* env);
+  static bool analyze_filled_new_array(
+      const ImmutableAttributeAnalyzerState* state,
+      const IRInstruction* insn,
+      ConstantEnvironment* env);
+  static bool analyze_new_array(const ImmutableAttributeAnalyzerState* state,
+                                const IRInstruction* insn,
+                                ConstantEnvironment* env);
+  static bool analyze_instance_of(const ImmutableAttributeAnalyzerState*,
+                                  const IRInstruction* insn,
+                                  ConstantEnvironment* env);
+  static bool analyze_array_length(const ImmutableAttributeAnalyzerState*,
+                                   const IRInstruction* insn,
+                                   ConstantEnvironment* env);
 };
 
 /*
@@ -556,7 +601,10 @@ using ConstantPrimitiveAndBoxedAnalyzer =
                                 ImmutableAttributeAnalyzer,
                                 EnumFieldAnalyzer,
                                 BoxedBooleanAnalyzer,
+                                StringAnalyzer,
                                 ApiLevelAnalyzer,
+                                ConstantClassObjectAnalyzer,
+                                NewObjectAnalyzer,
                                 PrimitiveAnalyzer>;
 
 } // namespace constant_propagation

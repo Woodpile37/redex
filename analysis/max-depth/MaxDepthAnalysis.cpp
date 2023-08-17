@@ -7,14 +7,15 @@
 
 #include "MaxDepthAnalysis.h"
 
-#include "AbstractDomain.h"
-#include "ConstantAbstractDomain.h"
+#include <sparta/AbstractDomain.h>
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/HashedSetAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+
 #include "ControlFlow.h"
 #include "DexClass.h"
-#include "HashedSetAbstractDomain.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
 #include "SpartaInterprocedural.h"
 
 namespace {
@@ -32,23 +33,19 @@ using namespace sparta_interprocedural;
 
 // Define an abstract domain as a summary for a method. The summary should
 // contain what properties we are interested in knowing such a method.
-struct DepthDomain : public AbstractDomain<DepthDomain> {
+struct DepthDomain final : public AbstractDomain<DepthDomain> {
   explicit DepthDomain() : m_depth(0), m_kind(sparta::AbstractValueKind::Top) {}
 
   explicit DepthDomain(unsigned i)
       : m_depth(i), m_kind(sparta::AbstractValueKind::Value) {}
 
-  bool is_bottom() const override {
-    return m_kind == sparta::AbstractValueKind::Bottom;
-  }
+  bool is_bottom() const { return m_kind == sparta::AbstractValueKind::Bottom; }
 
   bool is_value() const { return m_kind == sparta::AbstractValueKind::Value; }
 
-  bool is_top() const override {
-    return m_kind == sparta::AbstractValueKind::Top;
-  }
+  bool is_top() const { return m_kind == sparta::AbstractValueKind::Top; }
 
-  bool leq(const DepthDomain& other) const override {
+  bool leq(const DepthDomain& other) const {
     if (is_bottom()) {
       return true;
     } else if (m_kind == sparta::AbstractValueKind::Value) {
@@ -58,7 +55,7 @@ struct DepthDomain : public AbstractDomain<DepthDomain> {
     }
   }
 
-  bool equals(const DepthDomain& other) const override {
+  bool equals(const DepthDomain& other) const {
     if (m_kind != other.m_kind) {
       return false;
     } else {
@@ -68,14 +65,14 @@ struct DepthDomain : public AbstractDomain<DepthDomain> {
     }
   }
 
-  void set_to_bottom() override { not_reached(); }
-  virtual void set_value(unsigned depth) {
+  void set_to_bottom() { not_reached(); }
+  void set_value(unsigned depth) {
     m_kind = sparta::AbstractValueKind::Value;
     m_depth = depth;
   }
-  void set_to_top() override { m_kind = sparta::AbstractValueKind::Top; }
+  void set_to_top() { m_kind = sparta::AbstractValueKind::Top; }
 
-  void join_with(const DepthDomain& other) override {
+  void join_with(const DepthDomain& other) {
     if (is_bottom() || other.is_top()) {
       *this = other;
     } else if (is_value() && other.is_value()) {
@@ -85,13 +82,13 @@ struct DepthDomain : public AbstractDomain<DepthDomain> {
     }
   }
 
-  void widen_with(const DepthDomain& other) override { join_with(other); }
+  void widen_with(const DepthDomain& other) { join_with(other); }
 
-  void meet_with(const DepthDomain& /* other */) override {
+  void meet_with(const DepthDomain& /* other */) {
     throw std::runtime_error("meet_with not implemented!");
   }
 
-  void narrow_with(const DepthDomain& /* other */) override {
+  void narrow_with(const DepthDomain& /* other */) {
     throw std::runtime_error("narrow_with not implemented!");
   }
 

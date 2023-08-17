@@ -154,6 +154,11 @@ class Assessor {
         if (it->type == MFLOW_POSITION) {
           positions.insert(it->pos.get());
           last_position = it->pos.get();
+          always_assert_log(
+              last_position->file != nullptr,
+              "%s has a position with no file string assigned.\n%s\n",
+              SHOW(method),
+              SHOW(cfg));
           if (last_position->line == 0 &&
               last_position->file == m_unknown_source) {
             any_unknown_source_position = true;
@@ -327,8 +332,10 @@ DexAssessment DexScopeAssessor::run() {
     std::atomic<size_t> methods_without_deobfuscated_name{0};
     std::atomic<size_t> num_methods{0};
     std::atomic<size_t> methods_with_code{0};
+    std::atomic<size_t> huge_methods{0};
     std::atomic<size_t> num_instructions{0};
     std::atomic<size_t> sum_opcodes{0};
+    std::atomic<size_t> code_units{0};
     std::atomic<size_t> with_annotations{0};
     std::atomic<size_t> sum_annotations{0};
     std::atomic<size_t> with_param_annotations{0};
@@ -366,8 +373,22 @@ DexAssessment DexScopeAssessor::run() {
     method_stats.methods_with_code.fetch_add(1, std::memory_order_relaxed);
     method_stats.num_instructions.fetch_add(code->count_opcodes(),
                                             std::memory_order_relaxed);
-    method_stats.sum_opcodes.fetch_add(code->sum_opcode_sizes(),
+    auto sum_opcode_sizes = code->sum_opcode_sizes();
+    if (code->editable_cfg_built()) {
+      sum_opcode_sizes += code->cfg().get_size_adjustment();
+    }
+    method_stats.sum_opcodes.fetch_add(sum_opcode_sizes,
                                        std::memory_order_relaxed);
+    auto code_units = code->estimate_code_units();
+    if (code->editable_cfg_built()) {
+      code_units += code->cfg().get_size_adjustment();
+    }
+    method_stats.code_units.fetch_add(code_units, std::memory_order_relaxed);
+    if (code_units > 9000) {
+      // Why 9000? Because that's the default cut-off for SplitHugeSwitchPass to
+      // start splitting.
+      method_stats.huge_methods.fetch_add(1, std::memory_order_relaxed);
+    }
   });
 
   dex_position::Assessor dex_position_assessor;
@@ -418,8 +439,10 @@ DexAssessment DexScopeAssessor::run() {
   res["num_methods"] = method_stats.num_methods.load();
   res["num_fields"] = field_stats.num_fields.load();
   res["methods~with~code"] = method_stats.methods_with_code.load();
+  res["huge~methods"] = method_stats.huge_methods.load();
   res["num_instructions"] = method_stats.num_instructions.load();
   res["sum_opcodes"] = method_stats.sum_opcodes.load();
+  res["code_units"] = method_stats.code_units.load();
 
   res["methods.with_annotations"] = method_stats.with_annotations.load();
   res["methods.sum_annotations"] = method_stats.sum_annotations.load();

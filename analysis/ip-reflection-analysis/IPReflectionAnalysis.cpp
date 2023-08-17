@@ -9,12 +9,13 @@
 
 #include <fstream>
 
-#include "AbstractDomain.h"
+#include <sparta/AbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/PatriciaTreeMapAbstractPartition.h>
+
 #include "CallGraph.h"
 #include "ConfigFiles.h"
 #include "MethodOverrideGraph.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "PatriciaTreeMapAbstractPartition.h"
 #include "Resolver.h"
 #include "Show.h"
 #include "SpartaInterprocedural.h"
@@ -47,20 +48,16 @@ struct Caller {
   }
 };
 
-struct Summary : public AbstractDomain<Summary> {
+struct Summary final : public AbstractDomain<Summary> {
   explicit Summary() : m_return(reflection::AbstractObjectDomain::bottom()) {}
 
-  bool is_bottom() const override {
-    return m_kind == sparta::AbstractValueKind::Bottom;
-  }
+  bool is_bottom() const { return m_kind == sparta::AbstractValueKind::Bottom; }
 
   bool is_value() const { return m_kind == sparta::AbstractValueKind::Value; }
 
-  bool is_top() const override {
-    return m_kind == sparta::AbstractValueKind::Top;
-  }
+  bool is_top() const { return m_kind == sparta::AbstractValueKind::Top; }
 
-  bool leq(const Summary& other) const override {
+  bool leq(const Summary& other) const {
     if (is_bottom()) {
       return true;
     } else if (m_kind == sparta::AbstractValueKind::Value) {
@@ -70,7 +67,7 @@ struct Summary : public AbstractDomain<Summary> {
     }
   }
 
-  bool equals(const Summary& other) const override {
+  bool equals(const Summary& other) const {
     if (m_kind != other.m_kind) {
       return false;
     } else {
@@ -80,7 +77,7 @@ struct Summary : public AbstractDomain<Summary> {
     }
   }
 
-  void set_to_bottom() override { not_reached(); }
+  void set_to_bottom() { not_reached(); }
 
   void set_value(reflection::AbstractObjectDomain retval) {
     m_kind = sparta::AbstractValueKind::Value;
@@ -105,21 +102,21 @@ struct Summary : public AbstractDomain<Summary> {
     return m_reflection_sites;
   }
 
-  void set_to_top() override { m_kind = sparta::AbstractValueKind::Top; }
+  void set_to_top() { m_kind = sparta::AbstractValueKind::Top; }
 
-  void join_with(const Summary& /* other */) override {
+  void join_with(const Summary& /* other */) {
     throw std::runtime_error("join_with not implemented!");
   }
 
-  void widen_with(const Summary& /* other */) override {
+  void widen_with(const Summary& /* other */) {
     throw std::runtime_error("widen_with not implemented!");
   }
 
-  void meet_with(const Summary& /* other */) override {
+  void meet_with(const Summary& /* other */) {
     throw std::runtime_error("meet_with not implemented!");
   }
 
-  void narrow_with(const Summary& /* other */) override {
+  void narrow_with(const Summary& /* other */) {
     throw std::runtime_error("narrow_with not implemented!");
   }
 

@@ -56,8 +56,22 @@ class PrintKotlinStats : public Pass {
   };
 
   PrintKotlinStats() : Pass("PrintKotlinStatsPass") {}
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+        {UltralightCodePatterns, Preserves},
+    };
+  }
+
   void setup();
   void eval_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
   Stats handle_method(DexMethod* method);
   Stats handle_class(DexClass* cls);

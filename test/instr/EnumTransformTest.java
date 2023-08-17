@@ -10,7 +10,7 @@ package redex;
 import java.util.Random;
 import javax.annotation.Nullable;
 import org.junit.Test;
-import static org.fest.assertions.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 // POSTCHECK-LABEL: class: redex.$EnumUtils
 // POSTCHECK-NEXT: Access flags: (PUBLIC, FINAL)
@@ -210,6 +210,14 @@ enum USED_AS_CLASS_OBJECT {
   public static <T> void method(Class<T> c) {}
   public static void method() { method(USED_AS_CLASS_OBJECT.class); }
 }
+// CHECK: class: redex.USED_IN_INSTANCE_OF
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum USED_IN_INSTANCE_OF {
+  ONE;
+  public static void method(boolean b) {}
+  public static void method() { method(ONE instanceof USED_IN_INSTANCE_OF); }
+}
 // CHECK: class: redex.CAST_CHECK_CAST
 // CHECK-NEXT: Access flags:
 // CHECK-NEXT: Superclass: java.lang.Enum
@@ -287,6 +295,7 @@ class EnumHelper {
   public void aput_method() {
     Object[] array = new Object[10];
     array[0] = CAST_APUT_OBJECT.ONE;
+    s_obj = CAST_APUT_OBJECT.ONE;
   }
 
   public static int my_ordinal(SCORE score) { return score.ordinal(); }

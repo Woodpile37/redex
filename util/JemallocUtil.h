@@ -5,7 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 
 namespace jemalloc_util {
@@ -27,5 +29,8 @@ class ScopedProfiling final {
 
   ~ScopedProfiling() { disable_profiling(); }
 };
+
+std::string get_malloc_stats();
+void some_malloc_stats(const std::function<void(const char*, uint64_t)>& fn);
 
 } // namespace jemalloc_util

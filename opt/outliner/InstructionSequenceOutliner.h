@@ -16,6 +16,7 @@ struct Config {
   size_t min_insns_size{3};
   size_t max_insns_size{77};
   bool reorder_with_method_profiles{true};
+  bool derive_method_profiles_stats{false};
   bool reuse_outlined_methods_across_dexes{true};
   size_t max_outlined_methods_per_class{100};
   size_t savings_threshold{10};
@@ -24,6 +25,7 @@ struct Config {
   bool debug_make_crashing{false};
   ProfileGuidanceConfig profile_guidance;
   bool outline_control_flow{true};
+  bool obfuscate_method_names{false};
 };
 
 } // namespace outliner
@@ -32,7 +34,21 @@ class InstructionSequenceOutliner : public Pass {
  public:
   InstructionSequenceOutliner() : Pass("InstructionSequenceOutlinerPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, RequiresAndEstablishes},
+        {NoSpuriousGetClassCalls, Establishes},
+    };
+  }
+
   void bind_config() override;
+
+  bool is_cfg_legacy() override { return true; }
+
   void run_pass(DexStoresVector& stores,
                 ConfigFiles& config,
                 PassManager& mgr) override;

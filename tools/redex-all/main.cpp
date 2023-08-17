@@ -5,12 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "json/value.h"
 #include <boost/thread/thread.hpp>
 #include <cinttypes>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <regex>
 #include <set>
@@ -34,10 +36,10 @@
 #include <boost/program_options.hpp>
 #include <json/json.h>
 
-#include "ABExperimentContext.h"
 #include "AggregateException.h"
 #include "CommandProfiling.h"
 #include "CommentFilter.h"
+#include "ConfigFiles.h"
 #include "ControlFlow.h" // To set DEBUG.
 #include "Debug.h"
 #include "DexClass.h"
@@ -64,8 +66,12 @@
 #include "ProguardPrintConfiguration.h" // New ProGuard configuration
 #include "ReachableClasses.h"
 #include "RedexContext.h"
+#include "RedexPropertiesManager.h"
+#include "RedexPropertyCheckerRegistry.h"
 #include "RedexResources.h"
+#include "Sanitizers.h"
 #include "SanitizersConfig.h"
+#include "ScopedMemStats.h"
 #include "Show.h"
 #include "Timer.h"
 #include "ToolsCommon.h"
@@ -100,6 +106,8 @@ struct Arguments {
   Json::Value entry_data;
   boost::optional<int> stop_pass_idx;
   RedexOptions redex_options;
+  bool properties_check{false};
+  bool properties_check_allow_disabled{false};
 };
 
 UNUSED void dump_args(const Arguments& args) {
@@ -172,11 +180,10 @@ bool add_value_to_config(Json::Value& config,
 
 Json::Value default_config() {
   const auto passes = {
-      "ReBindRefsPass",        "BridgePass",
-      "FinalInlinePassV2",     "DelSuperPass",
-      "SingleImplPass",        "MethodInlinePass",
-      "StaticReloPassV2",      "RemoveEmptyClassesPass",
-      "ShortenSrcStringsPass", "RegAllocPass",
+      "ReBindRefsPass",   "BridgeSynthInlinePass",  "FinalInlinePassV2",
+      "DelSuperPass",     "SingleImplPass",         "MethodInlinePass",
+      "StaticReloPassV2", "RemoveEmptyClassesPass", "ShortenSrcStringsPass",
+      "RegAllocPass",
   };
   std::istringstream temp_json("{\"redex\":{\"passes\":[]}}");
   Json::Value cfg;
@@ -231,6 +238,75 @@ Json::Value reflect_config(const Configurable::Reflection& cr) {
   return reflected_config;
 }
 
+void add_pass_properties_reflection(Json::Value& value, Pass* pass) {
+  auto interactions = pass->get_property_interactions();
+  if (interactions.empty()) {
+    return;
+  }
+
+  Json::Value establishes = Json::arrayValue;
+  Json::Value requires_ = Json::arrayValue;
+  Json::Value preserves = Json::arrayValue;
+  Json::Value requires_finally = Json::arrayValue;
+
+  for (const auto& [property, inter] : interactions) {
+    if (inter.establishes) {
+      establishes.append(property);
+    }
+    if (inter.requires_) {
+      requires_.append(property);
+    }
+    if (inter.preserves) {
+      preserves.append(property);
+    }
+    if (inter.requires_finally) {
+      requires_finally.append(property);
+    }
+  }
+
+  Json::Value properties;
+  properties["establishes"] = establishes;
+  properties["requires"] = requires_;
+  properties["preserves"] = preserves;
+  properties["requires_finally"] = requires_finally;
+
+  value["properties"] = properties;
+}
+
+Json::Value reflect_property_definitions() {
+  Json::Value properties;
+
+  properties["properties"] = []() {
+    Json::Value prop_map;
+    auto all = redex_properties::Manager::get_all_properties();
+    for (auto& prop : all) {
+      Json::Value prop_value;
+      prop_value["negative"] = redex_properties::Manager::is_negative(prop);
+      prop_map[prop] = std::move(prop_value);
+    }
+    return prop_map;
+  }();
+
+  auto create_sorted = [](const auto& input) {
+    std::vector<redex_properties::PropertyName> tmp;
+    std::copy(input.begin(), input.end(), std::back_inserter(tmp));
+    std::sort(tmp.begin(), tmp.end());
+
+    Json::Value holder = Json::arrayValue;
+    for (auto& prop : tmp) {
+      holder.append(prop);
+    }
+    return holder;
+  };
+
+  properties["initial"] =
+      create_sorted(redex_properties::Manager::get_default_initial());
+  properties["final"] =
+      create_sorted(redex_properties::Manager::get_default_final());
+
+  return properties;
+}
+
 Arguments parse_args(int argc, char* argv[]) {
   Arguments args;
   args.out_dir = ".";
@@ -241,6 +317,11 @@ Arguments parse_args(int argc, char* argv[]) {
   od.add_options()("help,h", "print this help message");
   od.add_options()("reflect-config",
                    "print a reflection of the config and exit");
+  od.add_options()(
+      "properties-check",
+      "parse configuration, perform a stack properties check and exit");
+  od.add_options()("properties-check-allow-disabled",
+                   "accept the disable flag in the configuration");
   od.add_options()("apkdir,a",
                    // We allow overwrites to most of the options but will take
                    // only the last one.
@@ -289,10 +370,9 @@ Arguments parse_args(int argc, char* argv[]) {
           ->default_value(false),
       "If specified, states that the current run disables dex hasher.\n");
   od.add_options()(
-      "redacted",
-      po::bool_switch(&args.redex_options.redacted)->default_value(false),
-      "If specified then resulting dex files will have class data placed at"
-      " the end of the file, i.e. last map item entry just before map list.\n");
+      "post-lowering",
+      po::bool_switch(&args.redex_options.post_lowering)->default_value(false),
+      "If specified, post lowering steps are run.\n");
   od.add_options()(
       "arch,A",
       po::value<std::vector<std::string>>(),
@@ -370,8 +450,12 @@ Arguments parse_args(int argc, char* argv[]) {
     for (size_t i = 0; i < passes.size(); ++i) {
       auto& pass = passes[i];
       pass_configs[static_cast<int>(i)] = reflect_config(pass->reflect());
+      add_pass_properties_reflection(pass_configs[static_cast<int>(i)], pass);
     }
     reflected_config["passes"] = pass_configs;
+
+    reflected_config["properties"] = reflect_property_definitions();
+
     std::cout << reflected_config << std::flush;
     exit(EXIT_SUCCESS);
   }
@@ -385,9 +469,16 @@ Arguments parse_args(int argc, char* argv[]) {
     exit(EXIT_SUCCESS);
   }
 
+  if (vm.count("properties-check")) {
+    args.properties_check = true;
+  }
+  if (vm.count("properties-check-allow-disabled")) {
+    args.properties_check_allow_disabled = true;
+  }
+
   if (vm.count("dex-files")) {
     args.dex_files = vm["dex-files"].as<std::vector<std::string>>();
-  } else {
+  } else if (!args.properties_check) {
     std::cerr << "error: no input dex files" << std::endl << std::endl;
     print_usage();
     exit(EXIT_SUCCESS);
@@ -669,9 +760,72 @@ Json::Value get_pass_hashes(const PassManager& mgr) {
 }
 
 Json::Value get_lowering_stats(const instruction_lowering::Stats& stats) {
+  using namespace instruction_lowering;
+
   Json::Value obj(Json::ValueType::objectValue);
   obj["num_2addr_instructions"] = Json::UInt(stats.to_2addr);
   obj["num_move_added_for_check_cast"] = Json::UInt(stats.move_for_check_cast);
+
+  if (!stats.sparse_switches.data.empty()) {
+    // Some statistics.
+    Json::Value sparse_switches(Json::ValueType::objectValue);
+    sparse_switches["min"] =
+        Json::UInt(stats.sparse_switches.data.begin()->first);
+    sparse_switches["max"] =
+        Json::UInt(stats.sparse_switches.data.rbegin()->first);
+    sparse_switches["avg100"] = Json::UInt([&]() {
+      size_t cnt = 0;
+      size_t sum = 0;
+      for (auto& p : stats.sparse_switches.data) {
+        cnt += p.second.all;
+        sum += p.second.all * p.first;
+      }
+      return sum * 100 / cnt;
+    }());
+
+    auto span = stats.sparse_switches.data.rbegin()->first -
+                stats.sparse_switches.data.begin()->first;
+    constexpr size_t kBuckets = 10;
+    if (span > kBuckets) {
+      const auto first = stats.sparse_switches.data.begin()->first;
+      const auto last = stats.sparse_switches.data.rbegin()->first;
+
+      auto it = stats.sparse_switches.data.begin();
+      auto end = stats.sparse_switches.data.end();
+      Json::Value buckets(Json::ValueType::objectValue);
+
+      auto per_bucket = span / kBuckets;
+      size_t cur_bucket_start = it->first;
+      for (size_t i = 0; i != kBuckets; ++i) {
+        auto start_size = first + i * per_bucket;
+        auto end_size = first + (i + 1) * per_bucket;
+        if (i == kBuckets - 1) {
+          end_size = last + 1;
+        }
+        redex_assert(it->first >= start_size);
+        redex_assert(end_size > start_size);
+
+        Stats::SparseSwitches::Data tmp{};
+        for (; it != end && it->first < end_size; ++it) {
+          tmp += it->second;
+        }
+
+        if (tmp.all != 0) {
+          Json::Value bucket(Json::ValueType::objectValue);
+          bucket["all"] = Json::UInt(tmp.all);
+          bucket["in_hot_methods"] = Json::UInt(tmp.in_hot_methods);
+          bucket["min"] = Json::UInt(start_size);
+          bucket["max"] = Json::UInt(end_size);
+          buckets[std::to_string(i)] = bucket;
+        }
+      }
+      redex_assert(it == end);
+      sparse_switches["buckets"] = buckets;
+    }
+
+    obj["sparse_switches"] = sparse_switches;
+  }
+
   return obj;
 }
 
@@ -713,15 +867,29 @@ Json::Value get_input_stats(const dex_stats_t& stats,
   return d;
 }
 
+Json::Value get_output_dexes_stats(
+    const std::vector<std::pair<std::string, enhanced_dex_stats_t>>&
+        dexes_stats) {
+  Json::Value dexes;
+  int i = 0;
+  for (const auto& [store_name, stats] : dexes_stats) {
+    dexes[i] = get_stats(stats);
+    dexes[i]["store_name"] = store_name;
+    ++i;
+  }
+  return dexes;
+}
+
 Json::Value get_output_stats(
     const dex_stats_t& stats,
-    const std::vector<dex_stats_t>& dexes_stats,
+    const std::vector<std::pair<std::string, enhanced_dex_stats_t>>&
+        dexes_stats,
     const PassManager& mgr,
     const instruction_lowering::Stats& instruction_lowering_stats,
     const PositionMapper* pos_mapper) {
   Json::Value d;
   d["total_stats"] = get_stats(stats);
-  d["dexes_stats"] = get_detailed_stats(dexes_stats);
+  d["dexes_stats"] = get_output_dexes_stats(dexes_stats);
   d["pass_stats"] = get_pass_stats(mgr);
   d["pass_hashes"] = get_pass_hashes(mgr);
   d["lowering_stats"] = get_lowering_stats(instruction_lowering_stats);
@@ -872,6 +1040,45 @@ void dump_keep_reasons(const ConfigFiles& conf,
   }
 }
 
+void process_proguard_rules(ConfigFiles& conf,
+                            Scope& scope,
+                            Scope& external_classes,
+                            keep_rules::ProguardConfiguration& pg_config) {
+  bool keep_all_annotation_classes;
+  conf.get_json_config().get("keep_all_annotation_classes", true,
+                             keep_all_annotation_classes);
+
+  ConcurrentSet<const keep_rules::KeepSpec*> unused_rules =
+      process_proguard_rules(conf.get_proguard_map(), scope, external_classes,
+                             pg_config, keep_all_annotation_classes);
+  if (!unused_rules.empty()) {
+    std::vector<std::string> out;
+    for (const keep_rules::KeepSpec* keep_rule : unused_rules) {
+      out.push_back(keep_rules::show_keep(*keep_rule));
+    }
+    // Make output deterministic
+    std::sort(out.begin(), out.end());
+    bool unused_rule_abort;
+    conf.get_json_config().get("unused_keep_rule_abort", false,
+                               unused_rule_abort);
+    always_assert_log(!unused_rule_abort, "%s",
+                      [&]() {
+                        std::string tmp;
+                        for (const auto& s : out) {
+                          tmp += s;
+                          tmp += " not used\n";
+                        }
+                        return tmp;
+                      }()
+                          .c_str());
+
+    std::ofstream ofs{conf.metafile("redex-unused-keep-rules.txt")};
+    for (const auto& s : out) {
+      ofs << s << "\n";
+    }
+  }
+}
+
 /**
  * Pre processing steps: load dex and configurations
  */
@@ -909,6 +1116,24 @@ void redex_frontend(ConfigFiles& conf, /* input */
           keep_rules::proguard_parser::remove_default_blocklisted_rules(
               &pg_config);
     }
+
+    always_assert(!pg_conf.fail_on_unknown_commands ||
+                  parser_stats.unknown_commands == 0);
+  }
+
+  // WARNING: No further modifications of pg_config should happen after this
+  // call
+  // TODO: T148153725: [redex] Better encapsulate ProguardConfiguration
+  // construction
+  keep_rules::proguard_parser::identify_blanket_native_rules(&pg_config);
+
+  auto ignore_no_keep_rules =
+      args.config.get("ignore_no_keep_rules", false).asBool();
+  if (pg_config.keep_rules.empty() && !ignore_no_keep_rules) {
+    std::cerr << "error: No ProGuard keep rules provided. Redex optimizations "
+                 "will not preserve semantics without accurate keep rules."
+              << std::endl;
+    exit(EXIT_FAILURE);
   }
 
   {
@@ -917,8 +1142,12 @@ void redex_frontend(ConfigFiles& conf, /* input */
     d["parse_errors"] = (u64)parser_stats.parse_errors;
     d["unknown_tokens"] = (u64)parser_stats.unknown_tokens;
     d["unimplemented"] = (u64)parser_stats.unimplemented;
+    d["unknown_commands"] = (u64)parser_stats.unknown_commands;
     d["ok"] = (u64)(pg_config.ok ? 1 : 0);
     d["blocklisted_rules"] = (u64)blocklisted_rules;
+    d["blanket_native_rules"] = (u64)(std::distance(
+        pg_config.keep_rules_native_begin.value_or(pg_config.keep_rules.end()),
+        pg_config.keep_rules.end()));
     stats["proguard"] = d;
   }
 
@@ -995,40 +1224,6 @@ void redex_frontend(ConfigFiles& conf, /* input */
   DexStoreClassesIterator it(stores);
   Scope scope = build_class_scope(it);
   {
-    Timer t("Processing proguard rules");
-
-    bool keep_all_annotation_classes;
-    json_config.get("keep_all_annotation_classes", true,
-                    keep_all_annotation_classes);
-
-    ConcurrentSet<const keep_rules::KeepSpec*> unused_rules =
-        process_proguard_rules(conf.get_proguard_map(), scope, external_classes,
-                               pg_config, keep_all_annotation_classes);
-    if (unused_rules.size() > 0) {
-      std::vector<std::string> out;
-      for (const keep_rules::KeepSpec* keep_rule : unused_rules) {
-        out.push_back(keep_rules::show_keep(*keep_rule));
-      }
-      // Make output deterministic
-      std::sort(out.begin(), out.end());
-      bool unused_rule_abort;
-      conf.get_json_config().get("unused_keep_rule_abort", false,
-                                 unused_rule_abort);
-      if (unused_rule_abort) {
-        exit(1);
-        for (const auto& s : out) {
-          fprintf(stderr, "%s not used\n", s.c_str());
-        }
-      }
-      auto fd =
-          fopen(conf.metafile("redex-unused-keep-rules.txt").c_str(), "w");
-      for (const auto& s : out) {
-        fprintf(fd, "%s\n", s.c_str());
-      }
-      fclose(fd);
-    }
-  }
-  {
     Timer t("No Optimizations Rules");
     // this will change rstate of methods
     keep_rules::process_no_optimizations_rules(
@@ -1040,9 +1235,41 @@ void redex_frontend(ConfigFiles& conf, /* input */
     // init reachable will change rstate of classes, methods and fields
     init_reachable_classes(scope, ReachableClassesConfig(json_config));
   }
+  {
+    Timer t("Processing proguard rules");
+    process_proguard_rules(conf, scope, external_classes, pg_config);
+  }
+
+  TRACE(NATIVE, 2, "Blanket native classes: %zu",
+        g_redex->blanket_native_root_classes.size());
+  TRACE(NATIVE, 2, "Blanket native methods: %zu",
+        g_redex->blanket_native_root_methods.size());
 
   if (keep_reason::Reason::record_keep_reasons()) {
     dump_keep_reasons(conf, args, stores);
+  }
+}
+
+// Performa check for resources that must exist for app to behave correctly,
+// crash the build if they fail to present.
+void check_required_resources(ConfigFiles& conf, bool pre_run) {
+  std::vector<std::string> check_required_resources;
+  conf.get_json_config().get("check_required_resources", {},
+                             check_required_resources);
+  if (check_required_resources.empty()) {
+    return;
+  }
+
+  std::string apk_dir;
+  conf.get_json_config().get("apk_dir", "", apk_dir);
+  TRACE(MAIN, 1, "Validating resources.");
+  auto resources = create_resource_reader(apk_dir);
+  auto res_table = resources->load_res_table();
+  for (const auto& required_resource : check_required_resources) {
+    always_assert_log(res_table->name_to_ids.count(required_resource) != 0,
+                      "Required resource %s does not exist in %s apk",
+                      required_resource.c_str(),
+                      pre_run ? "input" : "final");
   }
 }
 
@@ -1066,7 +1293,9 @@ void finalize_resource_table(ConfigFiles& conf) {
   TRACE(MAIN, 1, "Finalizing resource table.");
   auto resources = create_resource_reader(apk_dir);
   auto res_table = resources->load_res_table();
-  res_table->remove_unreferenced_strings();
+  auto global_resources_config =
+      conf.get_global_config().get_config_by_name<ResourceConfig>("resources");
+  res_table->finalize_resource_table(*global_resources_config);
 }
 
 /**
@@ -1081,6 +1310,7 @@ void redex_backend(ConfigFiles& conf,
   const auto& output_dir = conf.get_outdir();
 
   finalize_resource_table(conf);
+  check_required_resources(conf, false);
 
   instruction_lowering::Stats instruction_lowering_stats;
   {
@@ -1088,8 +1318,10 @@ void redex_backend(ConfigFiles& conf,
     conf.get_json_config().get("lower_with_cfg", true, lower_with_cfg);
     Timer t("Instruction lowering");
     instruction_lowering_stats =
-        instruction_lowering::run(stores, lower_with_cfg);
+        instruction_lowering::run(stores, lower_with_cfg, &conf);
   }
+
+  sanitizers::lsan_do_recoverable_leak_check();
 
   TRACE(MAIN, 1, "Writing out new DexClasses...");
   const JsonWrapper& json_config = conf.get_json_config();
@@ -1101,8 +1333,8 @@ void redex_backend(ConfigFiles& conf,
     locator_index = new LocatorIndex(make_locator_index(stores));
   }
 
-  dex_stats_t output_totals;
-  std::vector<dex_stats_t> output_dexes_stats;
+  enhanced_dex_stats_t output_totals;
+  std::vector<std::pair<std::string, enhanced_dex_stats_t>> output_dexes_stats;
 
   const std::string& line_number_map_filename = conf.metafile(LINE_NUMBER_MAP);
   const std::string& debug_line_map_filename = conf.metafile(DEBUG_LINE_MAP);
@@ -1127,66 +1359,89 @@ void redex_backend(ConfigFiles& conf,
 
   std::set<uint32_t> signatures;
   std::unique_ptr<PostLowering> post_lowering =
-      redex_options.redacted ? PostLowering::create() : nullptr;
-  bool symbolicate_detached_methods;
-  conf.get_json_config().get("symbolicate_detached_methods", false,
-                             symbolicate_detached_methods);
+      redex_options.post_lowering ? PostLowering::create() : nullptr;
 
-  if (post_lowering) {
-    post_lowering->sync();
-  }
+  const bool mem_stats_enabled =
+      traceEnabled(STATS, 1) || conf.get_json_config().get("mem_stats", true);
+  const bool reset_hwm = conf.get_json_config().get("mem_stats_per_pass", true);
 
   if (is_iodi(dik)) {
     Timer t("Compute initial IODI metadata");
-    iodi_metadata.mark_methods(stores);
+    ScopedMemStats iodi_mem_stats{mem_stats_enabled, reset_hwm};
+    iodi_metadata.mark_methods(stores,
+                               dik == DebugInfoKind::InstructionOffsetsLayered);
+    iodi_mem_stats.trace_log("Compute initial IODI metadata");
   }
-  for (size_t store_number = 0; store_number < stores.size(); ++store_number) {
-    auto& store = stores[store_number];
-    Timer t("Writing optimized dexes");
-    for (size_t i = 0; i < store.get_dexen().size(); i++) {
-      auto gtypes = std::make_shared<GatheredTypes>(&store.get_dexen()[i]);
 
-      if (post_lowering) {
-        post_lowering->load_dex_indexes(
-            conf, manager.get_redex_options().min_sdk, &store.get_dexen()[i],
-            *gtypes, store.get_name(), i);
+  const auto& dex_output_config =
+      *conf.get_global_config().get_config_by_name<DexOutputConfig>(
+          "dex_output");
+
+  auto string_sort_mode = get_string_sort_mode(conf);
+
+  bool should_preserve_input_dexes =
+      conf.get_json_config().get("preserve_input_dexes", false);
+  if (should_preserve_input_dexes) {
+    always_assert_log(
+        !post_lowering,
+        "post lowering should be off when preserving input dex option is on");
+    TRACE(MAIN, 1, "Skipping writing output dexes as configured");
+  } else {
+    redex_assert(!stores.empty());
+    const auto& dex_magic = stores[0].get_dex_magic();
+    auto min_sdk = manager.get_redex_options().min_sdk;
+    ScopedMemStats wod_mem_stats{mem_stats_enabled, reset_hwm};
+    for (size_t store_number = 0; store_number < stores.size();
+         ++store_number) {
+      auto& store = stores[store_number];
+      const auto& store_name = store.get_name();
+      auto code_sort_mode = get_code_sort_mode(conf, store_name);
+      Timer t("Writing optimized dexes");
+      for (size_t i = 0; i < store.get_dexen().size(); i++) {
+        DexClasses* classes = &store.get_dexen()[i];
+        auto gtypes = std::make_shared<GatheredTypes>(classes);
+
+        if (post_lowering) {
+          post_lowering->load_dex_indexes(conf, min_sdk, classes, *gtypes,
+                                          store_name, i);
+        }
+
+        auto this_dex_stats = write_classes_to_dex(
+            redex::get_dex_output_name(output_dir, store, i),
+            classes,
+            gtypes,
+            locator_index,
+            store_number,
+            &store_name,
+            i,
+            conf,
+            pos_mapper.get(),
+            redex_options.debug_info_kind,
+            needs_addresses ? &method_to_id : nullptr,
+            needs_addresses ? &code_debug_lines : nullptr,
+            is_iodi(dik) ? &iodi_metadata : nullptr,
+            dex_magic,
+            dex_output_config,
+            min_sdk,
+            code_sort_mode,
+            string_sort_mode);
+
+        output_totals += this_dex_stats;
+        // Remove class sizes here to free up memory.
+        this_dex_stats.class_size.clear();
+        signatures.insert(
+            *reinterpret_cast<uint32_t*>(this_dex_stats.signature));
+        output_dexes_stats.push_back(
+            std::make_pair(store.get_name(), std::move(this_dex_stats)));
       }
-
-      auto this_dex_stats = write_classes_to_dex(
-          redex_options,
-          redex::get_dex_output_name(output_dir, store, i),
-          &store.get_dexen()[i],
-          gtypes,
-          locator_index,
-          store_number,
-          &store.get_name(),
-          i,
-          conf,
-          pos_mapper.get(),
-          needs_addresses ? &method_to_id : nullptr,
-          needs_addresses ? &code_debug_lines : nullptr,
-          is_iodi(dik) ? &iodi_metadata : nullptr,
-          stores[0].get_dex_magic(),
-          symbolicate_detached_methods ? post_lowering.get() : nullptr,
-          manager.get_redex_options().min_sdk);
-
-      output_totals += this_dex_stats;
-      output_dexes_stats.push_back(this_dex_stats);
-      signatures.insert(*reinterpret_cast<uint32_t*>(this_dex_stats.signature));
     }
+    wod_mem_stats.trace_log("Writing optimized dexes");
   }
+
+  sanitizers::lsan_do_recoverable_leak_check();
 
   std::vector<DexMethod*> needs_debug_line_mapping;
   if (post_lowering) {
-    if (symbolicate_detached_methods) {
-      post_lowering->emit_symbolication_metadata(
-          pos_mapper.get(),
-          needs_addresses ? &method_to_id : nullptr,
-          needs_addresses ? &code_debug_lines : nullptr,
-          is_iodi(dik) ? &iodi_metadata : nullptr,
-          needs_debug_line_mapping,
-          signatures);
-    }
     post_lowering->run(stores);
     post_lowering->finalize(manager.asset_manager());
   }
@@ -1222,6 +1477,21 @@ void redex_backend(ConfigFiles& conf,
         get_output_stats(output_totals, output_dexes_stats, manager,
                          instruction_lowering_stats, pos_mapper.get());
     print_warning_summary();
+
+    if (dex_output_config.write_class_sizes) {
+      Timer t2("Writing class sizes");
+      // Sort for stability.
+      std::vector<const DexClass*> keys;
+      std::transform(output_totals.class_size.begin(),
+                     output_totals.class_size.end(), std::back_inserter(keys),
+                     [](const auto& p) { return p.first; });
+      std::sort(keys.begin(), keys.end(), compare_dexclasses);
+      std::ofstream ofs{conf.metafile("redex-class-sizes.csv")};
+      for (auto* c : keys) {
+        ofs << c->get_deobfuscated_name_or_empty() << ","
+            << output_totals.class_size.at(c) << "\n";
+      }
+    }
   }
 }
 
@@ -1329,8 +1599,61 @@ void copy_proguard_stats(Json::Value& stats) {
   }
 }
 
+int check_pass_properties(const Arguments& args) {
+  // Cannot parse GlobalConfig nor passes, as they may require binding
+  // to dex elements. So this looks more complicated than necessary.
+
+  ConfigFiles conf(args.config, args.out_dir);
+
+  PassManagerConfig pmc;
+  if (conf.get_json_config().contains("pass_manager")) {
+    pmc.parse_config(JsonWrapper(conf.get_json_config().get(
+        "pass_manager", (Json::Value)Json::nullValue)));
+  }
+
+  if (!pmc.check_pass_order_properties &&
+      args.properties_check_allow_disabled) {
+    std::cout << "Properties checks are disabled, skipping." << std::endl;
+    return 0;
+  }
+
+  auto const& all_passes = PassRegistry::get().get_passes();
+  auto props_manager = redex_properties::Manager(
+      conf, redex_properties::PropertyCheckerRegistry::get().get_checkers());
+  auto active_passes =
+      PassManager::compute_activated_passes(all_passes, conf, &pmc);
+
+  std::vector<std::pair<std::string, redex_properties::PropertyInteractions>>
+      pass_interactions;
+  for (const auto& [pass, _] : active_passes.activated_passes) {
+    auto m = pass->get_property_interactions();
+    for (auto it = m.begin(); it != m.end();) {
+      auto&& [name, property_interaction] = *it;
+
+      if (!props_manager.property_is_enabled(name)) {
+        it = m.erase(it);
+        continue;
+      }
+
+      always_assert_log(property_interaction.is_valid(),
+                        "%s has an invalid property interaction for %s",
+                        pass->name().c_str(), name.c_str());
+      ++it;
+    }
+    pass_interactions.emplace_back(pass->name(), std::move(m));
+  }
+  auto failure = redex_properties::Manager::verify_pass_interactions(
+      pass_interactions, conf);
+  if (failure) {
+    std::cerr << "Illegal pass order:\n" << *failure << std::endl;
+    return 1;
+  }
+  return 0;
+}
+
 } // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape)
 int main(int argc, char* argv[]) {
   signal(SIGABRT, debug_backtrace_handler);
   signal(SIGINT, debug_backtrace_handler);
@@ -1344,8 +1667,17 @@ int main(int argc, char* argv[]) {
   // For better stacks in abort dumps.
   set_abort_if_not_this_thread();
 
+  // For Breadcrumbs issues, do not throw, do not print stack trace. Improves
+  // error readability.
+  redex_debug::set_exc_type_as_abort(RedexError::REJECTED_CODING_PATTERN);
+  redex_debug::disable_stack_trace_for_exc_type(
+      RedexError::REJECTED_CODING_PATTERN);
+
   auto maybe_global_profile =
       ScopedCommandProfiling::maybe_from_env("GLOBAL_", "global");
+
+  ConcurrentContainerConcurrentDestructionScope
+      concurrent_container_destruction_scope;
 
   std::string stats_output_path;
   Json::Value stats;
@@ -1366,6 +1698,10 @@ int main(int argc, char* argv[]) {
     // TODO: Make the command line -jarpath option like a colon separated
     //       list of library JARS.
     Arguments args = parse_args(argc, argv);
+
+    if (args.properties_check) {
+      return check_pass_properties(args);
+    }
 
     keep_reason::Reason::set_record_keep_reasons(
         args.config.get("record_keep_reasons", false).asBool());
@@ -1423,11 +1759,13 @@ int main(int argc, char* argv[]) {
       maybe_dump_jemalloc_profile("MALLOC_PROFILE_DUMP_FRONTEND");
     }
 
-    auto const& passes = PassRegistry::get().get_passes();
-    PassManager manager(passes, std::move(pg_config), conf, args.redex_options);
+    check_required_resources(conf, true);
 
-    ab_test::ABExperimentContext::parse_experiments_states(
-        conf, !manager.get_redex_options().redacted);
+    auto const& passes = PassRegistry::get().get_passes();
+    auto props_manager = redex_properties::Manager(
+        conf, redex_properties::PropertyCheckerRegistry::get().get_checkers());
+    PassManager manager(passes, std::move(pg_config), conf, args.redex_options,
+                        &props_manager);
 
     {
       Timer t("Running optimization passes");

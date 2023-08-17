@@ -5,7 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "PatriciaTreeMapAbstractEnvironment.h"
+#include <sparta/HashedAbstractEnvironment.h>
+#include <sparta/HashedSetAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
 
 #include <cstdint>
 #include <gmock/gmock.h>
@@ -13,9 +15,6 @@
 #include <limits>
 #include <random>
 #include <sstream>
-
-#include "HashedAbstractEnvironment.h"
-#include "HashedSetAbstractDomain.h"
 
 using namespace sparta;
 
@@ -47,7 +46,7 @@ class PatriciaTreeMapAbstractEnvironmentTest : public ::testing::Test {
   std::uniform_int_distribution<uint32_t> m_elem_dist;
 };
 
-HashedAbstractEnvironment<uint32_t, Domain> hae_from_ptae(
+static HashedAbstractEnvironment<uint32_t, Domain> hae_from_ptae(
     const Environment& env) {
   HashedAbstractEnvironment<uint32_t, Domain> hae;
   if (env.is_value()) {

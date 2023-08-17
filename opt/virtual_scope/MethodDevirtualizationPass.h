@@ -13,6 +13,18 @@ class MethodDevirtualizationPass : public Pass {
  public:
   MethodDevirtualizationPass() : Pass("MethodDevirtualizationPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoResolvablePureRefs, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   void bind_config() override {
     bind("staticize_vmethods_not_using_this",
          true,
@@ -29,6 +41,7 @@ class MethodDevirtualizationPass : public Pass {
     bind("ignore_keep", false, m_ignore_keep);
   }
 
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:

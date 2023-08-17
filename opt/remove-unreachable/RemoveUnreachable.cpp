@@ -8,6 +8,7 @@
 #include "RemoveUnreachable.h"
 
 #include <atomic>
+#include <fstream>
 #include <set>
 
 #include "ConfigFiles.h"
@@ -15,7 +16,6 @@
 #include "IOUtil.h"
 #include "MethodOverrideGraph.h"
 #include "PassManager.h"
-#include "ReachableClasses.h"
 #include "Show.h"
 #include "Trace.h"
 #include "Walkers.h"
@@ -176,14 +176,6 @@ void RemoveUnreachablePassBase::run_pass(DexStoresVector& stores,
   // Store names of removed classes and methods
   ConcurrentSet<std::string> removed_symbols;
 
-  if (pm.no_proguard_rules()) {
-    TRACE(RMU,
-          1,
-          "RemoveUnreachablePass not run because no "
-          "ProGuard configuration was provided.");
-    return;
-  }
-
   root_metrics(stores, pm);
 
   bool emit_graph_this_run =
@@ -199,12 +191,15 @@ void RemoveUnreachablePassBase::run_pass(DexStoresVector& stores,
   TRACE(RMU, 2, "RMU: remove_no_argument_constructors %d",
         m_remove_no_argument_constructors);
   int num_ignore_check_strings = 0;
+  reachability::ReachableAspects reachable_aspects;
   auto reachables = this->compute_reachable_objects(
-      stores, pm, &num_ignore_check_strings, emit_graph_this_run,
+      stores, pm, &num_ignore_check_strings, &reachable_aspects,
+      emit_graph_this_run, m_relaxed_keep_class_members,
+      m_prune_uninstantiable_insns, m_prune_uncallable_instance_method_bodies,
       m_remove_no_argument_constructors);
 
   reachability::ObjectCounts before = reachability::count_objects(stores);
-  TRACE(RMU, 1, "before: %lu classes, %lu fields, %lu methods",
+  TRACE(RMU, 1, "before: %zu classes, %zu fields, %zu methods",
         before.num_classes, before.num_fields, before.num_methods);
   pm.set_metric("before.num_classes", before.num_classes);
   pm.set_metric("before.num_fields", before.num_fields);
@@ -212,6 +207,16 @@ void RemoveUnreachablePassBase::run_pass(DexStoresVector& stores,
   pm.set_metric("marked_classes", reachables->num_marked_classes());
   pm.set_metric("marked_fields", reachables->num_marked_fields());
   pm.set_metric("marked_methods", reachables->num_marked_methods());
+  pm.incr_metric("dynamically_referenced_classes",
+                 reachable_aspects.dynamically_referenced_classes.size());
+  pm.incr_metric("instantiable_types",
+                 reachable_aspects.instantiable_types.size());
+  pm.incr_metric("uninstantiable_dependencies",
+                 reachable_aspects.uninstantiable_dependencies.size());
+  pm.incr_metric("instructions_unvisited",
+                 reachable_aspects.instructions_unvisited);
+  pm.incr_metric("callable_instance_methods",
+                 reachable_aspects.callable_instance_methods.size());
 
   ConcurrentReferencesMap references;
   if (output_unreachable_symbols && m_emit_removed_symbols_references) {
@@ -219,11 +224,23 @@ void RemoveUnreachablePassBase::run_pass(DexStoresVector& stores,
     // references of removed symbols (which, of course, will be from dead code).
     gather_references_from_removed_symbols(stores, *reachables, references);
   }
+  if (m_prune_uninstantiable_insns) {
+    auto uninstantiables_stats = reachability::sweep_code(
+        stores, m_prune_uncallable_instance_method_bodies,
+        m_prune_uncallable_virtual_methods, reachable_aspects);
+    uninstantiables_stats.report(pm);
+  }
   reachability::sweep(stores, *reachables,
-                      output_unreachable_symbols ? &removed_symbols : nullptr);
+                      output_unreachable_symbols ? &removed_symbols : nullptr,
+                      m_output_full_removed_symbols);
+  if (m_prune_uncallable_virtual_methods) {
+    auto uninstantiables_stats = reachability::sweep_uncallable_virtual_methods(
+        stores, reachable_aspects);
+    uninstantiables_stats.report(pm);
+  }
 
   reachability::ObjectCounts after = reachability::count_objects(stores);
-  TRACE(RMU, 1, "after: %lu classes, %lu fields, %lu methods",
+  TRACE(RMU, 1, "after: %zu classes, %zu fields, %zu methods",
         after.num_classes, after.num_fields, after.num_methods);
   pm.incr_metric("num_ignore_check_strings", num_ignore_check_strings);
   pm.incr_metric("classes_removed", before.num_classes - after.num_classes);
@@ -286,10 +303,16 @@ RemoveUnreachablePass::compute_reachable_objects(
     const DexStoresVector& stores,
     PassManager& /* pm */,
     int* num_ignore_check_strings,
+    reachability::ReachableAspects* reachable_aspects,
     bool emit_graph_this_run,
+    bool relaxed_keep_class_members,
+    bool cfg_gathering_check_instantiable,
+    bool cfg_gathering_check_instance_callable,
     bool remove_no_argument_constructors) {
   return reachability::compute_reachable_objects(
-      stores, m_ignore_sets, num_ignore_check_strings, emit_graph_this_run,
+      stores, m_ignore_sets, num_ignore_check_strings, reachable_aspects,
+      emit_graph_this_run, relaxed_keep_class_members,
+      cfg_gathering_check_instantiable, cfg_gathering_check_instance_callable,
       false, nullptr, remove_no_argument_constructors);
 }
 

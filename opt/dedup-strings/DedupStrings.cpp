@@ -9,7 +9,6 @@
 
 #include <vector>
 
-#include "ABExperimentContext.h"
 #include "CFGMutation.h"
 #include "ConcurrentContainers.h"
 #include "Creators.h"
@@ -20,8 +19,8 @@
 #include "InstructionSequenceOutliner.h"
 #include "MethodProfiles.h"
 #include "PassManager.h"
-#include "ScopedCFG.h"
 #include "Show.h"
+#include "SourceBlocks.h"
 #include "Walkers.h"
 #include "locator.h"
 
@@ -37,6 +36,9 @@ constexpr const char* METRIC_PERF_SENSITIVE_METHODS =
     "num_perf_sensitive_methods";
 constexpr const char* METRIC_NON_PERF_SENSITIVE_METHODS =
     "num_non_perf_sensitive_methods";
+constexpr const char* METRIC_PERF_SENSITIVE_INSNS = "num_perf_sensitive_insns";
+constexpr const char* METRIC_NON_PERF_SENSITIVE_INSNS =
+    "num_non_perf_sensitive_insns";
 constexpr const char* METRIC_DUPLICATE_STRINGS = "num_duplicate_strings";
 constexpr const char* METRIC_DUPLICATE_STRINGS_SIZE = "duplicate_strings_size";
 constexpr const char* METRIC_DUPLICATE_STRING_LOADS =
@@ -49,11 +51,49 @@ constexpr const char* METRIC_EXCLUDED_DUPLICATE_NON_LOAD_STRINGS =
 constexpr const char* METRIC_FACTORY_METHODS = "num_factory_methods";
 constexpr const char* METRIC_EXCLUDED_OUT_OF_FACTORY_METHODS_STRINGS =
     "num_excluded_out_of_factory_methods_strings";
+
+DedupStringsPerfMode parse_perf_mode(const std::string& str) {
+  if (str == "legacy") {
+    return DedupStringsPerfMode::LEGACY;
+  }
+  if (str == "exclude-hot-methods-or-classes") {
+    return DedupStringsPerfMode::EXCLUDE_HOT_METHODS_OR_CLASSES;
+  }
+  if (str == "exclude-hot-blocks-in-hot-methods-or-classes") {
+    return DedupStringsPerfMode::EXCLUDE_HOT_BLOCKS_IN_HOT_METHODS_OR_CLASSES;
+  }
+  always_assert_log(false, "Unknown perf mode: %s", str.c_str());
+}
+
+// Helper function that checks if a block is hit in any interaction.
+bool is_hot(cfg::Block* b) {
+  const auto* sb = source_blocks::get_first_source_block(b);
+  if (sb == nullptr) {
+    return false;
+  }
+
+  bool is_hot = false;
+  sb->foreach_val_early([&is_hot](const auto& val) {
+    is_hot = (val && val->val > 0.0f);
+    return is_hot;
+  });
+
+  return is_hot;
+}
+
+// All methods in the primary dex 0 must not be touched.
+// If method-profiles are available, we treat all popular methods as
+// perf-sensitive. Otherwise, we treat all methods of perf sensitive classes
+// as perf-sensitive. We also choose to not dedup strings in cl_inits and
+// outlined methods, as they either tend to get called during critical
+// initialization code paths, or often.
+bool treat_all_blocks_as_hot(size_t dexnr, DexMethod* method) {
+  return dexnr == 0 || method::is_clinit(method) ||
+         type_class(method->get_class())->rstate.outlined();
+}
 } // namespace
 
-void DedupStrings::run(
-    DexStoresVector& stores,
-    std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context) {
+void DedupStrings::run(DexStoresVector& stores) {
   // For now, we are only trying to optimize strings in the first store.
   // (It should be possible to generalize in the future.)
   DexClassesVector& dexen = stores[0].get_dexen();
@@ -89,8 +129,7 @@ void DedupStrings::run(
 
   // Rewrite const-string instructions
   rewrite_const_string_instructions(scope, methods_to_dex,
-                                    perf_sensitive_methods, strings_to_dedup,
-                                    ab_experiment_context);
+                                    perf_sensitive_methods, strings_to_dedup);
 }
 
 std::unordered_set<const DexMethod*> DedupStrings::get_perf_sensitive_methods(
@@ -109,20 +148,26 @@ std::unordered_set<const DexMethod*> DedupStrings::get_perf_sensitive_methods(
   }
   auto is_perf_sensitive = [&](size_t dexnr, DexClass* cls,
                                DexMethod* method) -> bool {
-    // All methods in the primary dex 0 must not be touched,
-    // as well as popular methods in classes marked as being perf-sensitive.
-    // We also choose to not dedup strings in cl_inits and outlined methods,
-    // as they either tend to get called during critical initialization code
-    // paths, or often.
-    if (dexnr == 0 || method::is_clinit(method) ||
-        type_class(method->get_class())->rstate.outlined()) {
+    if (treat_all_blocks_as_hot(dexnr, method)) {
       return true;
     }
-    if (!cls->is_perf_sensitive()) {
-      return false;
+    if (m_perf_mode == DedupStringsPerfMode::LEGACY) {
+      // We used to have some strange logic for perf-sensitivity. Avoid using
+      // it.
+      if (!cls->is_perf_sensitive()) {
+        return false;
+      }
+      return !m_method_profiles.has_stats() ||
+             !sufficiently_popular_methods.count(method);
     }
-    return !m_method_profiles.has_stats() ||
-           !sufficiently_popular_methods.count(method);
+    always_assert(
+        m_perf_mode == DedupStringsPerfMode::EXCLUDE_HOT_METHODS_OR_CLASSES ||
+        m_perf_mode ==
+            DedupStringsPerfMode::EXCLUDE_HOT_BLOCKS_IN_HOT_METHODS_OR_CLASSES);
+    if (!m_method_profiles.has_stats()) {
+      return cls->is_perf_sensitive();
+    }
+    return sufficiently_popular_methods.count(method);
   };
   std::unordered_set<const DexMethod*> perf_sensitive_methods;
   for (size_t dexnr = 0; dexnr < dexen.size(); dexnr++) {
@@ -186,10 +231,10 @@ DexMethod* DedupStrings::make_const_string_loader_method(
   host_cls_creator.set_super(type::java_lang_Object());
   auto host_cls = host_cls_creator.create();
   host_cls->rstate.set_generated();
-  host_cls->set_perf_sensitive(true);
+  host_cls->set_perf_sensitive(PerfSensitiveGroup::STRINGS_LOOKUP);
   // Insert class at beginning of dex, but after canary class, if any
   auto dex_it = dex.begin();
-  for (; dex_it != dex.end() && interdex::is_canary(*dex_it); dex_it++) {
+  for (; dex_it != dex.end() && is_canary(*dex_it); dex_it++) {
   }
   dex.insert(dex_it, host_cls);
 
@@ -229,6 +274,7 @@ DexMethod* DedupStrings::make_const_string_loader_method(
   }
   auto method = method_creator.create();
   host_cls->add_method(method);
+  method->get_code()->build_cfg(/* editable */ true);
   return method;
 }
 
@@ -247,7 +293,6 @@ void DedupStrings::gather_non_load_strings(
                     /* exclude_loads */ true);
 
   strings->insert(lstring.begin(), lstring.end());
-  strings->insert(m_ignore_strings.begin(), m_ignore_strings.end());
 }
 
 ConcurrentMap<const DexString*, std::unordered_map<size_t, size_t>>
@@ -261,28 +306,52 @@ DedupStrings::get_occurrences(
       occurrences;
   ConcurrentMap<const DexString*, std::unordered_set<size_t>>
       perf_sensitive_strings;
+  std::atomic<size_t> perf_sensitive_insns{0};
+  std::atomic<size_t> non_perf_sensitive_insns{0};
   walk::parallel::code(
-      scope, [&occurrences, &perf_sensitive_strings, &methods_to_dex,
-              &perf_sensitive_methods](DexMethod* method, IRCode& code) {
+      scope, [this, &occurrences, &perf_sensitive_strings, &methods_to_dex,
+              &perf_sensitive_methods, &perf_sensitive_insns,
+              &non_perf_sensitive_insns](DexMethod* method, IRCode& code) {
         const auto dexnr = methods_to_dex.at(method);
-        const auto perf_sensitive = perf_sensitive_methods.count(method) != 0;
-        for (auto& mie : InstructionIterable(code)) {
-          const auto insn = mie.insn;
-          if (insn->opcode() == OPCODE_CONST_STRING) {
-            const auto str = insn->get_string();
-            if (perf_sensitive) {
-              perf_sensitive_strings.update(
-                  str,
-                  [dexnr](const DexString*,
-                          std::unordered_set<size_t>& s,
-                          bool /* exists */) { s.emplace(dexnr); });
-            } else {
-              occurrences.update(str,
-                                 [dexnr](const DexString*,
-                                         std::unordered_map<size_t, size_t>& m,
-                                         bool /* exists */) { ++m[dexnr]; });
+        const auto perf_sensitive_method =
+            perf_sensitive_methods.count(method) != 0;
+        always_assert(code.editable_cfg_built());
+        auto& cfg = code.cfg();
+        const auto check_for_hot_blocks =
+            m_perf_mode == DedupStringsPerfMode::
+                               EXCLUDE_HOT_BLOCKS_IN_HOT_METHODS_OR_CLASSES &&
+            perf_sensitive_method && !treat_all_blocks_as_hot(dexnr, method);
+        size_t local_perf_sensitive_insns{0};
+        size_t local_non_perf_sensitive_insns{0};
+        for (auto* block : cfg.blocks()) {
+          for (auto& mie : InstructionIterable(block)) {
+            const auto insn = mie.insn;
+            if (insn->opcode() == OPCODE_CONST_STRING) {
+              const auto str = insn->get_string();
+              if (perf_sensitive_method &&
+                  (!check_for_hot_blocks || is_hot(block))) {
+                perf_sensitive_strings.update(
+                    str,
+                    [dexnr](const DexString*,
+                            std::unordered_set<size_t>& s,
+                            bool /* exists */) { s.emplace(dexnr); });
+                local_perf_sensitive_insns++;
+              } else {
+                occurrences.update(
+                    str,
+                    [dexnr](const DexString*,
+                            std::unordered_map<size_t, size_t>& m,
+                            bool /* exists */) { ++m[dexnr]; });
+                local_non_perf_sensitive_insns++;
+              }
             }
           }
+        }
+        if (local_perf_sensitive_insns) {
+          perf_sensitive_insns += local_perf_sensitive_insns;
+        }
+        if (local_non_perf_sensitive_insns) {
+          non_perf_sensitive_insns += local_non_perf_sensitive_insns;
         }
       });
 
@@ -301,6 +370,8 @@ DedupStrings::get_occurrences(
 
   m_stats.perf_sensitive_strings = perf_sensitive_strings.size();
   m_stats.non_perf_sensitive_strings = occurrences.size();
+  m_stats.perf_sensitive_insns = (size_t)perf_sensitive_insns;
+  m_stats.non_perf_sensitive_insns = (size_t)non_perf_sensitive_insns;
   return occurrences;
 }
 
@@ -536,54 +607,71 @@ void DedupStrings::rewrite_const_string_instructions(
     const std::unordered_map<const DexMethod*, size_t>& methods_to_dex,
     const std::unordered_set<const DexMethod*>& perf_sensitive_methods,
     const std::unordered_map<const DexString*, DedupStrings::DedupStringInfo>&
-        strings_to_dedup,
-    std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context) {
+        strings_to_dedup) {
 
   walk::parallel::code(
-      scope, [&methods_to_dex, &strings_to_dedup, &perf_sensitive_methods,
-              &ab_experiment_context](DexMethod* method, IRCode& code) {
-        if (perf_sensitive_methods.count(method) != 0) {
+      scope,
+      [this, &methods_to_dex, &strings_to_dedup,
+       &perf_sensitive_methods](DexMethod* method, IRCode& code) {
+        const auto perf_sensitive_method =
+            perf_sensitive_methods.count(method) != 0;
+        const auto dexnr = methods_to_dex.at(method);
+        if (m_perf_mode == DedupStringsPerfMode::
+                               EXCLUDE_HOT_BLOCKS_IN_HOT_METHODS_OR_CLASSES) {
+          if (treat_all_blocks_as_hot(dexnr, method)) {
+            return;
+          }
+        } else if (perf_sensitive_method) {
           // We don't rewrite methods in the primary dex or other perf-sensitive
           // methods.
           return;
         }
 
-        const auto dexnr = methods_to_dex.at(method);
-
         // First, we collect all const-string instructions that we want to
         // rewrite
-        cfg::ScopedCFG cfg(&code);
-        auto ii = cfg::InstructionIterable(*cfg);
+        always_assert(code.editable_cfg_built());
+        auto& cfg = code.cfg();
         std::vector<std::pair<cfg::InstructionIterator, const DedupStringInfo*>>
             const_strings;
-        for (auto it = ii.begin(); it != ii.end(); it++) {
-          // Do we have a const-string instruction?
-          const auto insn = it->insn;
-          if (insn->opcode() != OPCODE_CONST_STRING) {
+        const auto check_for_hot_blocks =
+            m_perf_mode == DedupStringsPerfMode::
+                               EXCLUDE_HOT_BLOCKS_IN_HOT_METHODS_OR_CLASSES &&
+            perf_sensitive_method;
+        always_assert(!treat_all_blocks_as_hot(dexnr, method));
+        for (auto* block : cfg.blocks()) {
+          if (check_for_hot_blocks && is_hot(block)) {
             continue;
           }
+          auto ii = InstructionIterable(block);
+          for (auto it = ii.begin(); it != ii.end(); it++) {
+            // Do we have a const-string instruction?
+            const auto insn = it->insn;
+            if (insn->opcode() != OPCODE_CONST_STRING) {
+              continue;
+            }
 
-          // We we rewrite this particular instruction?
-          const auto it2 = strings_to_dedup.find(insn->get_string());
-          if (it2 == strings_to_dedup.end()) {
-            continue;
+            // Should we rewrite this particular instruction?
+            const auto it2 = strings_to_dedup.find(insn->get_string());
+            if (it2 == strings_to_dedup.end()) {
+              continue;
+            }
+
+            const auto& info = it2->second;
+            if (info.dexes_to_dedup.count(dexnr) == 0) {
+              continue;
+            }
+
+            const_strings.emplace_back(block->to_cfg_instruction_iterator(it),
+                                       &info);
           }
-
-          const auto& info = it2->second;
-          if (info.dexes_to_dedup.count(dexnr) == 0) {
-            continue;
-          }
-
-          const_strings.emplace_back(it, &info);
         }
 
         if (const_strings.empty()) {
           return;
         }
 
-        ab_experiment_context->try_register_method(method);
         // Second, we actually rewrite them.
-        cfg::CFGMutation cfg_mut(*cfg);
+        cfg::CFGMutation cfg_mut(cfg);
 
         // From
         //   const-string v0, "foo"
@@ -597,12 +685,12 @@ void DedupStrings::rewrite_const_string_instructions(
         // register v0, as that would change its type and cause type conflicts
         // in catch blocks, if any.
 
-        auto temp_reg = cfg->allocate_temp();
+        auto temp_reg = cfg.allocate_temp();
         for (const auto& p : const_strings) {
           const auto& const_string_it = p.first;
           const auto& info = *p.second;
-          auto move_result = cfg->move_result_of(const_string_it);
-          always_assert(move_result != ii.end());
+          auto move_result = cfg.move_result_of(const_string_it);
+          always_assert(!move_result.is_end());
           always_assert(
               opcode::is_a_move_result_pseudo(move_result->insn->opcode()));
           const auto reg = move_result->insn->dest();
@@ -639,9 +727,11 @@ class DedupStringsInterDexPlugin : public interdex::InterDexPassPlugin {
   explicit DedupStringsInterDexPlugin(size_t max_factory_methods)
       : m_max_factory_methods(max_factory_methods) {}
 
-  size_t reserve_mrefs() override { return m_max_factory_methods; }
-
-  size_t reserve_trefs() override { return m_max_factory_methods; }
+  ReserveRefsInfo reserve_refs() override {
+    return ReserveRefsInfo(/* frefs */ 0,
+                           /* trefs */ m_max_factory_methods,
+                           /* mrefs */ m_max_factory_methods);
+  }
 
  private:
   size_t m_max_factory_methods;
@@ -665,10 +755,12 @@ void DedupStringsPass::bind_config() {
   bind("method_profiles_appear_percent_threshold",
        default_method_profiles_appear_percent_threshold,
        m_method_profiles_appear_percent_threshold);
+  std::string perf_mode_str;
+  bind("perf_mode", "exclude-hot-methods-or-classes", perf_mode_str);
 
   trait(Traits::Pass::unique, true);
 
-  after_configuration([this] {
+  after_configuration([this, perf_mode_str = std::move(perf_mode_str)] {
     always_assert(m_max_factory_methods > 0);
     interdex::InterDexRegistry* registry =
         static_cast<interdex::InterDexRegistry*>(
@@ -678,29 +770,18 @@ void DedupStringsPass::bind_config() {
       return new DedupStringsInterDexPlugin(m_max_factory_methods);
     };
     registry->register_plugin("DEDUP_STRINGS_PLUGIN", std::move(fn));
+    always_assert(!perf_mode_str.empty());
+    m_perf_mode = parse_perf_mode(perf_mode_str);
   });
 }
 
 void DedupStringsPass::run_pass(DexStoresVector& stores,
                                 ConfigFiles& conf,
                                 PassManager& mgr) {
-  auto ab_experiment_context =
-      ab_test::ABExperimentContext::create("dedup_strings");
-  if (ab_experiment_context->use_control()) {
-    return;
-  }
-
-  auto exp_names = ab_test::ABExperimentContext::get_all_experiments_names();
-
-  std::unordered_set<const DexString*> exp_strings_to_ignore;
-  for (const auto& exp_name : exp_names) {
-    exp_strings_to_ignore.insert(DexString::make_string(exp_name));
-  }
-
   DedupStrings ds(m_max_factory_methods,
-                  m_method_profiles_appear_percent_threshold,
-                  conf.get_method_profiles(), std::move(exp_strings_to_ignore));
-  ds.run(stores, ab_experiment_context);
+                  m_method_profiles_appear_percent_threshold, m_perf_mode,
+                  conf.get_method_profiles());
+  ds.run(stores);
   const auto stats = ds.get_stats();
   mgr.incr_metric(METRIC_PERF_SENSITIVE_STRINGS, stats.perf_sensitive_strings);
   mgr.incr_metric(METRIC_NON_PERF_SENSITIVE_STRINGS,
@@ -711,8 +792,14 @@ void DedupStringsPass::run_pass(DexStoresVector& stores,
   mgr.incr_metric(METRIC_PERF_SENSITIVE_METHODS, stats.perf_sensitive_methods);
   mgr.incr_metric(METRIC_NON_PERF_SENSITIVE_METHODS,
                   stats.non_perf_sensitive_methods);
-  TRACE(DS, 1, "[dedup strings] perf sensitive methods: %zu vs %zu",
-        stats.perf_sensitive_methods, stats.non_perf_sensitive_methods);
+  mgr.incr_metric(METRIC_PERF_SENSITIVE_INSNS, stats.perf_sensitive_insns);
+  mgr.incr_metric(METRIC_NON_PERF_SENSITIVE_INSNS,
+                  stats.non_perf_sensitive_insns);
+  TRACE(DS, 1,
+        "[dedup strings] perf sensitive methods (instructions): %zu(%zu) vs "
+        "%zu(%zu)",
+        stats.perf_sensitive_methods, stats.perf_sensitive_insns,
+        stats.non_perf_sensitive_methods, stats.non_perf_sensitive_insns);
 
   mgr.incr_metric(METRIC_DUPLICATE_STRINGS, stats.duplicate_strings);
   mgr.incr_metric(METRIC_DUPLICATE_STRINGS_SIZE, stats.duplicate_strings_size);
@@ -735,7 +822,6 @@ void DedupStringsPass::run_pass(DexStoresVector& stores,
         stats.duplicate_string_loads, stats.expected_size_reduction,
         stats.dexes_without_host_cls, stats.excluded_duplicate_non_load_strings,
         stats.factory_methods, stats.excluded_out_of_factory_methods_strings);
-  ab_experiment_context->flush();
 }
 
 static DedupStringsPass s_pass;

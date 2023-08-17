@@ -24,6 +24,9 @@ enum RedexError {
   BAD_ANNOTATION = 6,
   UNSATISFIED_ANALYSIS_PASS = 7,
   REJECTED_CODING_PATTERN = 8,
+  INVALID_BETAMAP = 9,
+  BUFFER_END_EXCEEDED = 10,
+  MAX = 10,
 };
 
 class RedexException : public std::exception {

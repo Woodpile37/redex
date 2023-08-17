@@ -14,6 +14,19 @@ class RemoveUnreachablePassBase : public Pass {
  public:
   explicit RemoveUnreachablePassBase(const std::string& name) : Pass(name) {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoResolvablePureRefs, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+        {UltralightCodePatterns, Preserves},
+    };
+  }
+
   void bind_config() override {
     bind("ignore_string_literals", {}, m_ignore_sets.string_literals);
     bind("ignore_string_literal_annos", {}, m_ignore_sets.string_literal_annos);
@@ -28,6 +41,15 @@ class RemoveUnreachablePassBase : public Pass {
     bind("remove_no_argument_constructors",
          false,
          m_remove_no_argument_constructors);
+    bind("output_full_removed_symbols", false, m_output_full_removed_symbols);
+    bind("relaxed_keep_class_members", false, m_relaxed_keep_class_members);
+    bind("prune_uninstantiable_insns", false, m_prune_uninstantiable_insns);
+    bind("prune_uncallable_instance_method_bodies",
+         false,
+         m_prune_uncallable_instance_method_bodies);
+    bind("prune_uncallable_virtual_methods",
+         false,
+         m_prune_uncallable_virtual_methods);
     after_configuration([this] {
       // To keep the backward compatability of this code, ensure that the
       // "MemberClasses" annotation is always in system_annos.
@@ -42,7 +64,11 @@ class RemoveUnreachablePassBase : public Pass {
   compute_reachable_objects(const DexStoresVector& stores,
                             PassManager& pm,
                             int* num_ignore_check_strings,
+                            reachability::ReachableAspects* reachable_aspects,
                             bool emit_graph_this_run,
+                            bool relaxed_keep_class_members,
+                            bool cfg_gathering_check_instantiable,
+                            bool cfg_gathering_check_instance_callable,
                             bool remove_no_argument_constructors) = 0;
 
   void write_out_removed_symbols(
@@ -55,6 +81,11 @@ class RemoveUnreachablePassBase : public Pass {
   boost::optional<uint32_t> m_emit_graph_on_run;
   bool m_always_emit_unreachable_symbols = false;
   bool m_emit_removed_symbols_references = false;
+  bool m_output_full_removed_symbols = false;
+  bool m_relaxed_keep_class_members = false;
+  bool m_prune_uninstantiable_insns = false;
+  bool m_prune_uncallable_instance_method_bodies = false;
+  bool m_prune_uncallable_virtual_methods = false;
 };
 
 class RemoveUnreachablePass : public RemoveUnreachablePassBase {
@@ -66,6 +97,10 @@ class RemoveUnreachablePass : public RemoveUnreachablePassBase {
       const DexStoresVector& stores,
       PassManager& pm,
       int* num_ignore_check_strings,
+      reachability::ReachableAspects* reachable_aspects,
       bool emit_graph_this_run,
+      bool relaxed_keep_class_members,
+      bool cfg_gathering_check_instantiable,
+      bool cfg_gathering_check_instance_callable,
       bool remove_no_argument_constructors) override;
 };

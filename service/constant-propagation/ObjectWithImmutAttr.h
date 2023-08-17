@@ -8,10 +8,10 @@
 #pragma once
 #include <vector>
 
-#include "DisjointUnionAbstractDomain.h"
-#include "SignedConstantDomain.h"
+#include <sparta/DisjointUnionAbstractDomain.h>
 
 #include "Show.h"
+#include "SignedConstantDomain.h"
 #include "TemplateUtil.h"
 #include "TypeUtil.h"
 
@@ -254,6 +254,27 @@ struct ObjectWithImmutAttr {
     return true;
   }
 
+  bool leq(const ObjectWithImmutAttr& other) const {
+    redex_assert(type == other.type);
+    if (jvm_cached_singleton && !other.jvm_cached_singleton) {
+      return false;
+    }
+    if (attributes.size() > other.attributes.size()) {
+      return false;
+    }
+    for (size_t idx = 0; idx < attributes.size(); idx++) {
+      auto& attr1 = attributes[idx];
+      const auto& attr2 = other.attributes[idx];
+      if (attr1.attr != attr2.attr) {
+        return false;
+      }
+      if (!attr1.value.leq(attr2.value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void join_with(const ObjectWithImmutAttr& other) {
     redex_assert(type == other.type);
     bool is_all_constant = true;
@@ -265,6 +286,16 @@ struct ObjectWithImmutAttr {
     }
     jvm_cached_singleton =
         jvm_cached_singleton && other.jvm_cached_singleton && is_all_constant;
+  }
+
+  void meet_with(const ObjectWithImmutAttr& other) {
+    redex_assert(type == other.type);
+    for (size_t idx = 0; idx < attributes.size(); idx++) {
+      auto& attr1 = attributes[idx];
+      const auto& attr2 = other.attributes[idx];
+      attr1.value.meet_with(attr2.value);
+    }
+    jvm_cached_singleton &= other.jvm_cached_singleton;
   }
 
   bool operator==(const ObjectWithImmutAttr& other) const {
@@ -366,6 +397,9 @@ class ObjectWithImmutAttrDomain final
       m_value = std::make_unique<ObjectWithImmutAttr>(*other.m_value);
     }
   }
+
+  ObjectWithImmutAttrDomain(ObjectWithImmutAttrDomain&& other) = default;
+
   ObjectWithImmutAttrDomain& operator=(const ObjectWithImmutAttrDomain& other) {
     m_kind = other.m_kind;
     if (other.m_value) {
@@ -374,35 +408,43 @@ class ObjectWithImmutAttrDomain final
     return *this;
   }
 
+  ObjectWithImmutAttrDomain& operator=(ObjectWithImmutAttrDomain&& other) =
+      default;
+
   boost::optional<ObjectWithImmutAttr> get_constant() const {
     return m_value ? boost::make_optional(*m_value) : boost::none;
   }
 
-  bool is_bottom() const override {
-    return m_kind == sparta::AbstractValueKind::Bottom;
-  }
+  bool is_bottom() const { return m_kind == sparta::AbstractValueKind::Bottom; }
 
   bool is_value() const { return m_kind == sparta::AbstractValueKind::Value; }
 
-  bool is_top() const override {
-    return m_kind == sparta::AbstractValueKind::Top;
-  }
+  bool is_top() const { return m_kind == sparta::AbstractValueKind::Top; }
 
-  void set_to_bottom() override {
+  void set_to_bottom() {
     m_kind = sparta::AbstractValueKind::Bottom;
     m_value = nullptr;
   }
 
-  void set_to_top() override {
+  void set_to_top() {
     m_kind = sparta::AbstractValueKind::Top;
     m_value = nullptr;
   }
 
-  bool leq(const ObjectWithImmutAttrDomain& other) const override {
-    return equals(other);
+  bool leq(const ObjectWithImmutAttrDomain& other) const {
+    if (is_bottom()) {
+      return true;
+    }
+    if (is_top()) {
+      return other.is_top();
+    }
+    if (other.is_top()) {
+      return true;
+    }
+    return m_value->type == other.m_value->type && m_value->leq(*other.m_value);
   }
 
-  bool equals(const ObjectWithImmutAttrDomain& other) const override {
+  bool equals(const ObjectWithImmutAttrDomain& other) const {
     if (is_bottom()) {
       return other.is_bottom();
     }
@@ -415,7 +457,7 @@ class ObjectWithImmutAttrDomain final
     return *m_value == *other.m_value;
   }
 
-  void join_with(const ObjectWithImmutAttrDomain& other) override {
+  void join_with(const ObjectWithImmutAttrDomain& other) {
     if (is_top() || other.is_bottom()) {
       return;
     }
@@ -435,11 +477,9 @@ class ObjectWithImmutAttrDomain final
     }
   }
 
-  void widen_with(const ObjectWithImmutAttrDomain& other) override {
-    join_with(other);
-  }
+  void widen_with(const ObjectWithImmutAttrDomain& other) { join_with(other); }
 
-  void meet_with(const ObjectWithImmutAttrDomain& other) override {
+  void meet_with(const ObjectWithImmutAttrDomain& other) {
     if (is_bottom() || other.is_top()) {
       return;
     }
@@ -458,13 +498,22 @@ class ObjectWithImmutAttrDomain final
     } else if (equality == TriState::False) {
       set_to_bottom();
     } else {
+      always_assert(equality == TriState::Unknown);
+      if (m_value->same_attrs(*other.m_value)) {
+        m_value->meet_with(*other.m_value);
+        for (auto& attr : m_value->attributes) {
+          if (attr.value.is_bottom()) {
+            set_to_bottom();
+            return;
+          }
+        }
+        return;
+      }
       set_to_top();
     }
   }
 
-  void narrow_with(const ObjectWithImmutAttrDomain& other) override {
-    meet_with(other);
-  }
+  void narrow_with(const ObjectWithImmutAttrDomain& other) { meet_with(other); }
 
   friend std::ostream& operator<<(std::ostream& out,
                                   const ObjectWithImmutAttrDomain& x) {

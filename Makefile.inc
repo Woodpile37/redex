@@ -4,6 +4,7 @@
 COMMON_INCLUDES = \
 	-I$(top_srcdir)/analysis/ip-reflection-analysis \
 	-I$(top_srcdir)/analysis/max-depth \
+	-I$(top_srcdir)/checkers \
 	-I$(top_srcdir)/liblocator \
 	-I$(top_srcdir)/libredex \
 	-I$(top_srcdir)/libresource \
@@ -14,9 +15,11 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/libresource/utils \
 	-I$(top_srcdir)/opt \
 	-I$(top_srcdir)/opt/access-marking \
+	-I$(top_srcdir)/opt/add-secondary-dex \
 	-I$(top_srcdir)/opt/add_redex_txt_to_apk \
 	-I$(top_srcdir)/opt/analyze-pure-method \
 	-I$(top_srcdir)/opt/app_module_usage \
+	-I$(top_srcdir)/opt/art-profile-writer \
 	-I$(top_srcdir)/opt/annoclasskill \
 	-I$(top_srcdir)/opt/annokill \
 	-I$(top_srcdir)/opt/basic-block \
@@ -30,6 +33,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/copy-propagation \
 	-I$(top_srcdir)/opt/cse \
 	-I$(top_srcdir)/opt/dedup_blocks \
+	-I$(top_srcdir)/opt/dedup_resources \
 	-I$(top_srcdir)/opt/dedup-strings \
 	-I$(top_srcdir)/opt/delinit \
 	-I$(top_srcdir)/opt/delsuper \
@@ -37,6 +41,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/final_inline \
 	-I$(top_srcdir)/opt/init-classes \
 	-I$(top_srcdir)/opt/instrument \
+	-I$(top_srcdir)/opt/int_type_patcher \
 	-I$(top_srcdir)/opt/interdex \
 	-I$(top_srcdir)/opt/layout-reachability \
 	-I$(top_srcdir)/opt/local-dce \
@@ -44,14 +49,17 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/merge_interface \
 	-I$(top_srcdir)/opt/methodinline \
 	-I$(top_srcdir)/opt/obfuscate \
+	-I$(top_srcdir)/opt/obfuscate_resources \
 	-I$(top_srcdir)/opt/object-sensitive-dce \
 	-I$(top_srcdir)/opt/optimize_enums \
+	-I$(top_srcdir)/opt/optimize_resources \
 	-I$(top_srcdir)/opt/original_name \
 	-I$(top_srcdir)/opt/outliner \
 	-I$(top_srcdir)/opt/partial-application \
 	-I$(top_srcdir)/opt/peephole \
 	-I$(top_srcdir)/opt/print-members \
 	-I$(top_srcdir)/opt/print-kotlin-stats \
+	-I$(top_srcdir)/opt/rearrange-enum-clinit \
 	-I$(top_srcdir)/opt/rebindrefs \
 	-I$(top_srcdir)/opt/reduce-array-literals \
 	-I$(top_srcdir)/opt/reduce-boolean-branches \
@@ -61,7 +69,6 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/remove-apilevel-checks \
 	-I$(top_srcdir)/opt/remove-builders \
 	-I$(top_srcdir)/opt/remove_empty_classes \
-	-I$(top_srcdir)/opt/remove_gotos \
 	-I$(top_srcdir)/opt/remove-interfaces \
 	-I$(top_srcdir)/opt/remove-nullcheck-string-arg \
 	-I$(top_srcdir)/opt/remove-recursive-locks \
@@ -78,6 +85,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/shorten-srcstrings \
 	-I$(top_srcdir)/opt/singleimpl \
 	-I$(top_srcdir)/opt/split_huge_switches \
+	-I$(top_srcdir)/opt/split_resource_tables \
 	-I$(top_srcdir)/opt/staticrelo \
 	-I$(top_srcdir)/opt/static-sink \
 	-I$(top_srcdir)/opt/stringbuilder-outliner \

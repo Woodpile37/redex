@@ -40,120 +40,152 @@ RedexContext::RedexContext(bool allow_class_duplicates)
       m_allow_class_duplicates(allow_class_duplicates) {}
 
 RedexContext::~RedexContext() {
-  std::vector<std::function<void()>> fns{
-      [&] {
-        Timer timer("Delete DexTypes", /* indent */ false);
-        // NB: This table intentionally contains aliases (multiple
-        // DexStrings map to the same DexType), so we have to dedup the set of
-        // types before deleting to avoid double-frees.
-        std::unordered_set<DexType*> delete_types;
-        for (auto const& p : s_type_map) {
-          if (delete_types.emplace(p.second).second) {
-            delete p.second;
-          }
-        }
-        s_type_map.clear();
-      },
-      [&] {
-        Timer timer("DexTypeLists", /* indent */ false);
-        for (auto const& p : s_typelist_map) {
-          delete p.second;
-        }
-        s_typelist_map.clear();
-      },
-      [&] {
-        Timer timer("Delete DexProtos.", /* indent */ false);
-        for (auto* proto : s_proto_set) {
-          delete proto;
-        }
-        s_proto_set.clear();
-      },
-      [&] {
-        Timer timer("Delete DexClasses", /* indent */ false);
-        for (auto const& p : m_type_to_class) {
-          delete p.second;
-        }
-        m_type_to_class.clear();
-      },
-      [&] {
-        Timer timer("Delete DexLocations", /* indent */ false);
-        for (auto const& p : s_location_map) {
-          delete p.second;
-        }
-        s_location_map.clear();
-      },
-      [&] {
-        Timer timer("release_keep_reasons", /* indent */ false);
-        keep_reason::Reason::release_keep_reasons();
-      },
-      [&] {
-        Timer timer("m_destruction_tasks", /* indent */ false);
-        for (const Task& t : m_destruction_tasks) {
-          t();
-        }
-        m_destruction_tasks.clear();
-      },
-      [&] {
-        Timer timer("delete m_position_pattern_switch_manager",
-                    /* indent */ false);
-        delete m_position_pattern_switch_manager;
-      },
-      [&] {
-        Timer timer("misc", /* indent */ false);
-        m_external_classes.clear();
-        field_values.clear();
-        method_return_values.clear();
-      }};
-  // Deleting fields and methods is especially expensive, so we do it by
-  // "buckets".
-  const size_t method_buckets_count = 16;
-  for (size_t bucket = 0; bucket < method_buckets_count; bucket++) {
-    fns.push_back([bucket, this]() {
-      Timer timer("Delete DexMethods/" + std::to_string(bucket),
-                  /* indent */ false);
-      // Delete DexMethods. Use set to prevent double freeing aliases
-      std::unordered_set<DexMethod*> delete_methods;
-      for (auto const& it : s_method_map) {
-        auto method = static_cast<DexMethod*>(it.second);
-        if ((reinterpret_cast<size_t>(method) >> 16) % method_buckets_count ==
-                bucket &&
-            delete_methods.emplace(method).second) {
-          delete method;
-        }
-      }
-    });
-  }
-  const size_t field_buckets_count = 4;
-  for (size_t bucket = 0; bucket < field_buckets_count; bucket++) {
-    fns.push_back([bucket, this]() {
-      Timer timer("Delete DexFields/" + std::to_string(bucket),
-                  /* indent */ false);
-      // Delete DexFields. Use set to prevent double freeing aliases
-      std::unordered_set<DexField*> delete_fields;
-      for (auto const& it : s_field_map) {
-        auto field = static_cast<DexField*>(it.second);
-        if ((reinterpret_cast<size_t>(field) >> 16) % field_buckets_count ==
-                bucket &&
-            delete_fields.emplace(field).second) {
-          delete field;
-        }
-      }
-    });
-  }
-  size_t segment_index{0};
-  for (auto& segment : s_string_set) {
-    fns.push_back([&segment, index = segment_index++]() {
-      Timer timer("Delete DexStrings segment/" + std::to_string(index),
-                  /* indent */ false);
-      for (auto* v : segment) {
-        delete v;
-      }
-      segment.clear();
-    });
-  }
+  // We parallelize destruction for efficiency.
+  auto parallel_run = [](const std::vector<std::function<void()>>& fns,
+                         const char* timer_name) {
+    if (timer_name != nullptr) {
+      Timer timer(timer_name, /*indent=*/false);
+      workqueue_run<std::function<void()>>(
+          [](const std::function<void()>& fn) { fn(); }, fns);
+    } else {
+      workqueue_run<std::function<void()>>(
+          [](const std::function<void()>& fn) { fn(); }, fns);
+    }
+  };
 
-  workqueue_run<std::function<void()>>([](std::function<void()>& fn) { fn(); },
-                                       fns);
+  parallel_run({[&] {
+                  Timer timer("Delete DexTypes", /* indent */ false);
+                  // NB: This table intentionally contains aliases (multiple
+                  // DexStrings map to the same DexType), so we have to dedup
+                  // the set of types before deleting to avoid double-frees.
+                  std::unordered_set<DexType*> delete_types;
+                  for (auto const& p : s_type_map) {
+                    if (delete_types.emplace(p.second).second) {
+                      delete p.second;
+                    }
+                  }
+                  s_type_map.clear();
+                },
+                [&] {
+                  Timer timer("DexTypeLists", /* indent */ false);
+                  for (auto const& p : s_typelist_map) {
+                    delete p.second;
+                  }
+                  s_typelist_map.clear();
+                },
+                [&] {
+                  Timer timer("Delete DexProtos.", /* indent */ false);
+                  for (auto* proto : s_proto_set) {
+                    delete proto;
+                  }
+                  s_proto_set.clear();
+                },
+                [&] {
+                  Timer timer("Delete DexClasses", /* indent */ false);
+                  for (auto const& p : m_type_to_class) {
+                    delete p.second;
+                  }
+                  m_type_to_class.clear();
+                },
+                [&] {
+                  Timer timer("Delete DexLocations", /* indent */ false);
+                  for (auto const& p : s_location_map) {
+                    delete p.second;
+                  }
+                  s_location_map.clear();
+                },
+                [&] {
+                  Timer timer("release_keep_reasons", /* indent */ false);
+                  keep_reason::Reason::release_keep_reasons();
+                },
+                [&] {
+                  Timer timer("m_destruction_tasks", /* indent */ false);
+                  for (const Task& t : m_destruction_tasks) {
+                    t();
+                  }
+                  m_destruction_tasks.clear();
+                },
+                [&] {
+                  Timer timer("delete m_position_pattern_switch_manager",
+                              /* indent */ false);
+                  delete m_position_pattern_switch_manager;
+                },
+                [&] {
+                  Timer timer("misc", /* indent */ false);
+                  m_external_classes.clear();
+                  field_values.clear();
+                  method_return_values.clear();
+                }},
+               nullptr);
+
+  // Deleting fields and methods is especially expensive, so we do it by
+  // "buckets". For timer clarity we do them serially, even if we could
+  // save a little bit of time.
+  parallel_run(
+      [&]() {
+        const size_t method_buckets_count = 16;
+        std::vector<std::function<void()>> fns;
+        fns.reserve(method_buckets_count);
+        for (size_t bucket = 0; bucket < method_buckets_count; bucket++) {
+          fns.push_back([bucket, this]() {
+            // Delete DexMethods. Use set to prevent double freeing aliases
+            std::unordered_set<DexMethod*> delete_methods;
+            for (auto const& it : s_method_map) {
+              auto method = static_cast<DexMethod*>(it.second);
+              if ((reinterpret_cast<size_t>(method) >> 16) %
+                          method_buckets_count ==
+                      bucket &&
+                  delete_methods.emplace(method).second) {
+                delete method;
+              }
+            }
+          });
+        }
+        return fns;
+      }(),
+      "Delete DexMethods");
+
+  parallel_run(
+      [&]() {
+        const size_t field_buckets_count = 4;
+        std::vector<std::function<void()>> fns;
+        fns.reserve(field_buckets_count);
+        for (size_t bucket = 0; bucket < field_buckets_count; bucket++) {
+          fns.push_back([bucket, this]() {
+            // Delete DexFields. Use set to prevent double freeing aliases
+            std::unordered_set<DexFieldRef*> delete_fields;
+            for (auto const& it : s_field_map) {
+              auto field = static_cast<DexFieldRef*>(it.second);
+              if ((reinterpret_cast<size_t>(field) >> 16) %
+                          field_buckets_count ==
+                      bucket &&
+                  delete_fields.emplace(field).second) {
+                delete field;
+              }
+            }
+          });
+        }
+        return fns;
+      }(),
+      "Delete DexFields");
+
+  parallel_run(
+      [&]() {
+        size_t segment_index{0};
+        std::vector<std::function<void()>> fns;
+        fns.reserve(s_string_set.slots());
+        for (auto& segment : s_string_set) {
+          fns.push_back([&segment, index = segment_index++]() {
+            for (auto* v : segment) {
+              delete v;
+            }
+            segment.clear();
+          });
+        }
+        return fns;
+      }(),
+      "Delete DexStrings");
+
   s_method_map.clear();
 
   std::ostringstream oss;
@@ -659,11 +691,10 @@ void RedexContext::mutate_method(DexMethodRef* method,
       std::string cls_name = show_deobfuscated(old_spec.cls);
       std::regex separator{"[/;]"};
       std::vector<std::string> parts;
-      std::copy(std::sregex_token_iterator(cls_name.begin(), cls_name.end(),
-                                           separator, -1),
-                std::sregex_token_iterator(),
-                std::back_inserter(parts));
-
+      parts.insert(parts.end(),
+                   std::sregex_token_iterator(cls_name.begin(), cls_name.end(),
+                                              separator, -1),
+                   std::sregex_token_iterator());
       // Make a name like "name$Bar$foo", or "$clinit$$Bar$foo".
       std::stringstream ss;
       if (old_spec.name->str().front() == '<') {
@@ -702,7 +733,10 @@ DexLocation* RedexContext::make_location(std::string_view store_name,
   }
   std::unique_ptr<DexLocation> value(
       new DexLocation(std::string(store_name), std::string(file_name)));
-  key = std::make_pair(value->get_store_name(), value->get_file_name());
+  key = std::make_pair(std::string_view(value->get_store_name()),
+                       std::string_view(value->get_file_name()));
+  always_assert(key.first.data() == value->get_store_name().data());
+  always_assert(key.second.data() == value->get_file_name().data());
   return try_insert(key, std::move(value), &s_location_map);
 }
 

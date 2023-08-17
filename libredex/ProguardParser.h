@@ -19,11 +19,13 @@ struct Stats {
   size_t unknown_tokens{0};
   size_t parse_errors{0};
   size_t unimplemented{0};
+  size_t unknown_commands{0};
 
   Stats& operator+=(const Stats& rhs) {
     unknown_tokens += rhs.unknown_tokens;
     parse_errors += rhs.parse_errors;
     unimplemented += rhs.unimplemented;
+    unknown_commands += rhs.unknown_commands;
     return *this;
   }
 };
@@ -41,6 +43,8 @@ size_t remove_default_blocklisted_rules(ProguardConfiguration* pg_config);
 
 size_t remove_blocklisted_rules(const std::string& rules,
                                 ProguardConfiguration* pg_config);
+
+size_t identify_blanket_native_rules(ProguardConfiguration* pg_config);
 
 } // namespace proguard_parser
 } // namespace keep_rules

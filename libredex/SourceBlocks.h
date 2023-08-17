@@ -57,6 +57,56 @@ struct BlockAccessor {
   }
 };
 
+inline std::vector<Edge*> get_sorted_edges(Block* b) {
+  auto succs = b->succs();
+  std::sort(succs.begin(), succs.end(), [](const Edge* lhs, const Edge* rhs) {
+    if (lhs->type() != rhs->type()) {
+      return lhs->type() < rhs->type();
+    }
+    switch (lhs->type()) {
+    case EDGE_GOTO:
+      redex_assert(lhs == rhs);
+      return false;
+    case EDGE_BRANCH: {
+      auto lhs_case = lhs->case_key();
+      auto rhs_case = rhs->case_key();
+      if (!lhs_case) {
+        redex_assert(!rhs_case);
+        redex_assert(lhs == rhs);
+        return false;
+      }
+      redex_assert(rhs_case);
+      return *lhs_case < *rhs_case;
+    }
+    case EDGE_THROW: {
+      auto lhs_info = lhs->throw_info();
+      auto rhs_info = rhs->throw_info();
+      redex_assert(lhs_info != nullptr);
+      redex_assert(rhs_info != nullptr);
+      auto lhs_catch = lhs_info->catch_type;
+      auto rhs_catch = rhs_info->catch_type;
+      if (lhs_catch == nullptr) {
+        if (rhs_catch == nullptr) {
+          redex_assert(lhs == rhs);
+          return false;
+        }
+        return true;
+      }
+      if (rhs_catch == nullptr) {
+        return false;
+      }
+      return compare_dextypes(lhs_catch, rhs_catch);
+    }
+    case EDGE_GHOST:
+      return false;
+    case EDGE_TYPE_SIZE:
+      not_reached();
+    }
+    not_reached(); // For GCC.
+  });
+  return succs;
+}
+
 template <typename BlockStartFn, typename EdgeFn, typename BlockEndFn>
 void visit_in_order(const ControlFlowGraph* cfg,
                     const BlockStartFn& block_start_fn,
@@ -64,56 +114,6 @@ void visit_in_order(const ControlFlowGraph* cfg,
                     const BlockEndFn& block_end_fn) {
   // Do not rely on `blocks()`, as there are no ordering guarantees. For now,
   // do a simple DFS with explicitly ordered edges.
-
-  auto get_sorted_edges = [](Block* b) {
-    auto succs = b->succs();
-    std::sort(succs.begin(), succs.end(), [](const Edge* lhs, const Edge* rhs) {
-      if (lhs->type() != rhs->type()) {
-        return lhs->type() < rhs->type();
-      }
-      switch (lhs->type()) {
-      case EDGE_GOTO:
-        redex_assert(lhs == rhs);
-        return false;
-      case EDGE_BRANCH: {
-        auto lhs_case = lhs->case_key();
-        auto rhs_case = rhs->case_key();
-        if (!lhs_case) {
-          redex_assert(!rhs_case);
-          redex_assert(lhs == rhs);
-          return false;
-        }
-        redex_assert(rhs_case);
-        return *lhs_case < *rhs_case;
-      }
-      case EDGE_THROW: {
-        auto lhs_info = lhs->throw_info();
-        auto rhs_info = rhs->throw_info();
-        redex_assert(lhs_info != nullptr);
-        redex_assert(rhs_info != nullptr);
-        auto lhs_catch = lhs_info->catch_type;
-        auto rhs_catch = rhs_info->catch_type;
-        if (lhs_catch == nullptr) {
-          if (rhs_catch == nullptr) {
-            redex_assert(lhs == rhs);
-            return false;
-          }
-          return true;
-        }
-        if (rhs_catch == nullptr) {
-          return false;
-        }
-        return compare_dextypes(lhs_catch, rhs_catch);
-      }
-      case EDGE_GHOST:
-        return false;
-      case EDGE_TYPE_SIZE:
-        not_reached();
-      }
-      not_reached(); // For GCC.
-    });
-    return succs;
-  };
 
   std::unordered_set<Block*> visited;
   self_recursive_fn(
@@ -137,7 +137,7 @@ void visit_in_order(const ControlFlowGraph* cfg,
       },
       cfg->entry_block());
 
-  redex_assert(visited.size() == cfg->blocks().size());
+  redex_assert(visited.size() == cfg->num_blocks());
 }
 
 } // namespace impl
@@ -145,6 +145,7 @@ void visit_in_order(const ControlFlowGraph* cfg,
 struct InsertResult {
   size_t block_count;
   std::string serialized;
+  std::string serialized_idom_map;
   bool profile_success;
 };
 
@@ -157,6 +158,12 @@ using ProfileData =
     std::variant<std::nullopt_t,
                  std::pair<std::string, boost::optional<SourceBlock::Val>>,
                  SourceBlock::Val>;
+
+InsertResult insert_source_blocks(const DexString* method,
+                                  ControlFlowGraph* cfg,
+                                  const std::vector<ProfileData>& profiles = {},
+                                  bool serialize = true,
+                                  bool insert_after_excs = false);
 
 InsertResult insert_source_blocks(DexMethod* method,
                                   ControlFlowGraph* cfg,
@@ -244,25 +251,33 @@ inline const SourceBlock* get_first_source_block(const cfg::Block* b) {
   return nullptr;
 }
 
+template <typename Iterator>
+inline SourceBlock* find_between(const Iterator& start, const Iterator& end) {
+  auto it = std::find_if(
+      start, end, [](auto& e) { return e.type == MFLOW_SOURCE_BLOCK; });
+  return it != end ? it->src_block.get() : nullptr;
+}
+
 inline SourceBlock* get_last_source_block_before(cfg::Block* b,
-                                                 IRList::iterator it) {
-  while (it != b->begin()) {
-    it--;
-    if (it->type == MFLOW_SOURCE_BLOCK) {
-      return it->src_block->get_last_in_chain();
-    }
-  }
-  return nullptr;
+                                                 const IRList::iterator& it) {
+  auto* sb = find_between(IRList::reverse_iterator(it), b->rend());
+  return sb != nullptr ? sb->get_last_in_chain() : nullptr;
 }
 inline const SourceBlock* get_last_source_block_before(
-    const cfg::Block* b, IRList::const_iterator it) {
-  while (it != b->begin()) {
-    it--;
-    if (it->type == MFLOW_SOURCE_BLOCK) {
-      return it->src_block->get_last_in_chain();
-    }
-  }
-  return nullptr;
+    const cfg::Block* b, const IRList::const_iterator& it) {
+  auto* sb = find_between(IRList::const_reverse_iterator(it), b->rend());
+  return sb != nullptr ? sb->get_last_in_chain() : nullptr;
+}
+
+inline SourceBlock* get_first_source_block_after(cfg::Block* b,
+                                                 const IRList::iterator& it) {
+  auto* sb = find_between(it, b->end());
+  return sb != nullptr ? sb : nullptr;
+}
+inline const SourceBlock* get_first_source_block_after(
+    const cfg::Block* b, const IRList::const_iterator& it) {
+  auto* sb = find_between(it, b->end());
+  return sb != nullptr ? sb : nullptr;
 }
 
 inline SourceBlock* get_first_source_block(cfg::ControlFlowGraph* cfg) {
@@ -305,6 +320,100 @@ inline const SourceBlock* get_last_source_block(const cfg::Block* b) {
       get_last_source_block(const_cast<cfg::Block*>(b)));
 }
 
+IRList::iterator find_first_block_insert_point(cfg::Block* b);
+
+namespace normalize {
+
+size_t num_interactions(const cfg::ControlFlowGraph& cfg,
+                        const SourceBlock* sb);
+
+inline float get_factor(SourceBlock* dominating,
+                        SourceBlock* dominated,
+                        size_t idx) {
+  float caller_val;
+  {
+    if (dominating == nullptr) {
+      return NAN;
+    }
+    auto val = dominating->get_val(idx);
+    if (!val) {
+      return NAN;
+    }
+    caller_val = *val;
+  }
+  if (caller_val == 0) {
+    return 0.0f;
+  }
+
+  float callee_val;
+  {
+    if (dominated == nullptr) {
+      return NAN;
+    }
+    auto val = dominated->get_val(idx);
+    if (!val) {
+      return NAN;
+    }
+    callee_val = *val;
+  }
+  if (callee_val == 0) {
+    return 0.0f;
+  }
+
+  // Expectation would be that callee_val >= caller_val. But tracking might
+  // not be complete.
+
+  // This will normalize to the value at the dominating source block.
+  return caller_val / callee_val;
+}
+
+inline void normalize(SourceBlock* sb, size_t idx, float factor) {
+  if (sb->vals[idx]) {
+    sb->vals[idx]->val *= factor;
+  }
+}
+
+inline void normalize(SourceBlock* dominating,
+                      SourceBlock* dominated,
+                      size_t interactions) {
+  for (size_t i = 0; i != interactions; ++i) {
+    auto sb_factor = get_factor(dominating, dominated, i);
+    normalize(dominated, i, sb_factor);
+  }
+}
+
+inline void normalize(ControlFlowGraph& cfg,
+                      SourceBlock* dominating,
+                      SourceBlock* dominated,
+                      size_t interactions) {
+  if (interactions == 0) {
+    return;
+  }
+  std::vector<float> factors;
+  factors.reserve(interactions);
+  for (size_t i = 0; i != interactions; ++i) {
+    factors.push_back(get_factor(dominating, dominated, i));
+  }
+  for (auto* b : cfg.blocks()) {
+    source_blocks::foreach_source_block(b, [&](auto* sb) {
+      for (size_t i = 0; i != interactions; ++i) {
+        normalize(sb, i, factors[i]);
+      }
+    });
+  }
+}
+
+inline void normalize(ControlFlowGraph& cfg,
+                      SourceBlock* dominating,
+                      size_t interactions) {
+  // Assume that integrity is guaranteed, so that val at entry is
+  // dominating all blocks.
+  normalize(
+      cfg, dominating, get_first_source_block(cfg.entry_block()), interactions);
+}
+
+} // namespace normalize
+
 void track_source_block_coverage(ScopedMetrics& sm,
                                  const DexStoresVector& stores);
 
@@ -322,8 +431,35 @@ struct ViolationsHelper {
 
   ViolationsHelper(Violation v,
                    const Scope& scope,
+                   size_t top_n,
                    std::vector<std::string> to_vis);
   ~ViolationsHelper();
+
+  void process(ScopedMetrics* sm);
+  void silence();
+
+  ViolationsHelper(ViolationsHelper&& other) noexcept;
+  ViolationsHelper& operator=(ViolationsHelper&& rhs) noexcept;
 };
+
+SourceBlock* get_first_source_block_of_method(const DexMethod* m);
+
+SourceBlock* get_any_first_source_block_of_methods(
+    const std::vector<const DexMethod*>& methods);
+
+void insert_synthetic_source_blocks_in_method(
+    DexMethod* method,
+    const std::function<std::unique_ptr<SourceBlock>()>& source_block_creator);
+
+void fill_source_block(SourceBlock& sb,
+                       DexMethod* ref,
+                       uint32_t id,
+                       const SourceBlock::Val& val);
+
+void fill_source_block(
+    SourceBlock& sb,
+    DexMethod* ref,
+    uint32_t id,
+    const std::optional<SourceBlock::Val>& opt_val = std::nullopt);
 
 } // namespace source_blocks

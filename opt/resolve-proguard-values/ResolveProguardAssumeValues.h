@@ -53,7 +53,19 @@ class ResolveProguardAssumeValuesPass : public Pass {
   //  }
   //
   ResolveProguardAssumeValuesPass() : Pass("ResolveProguardAssumeValuesPass") {}
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   static ResolveProguardAssumeValuesPass::Stats process_for_code(IRCode* code);
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector& stores,
                 ConfigFiles&,
                 PassManager& mgr) override;

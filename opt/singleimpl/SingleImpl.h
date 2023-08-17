@@ -26,6 +26,17 @@ class SingleImplPass : public Pass {
  public:
   SingleImplPass() : Pass("SingleImplPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+        {NoResolvablePureRefs, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   void bind_config() override {
     bind("allowlist", {}, m_pass_config.allowlist);
     bind("package_allowlist", {}, m_pass_config.package_allowlist);
@@ -41,6 +52,7 @@ class SingleImplPass : public Pass {
          m_pass_config.filter_proguard_special_interfaces);
   }
 
+  bool is_cfg_legacy() override { return true; }
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
   // count of removed interfaces

@@ -54,6 +54,18 @@ enum TypeTagConfig {
   INPUT_HANDLED = 3,
 };
 
+enum TypeLikeStringConfig {
+  // Type like strings are safe to be replaced with the name of the new
+  // shape class. The assumption is that the reflections against the type like
+  // strings still work after merging. This usually means type tags exist in the
+  // targeted input. Merging only changes class names not intiantiation pattern.
+  REPLACE = 0,
+  // Do not merge classes potentially reflected using the type like string. It's
+  // more conservative. We do not have the full knowledge about the reflection
+  // pattern. It's better to avoid merging altogether.
+  EXCLUDE = 1,
+};
+
 /**
  * A class hierarchy specification to model for erasure.
  * This is normally specified via config entries:
@@ -153,11 +165,8 @@ struct ModelSpec {
   // capture stack traces for human-written code may make java stack trace
   // confusing.
   bool dedup_fill_in_stack_trace{true};
-  // Replace string literals matching a merged type.
-  bool replace_type_like_const_strings{true};
-  // Whether string literals matching class names disqualifies classes from
-  // being merged
-  bool type_like_const_strings_unsafe{false};
+  // Replace type like string or exclude potentially referenced class.
+  TypeLikeStringConfig type_like_string_confg{TypeLikeStringConfig::EXCLUDE};
   // Indicates if the merging should be performed per dex.
   bool per_dex_grouping{false};
   // The Model targets are generated code. If so, we consider merging_targets as
@@ -190,6 +199,14 @@ struct ModelSpec {
            type_tag_config == TypeTagConfig::INPUT_PASS_TYPE_TAG_TO_CTOR;
   }
 
+  bool replace_type_like_strings() const {
+    return type_like_string_confg == TypeLikeStringConfig::REPLACE;
+  }
+
+  bool exclude_type_like_strings() const {
+    return type_like_string_confg == TypeLikeStringConfig::EXCLUDE;
+  }
+
   boost::optional<size_t> max_num_dispatch_target{boost::none};
 };
 
@@ -201,6 +218,8 @@ struct ModelStats {
   uint32_t m_dropped = 0;
   // InterDex grouping stats
   std::map<InterdexSubgroupIdx, size_t> m_interdex_groups{};
+  // MergingStrategy grouping stats
+  std::map<size_t, size_t> m_merging_size_counts{};
   // Stats for approximate shape merging
   ApproximateStats m_approx_stats{};
   // Merging related stats
@@ -284,8 +303,6 @@ class Model {
 
   bool process_method_meta() const { return m_spec.process_method_meta; }
   bool keep_debug_info() const { return m_spec.keep_debug_info; }
-
-  void update_redex_stats(PassManager& mgr) const;
 
   static void build_interdex_groups(ConfigFiles& conf);
 
@@ -372,7 +389,6 @@ class Model {
   static std::unordered_map<DexType*, size_t> s_cls_to_interdex_group;
   static size_t s_num_interdex_groups;
 
- private:
   /**
    * Build a Model given a set of roots and a set of types deriving from the
    * roots.
@@ -430,7 +446,7 @@ class Model {
                           MergerType::ShapeHierarchy& hier);
   void flatten_shapes(const MergerType& merger,
                       MergerType::ShapeCollector& shapes);
-  TypeGroupByDex group_per_dex(bool per_dex_grouping, const TypeSet& types);
+  TypeGroupByDex group_per_dex(const TypeSet& types, const ModelSpec& spec);
   TypeSet get_types_in_current_interdex_group(
       const TypeSet& types, const ConstTypeHashSet& interdex_group_types);
 
@@ -464,7 +480,7 @@ class Model {
 
   void move_child_to_mergeables(MergerType& merger, const DexType* child) {
     TRACE(CLMG, 3, "Adding child %s to merger %s", show_type(child).c_str(),
-          print(&merger).c_str());
+          print(merger).c_str());
     remove_child(child);
     merger.mergeables.insert(child);
   }
@@ -473,7 +489,7 @@ class Model {
                                                      // header.
 
   // printers
-  std::string print(const MergerType* merger) const;
+  std::string print(const MergerType& merger) const;
   std::string print(const DexType* type) const;
   std::string print(const DexType* type, int nest) const;
 
@@ -482,10 +498,13 @@ class Model {
   void walk_hierarchy_helper(HierarchyWalkerFn walker, const DexType* type) {
     const auto& children = m_hierarchy.find(type);
     if (children == m_hierarchy.end()) return;
-    for (const auto& child : children->second) {
-      const auto& merger = m_mergers.find(child);
-      if (merger != m_mergers.end() && !merger->second.dummy) {
-        walker(merger->second);
+    for (const auto* child : children->second) {
+      const auto& merger_it = m_mergers.find(child);
+      if (merger_it != m_mergers.end()) {
+        const auto& merger = merger_it->second;
+        if (!merger.dummy) {
+          walker(merger);
+        }
       }
       walk_hierarchy_helper(walker, child);
     }

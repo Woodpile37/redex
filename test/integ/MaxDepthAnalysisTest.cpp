@@ -19,6 +19,16 @@
 class AnalysisConsumerPass : public Pass {
  public:
   AnalysisConsumerPass() : Pass("AnalysisConsumerPass") {}
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+    };
+  }
+
   void set_analysis_usage(AnalysisUsage& au) const override {
     au.add_required<MaxDepthAnalysisPass>();
     au.set_preserve_all();
@@ -55,6 +65,7 @@ struct MaxDepthAnalysisTest : public RedexIntegrationTest {
     config["MaxDepthAnalysisPass"] = Json::objectValue;
     config["AnalysisConsumerPass"] = Json::objectValue;
     ConfigFiles conf(config);
+    conf.parse_global_config();
     std::vector<Pass*> passes{analysis_pass.get(), consumer_pass.get()};
     pass_manager = std::make_unique<PassManager>(passes, conf);
     pass_manager->set_testing_mode();

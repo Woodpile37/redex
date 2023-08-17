@@ -54,16 +54,17 @@
 #include <cinttypes>
 #include <utility>
 
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/PatriciaTreeSetAbstractDomain.h>
+#include <sparta/ReducedProductAbstractDomain.h>
+
 #include "BaseIRAnalyzer.h"
 #include "CFGMutation.h"
-#include "ConstantAbstractDomain.h"
 #include "ControlFlow.h"
 #include "FieldOpTracker.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "PatriciaTreeSetAbstractDomain.h"
-#include "ReducedProductAbstractDomain.h"
 #include "Resolver.h"
 #include "Show.h"
 #include "StlUtil.h"
@@ -239,14 +240,14 @@ const CseUnorderedLocationSet general_memory_barrier_locations =
     CseUnorderedLocationSet{
         CseLocation(CseSpecialLocations::GENERAL_MEMORY_BARRIER)};
 
-class Analyzer final : public BaseIRAnalyzer<CseEnvironment> {
+class Analyzer final : public BaseEdgeAwareIRAnalyzer<CseEnvironment> {
  public:
   Analyzer(SharedState* shared_state,
            cfg::ControlFlowGraph& cfg,
            bool is_method_static,
            bool is_method_init_or_clinit,
            DexType* declaring_type)
-      : BaseIRAnalyzer(cfg), m_shared_state(shared_state) {
+      : BaseEdgeAwareIRAnalyzer(cfg), m_shared_state(shared_state) {
     // Collect all read locations
     std::unordered_map<CseLocation, size_t, CseLocationHasher>
         read_location_counts;
@@ -385,11 +386,11 @@ class Analyzer final : public BaseIRAnalyzer<CseEnvironment> {
       }
     }
 
-    MonotonicFixpointIterator::run(CseEnvironment::top());
+    run(CseEnvironment::top());
   }
 
-  void analyze_instruction(const IRInstruction* insn,
-                           CseEnvironment* current_state) const override {
+  void analyze_instruction_normal(
+      const IRInstruction* insn, CseEnvironment* current_state) const override {
     const auto set_current_state_at = [&](reg_t reg, bool wide,
                                           ValueIdDomain value) {
       current_state->mutate_ref_env([&](RefEnvironment* env) {
@@ -436,12 +437,6 @@ class Analyzer final : public BaseIRAnalyzer<CseEnvironment> {
             get_value_id_domain(insn, current_state, clobbered_locations);
         current_state->mutate_ref_env(
             [&](RefEnvironment* env) { env->set(RESULT_REGISTER, domain); });
-        if (opcode == OPCODE_NEW_ARRAY && domain.get_constant()) {
-          auto value = get_array_length_value(*domain.get_constant());
-          TRACE(CSE, 4, "[CSE] installing array-length forwarding for %s",
-                SHOW(insn));
-          install_forwarding(insn, value, current_state);
-        }
       }
       break;
     }
@@ -480,15 +475,31 @@ class Analyzer final : public BaseIRAnalyzer<CseEnvironment> {
       if (any_changes) {
         m_shared_state->log_barrier(make_barrier(insn));
       }
+    }
+  }
 
-      if (!clobbered_locations.count(
-              CseLocation(CseSpecialLocations::GENERAL_MEMORY_BARRIER))) {
-        auto value = get_equivalent_put_value(insn, current_state);
-        if (value) {
-          TRACE(CSE, 4, "[CSE] installing store-to-load forwarding for %s",
-                SHOW(insn));
-          install_forwarding(insn, *value, current_state);
-        }
+  void analyze_no_throw(const IRInstruction* insn,
+                        CseEnvironment* current_state) const override {
+    auto opcode = insn->opcode();
+    if (opcode == OPCODE_NEW_ARRAY) {
+      const auto& domain = current_state->get_ref_env().get(RESULT_REGISTER);
+      if (domain.get_constant()) {
+        auto value = get_array_length_value(*domain.get_constant());
+        TRACE(CSE, 4, "[CSE] installing array-length forwarding for %s",
+              SHOW(insn));
+        install_forwarding(insn, value, current_state);
+      }
+      return;
+    }
+    auto value = get_equivalent_put_value(insn, current_state);
+    if (value) {
+      auto barrier = make_barrier(insn);
+      if (is_barrier_relevant(barrier, m_read_locations) &&
+          get_written_location(barrier) !=
+              CseLocation(CseSpecialLocations::GENERAL_MEMORY_BARRIER)) {
+        TRACE(CSE, 4, "[CSE] installing store-to-load forwarding for %s",
+              SHOW(insn));
+        install_forwarding(insn, *value, current_state);
       }
     }
   }
@@ -878,10 +889,12 @@ namespace cse_impl {
 
 SharedState::SharedState(
     const std::unordered_set<DexMethodRef*>& pure_methods,
-    const std::unordered_set<const DexString*>& finalish_field_names)
+    const std::unordered_set<const DexString*>& finalish_field_names,
+    const std::unordered_set<const DexField*>& finalish_fields)
     : m_pure_methods(pure_methods),
       m_safe_methods(pure_methods),
-      m_finalish_field_names(finalish_field_names) {
+      m_finalish_field_names(finalish_field_names),
+      m_finalish_fields(finalish_fields) {
   // The following methods are...
   // - static, or
   // - direct (constructors), or
@@ -906,6 +919,7 @@ SharedState::SharedState(
       "Ljava/lang/Byte;.parseByte:(Ljava/lang/String;)B",
       "Ljava/lang/Class;.forName:(Ljava/lang/String;)Ljava/lang/Class;",
       "Ljava/lang/Double;.parseDouble:(Ljava/lang/String;)D",
+      // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
       "Ljava/lang/Enum;.valueOf:(Ljava/lang/Class;Ljava/lang/String;)Ljava/"
       "lang/Enum;",
       "Ljava/lang/Float;.parseFloat:(Ljava/lang/String;)F",
@@ -1315,6 +1329,7 @@ bool SharedState::has_pure_method(const IRInstruction* insn) const {
 
 bool SharedState::is_finalish(const DexField* field) const {
   return is_final(field) || !!m_finalizable_fields.count(field) ||
+         !!m_finalish_fields.count(field) ||
          !!m_finalish_field_names.count(field->get_name());
 }
 
@@ -1394,9 +1409,10 @@ CommonSubexpressionElimination::CommonSubexpressionElimination(
     if (env.is_bottom()) {
       continue;
     }
+    auto last_insn = block->get_last_insn();
     for (const auto& mie : InstructionIterable(block)) {
       IRInstruction* insn = mie.insn;
-      analyzer.analyze_instruction(insn, &env);
+      analyzer.analyze_instruction(insn, &env, insn == last_insn->insn);
       auto opcode = insn->opcode();
       if (!insn->has_dest() || opcode::is_a_move(opcode) ||
           opcode::is_a_const(opcode)) {
@@ -1780,13 +1796,14 @@ void CommonSubexpressionElimination::insert_runtime_assertions(
       always_assert(!type.is_bottom());
       TRACE(CSE, 6, "[CSE] to check: %s => %s - r%u: %s", SHOW(earlier_insn),
             SHOW(insn), temp, SHOW(type.element()));
-      always_assert(type.element() != CONST2);
-      always_assert(type.element() != LONG2);
-      always_assert(type.element() != DOUBLE2);
-      always_assert(type.element() != SCALAR2);
-      if (type.element() != ZERO && type.element() != CONST &&
-          type.element() != INT && type.element() != REFERENCE &&
-          type.element() != LONG1) {
+      always_assert(type.element() != IRType::CONST2);
+      always_assert(type.element() != IRType::LONG2);
+      always_assert(type.element() != IRType::DOUBLE2);
+      always_assert(type.element() != IRType::SCALAR2);
+      if (type.element() != IRType::ZERO && type.element() != IRType::CONST &&
+          type.element() != IRType::INT &&
+          type.element() != IRType::REFERENCE &&
+          type.element() != IRType::LONG1) {
         // TODO: Handle floats and doubles via Float.floatToIntBits and
         // Double.doubleToLongBits to deal with NaN.
         // TODO: Improve TypeInference so that we never have to deal with
@@ -1816,7 +1833,7 @@ void CommonSubexpressionElimination::insert_runtime_assertions(
                        throw_info->index);
       }
 
-      if (type.element() == LONG1) {
+      if (type.element() == IRType::LONG1) {
         auto cmp_reg = m_cfg.allocate_temp();
         IRInstruction* cmp_insn = new IRInstruction(OPCODE_CMP_LONG);
         cmp_insn->set_dest(cmp_reg);

@@ -172,29 +172,45 @@ TEST(BundleResources, TestCollectResFilesByRid) {
 }
 
 TEST(BundleResources, ReadLayout) {
-  setup_resources_and_run(
-      [&](const std::string& extract_dir, BundleResources* resources) {
-        std::unordered_set<std::string> layout_classes;
-        std::unordered_set<std::string> attrs_to_read;
-        attrs_to_read.emplace(ONCLICK_ATTRIBUTE);
-        std::unordered_multimap<std::string, std::string> attribute_values;
-        resources->collect_layout_classes_and_attributes_for_file(
-            std::getenv("test_layout_path"),
-            attrs_to_read,
-            &layout_classes,
-            &attribute_values);
-        EXPECT_EQ(layout_classes.size(), 2);
-        EXPECT_EQ(layout_classes.count("Lcom/fb/bundles/WickedCoolButton;"), 1);
-        EXPECT_EQ(layout_classes.count("Lcom/fb/bundles/NiftyViewGroup;"), 1);
+  setup_resources_and_run([&](const std::string& extract_dir,
+                              BundleResources* resources) {
+    std::unordered_set<std::string> layout_classes;
+    std::unordered_set<std::string> attrs_to_read;
+    attrs_to_read.emplace(ONCLICK_ATTRIBUTE);
+    std::unordered_multimap<std::string, std::string> attribute_values;
+    resources->collect_layout_classes_and_attributes_for_file(
+        std::getenv("test_layout_path"),
+        attrs_to_read,
+        &layout_classes,
+        &attribute_values);
+    EXPECT_EQ(layout_classes.size(), 2);
+    EXPECT_EQ(layout_classes.count("Lcom/fb/bundles/WickedCoolButton;"), 1);
+    EXPECT_EQ(layout_classes.count("Lcom/fb/bundles/NiftyViewGroup;"), 1);
 
-        auto range = attribute_values.equal_range(ONCLICK_ATTRIBUTE);
-        size_t found_method_names = 0;
-        for (auto it = range.first; it != range.second; ++it) {
-          found_method_names++;
-          EXPECT_TRUE(it->second == "performFoo" || it->second == "performBar");
-        }
-        EXPECT_EQ(found_method_names, 2);
-      });
+    auto range = attribute_values.equal_range(ONCLICK_ATTRIBUTE);
+    size_t found_method_names = 0;
+    for (auto it = range.first; it != range.second; ++it) {
+      found_method_names++;
+      EXPECT_TRUE(it->second == "performFoo" || it->second == "performBar");
+    }
+    EXPECT_EQ(found_method_names, 2);
+
+    // Parse another file with slightly different form.
+    std::unordered_set<std::string> more_classes;
+    std::unordered_multimap<std::string, std::string> more_attribute_values;
+    resources->collect_layout_classes_and_attributes_for_file(
+        std::getenv("another_layout_path"),
+        {},
+        &more_classes,
+        &more_attribute_values);
+    EXPECT_EQ(more_classes.size(), 5);
+    EXPECT_EQ(more_classes.count("Lcom/facebook/BananaView;"), 1);
+    EXPECT_EQ(
+        more_classes.count("Landroidx/fragment/app/FragmentContainerView;"), 1);
+    EXPECT_EQ(more_classes.count("Lcom/facebook/SomeFragment;"), 1);
+    EXPECT_EQ(more_classes.count("Lcom/facebook/AnotherFragment;"), 1);
+    EXPECT_EQ(more_classes.count("Lcom/facebook/CoolView;"), 1);
+  });
 }
 
 TEST(BundleResources, RenameLayout) {
@@ -237,7 +253,8 @@ TEST(BundleResources, ReadResource) {
     EXPECT_EQ(bg_grey.size(), 1);
     obtain_resource_name_back = id_to_name.at(bg_grey[0]);
     EXPECT_EQ(obtain_resource_name_back, "bg_grey");
-    auto drawable_type_id = res_table->get_types_by_name({"drawable"});
+    std::unordered_set<std::string> types = {"drawable"};
+    auto drawable_type_id = res_table->get_types_by_name(types);
     EXPECT_EQ(drawable_type_id.size(), 1);
     std::unordered_set<std::string> drawable_res_names;
     for (const auto& pair : id_to_name) {
@@ -465,7 +482,8 @@ TEST(BundleResources, ObfuscateResourcesName) {
     EXPECT_EQ(files.size(), 1);
     EXPECT_EQ(*files.begin(), "base/res/drawable-mdpi-v4/icon.png");
 
-    auto type_ids = res_table->get_types_by_name({"color"});
+    std::unordered_set<std::string> types = {"color"};
+    auto type_ids = res_table->get_types_by_name(types);
     std::unordered_set<uint32_t> shifted_allow_type_ids;
     for (auto& type_id : type_ids) {
       shifted_allow_type_ids.emplace(type_id >> TYPE_INDEX_BIT_SHIFT);
@@ -474,10 +492,8 @@ TEST(BundleResources, ObfuscateResourcesName) {
     filepath_old_to_new["base/res/drawable-mdpi-v4/icon.png"] =
         "base/res/a.png";
     res_table->obfuscate_resource_and_serialize(
-        resources->find_resources_files(),
-        filepath_old_to_new,
-        shifted_allow_type_ids,
-        {"keep_me_unused_"});
+        resources->find_resources_files(), filepath_old_to_new,
+        shifted_allow_type_ids, {"keep_me_unused_"}, {});
 
     auto res_table_new = resources->load_res_table();
 
@@ -490,7 +506,7 @@ TEST(BundleResources, ObfuscateResourcesName) {
     EXPECT_EQ(res_table_new->get_res_ids_by_name("hex_or_file2").size(), 0);
     EXPECT_EQ(res_table_new->get_res_ids_by_name("duplicate_name").size(), 2);
     EXPECT_EQ(res_table_new->get_res_ids_by_name(RESOURCE_NAME_REMOVED).size(),
-              5);
+              7);
     const auto& id_to_name = res_table_new->id_to_name;
     EXPECT_EQ(id_to_name.at(color1_id), RESOURCE_NAME_REMOVED);
     EXPECT_EQ(id_to_name.at(color3_id), RESOURCE_NAME_REMOVED);

@@ -7,6 +7,7 @@
 
 #include <boost/optional.hpp>
 #include <string>
+#include <unistd.h>
 
 class ScopedCommandProfiling final {
  public:

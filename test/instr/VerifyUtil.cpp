@@ -23,10 +23,28 @@
 #include "VerifyUtil.h"
 #include "Walkers.h"
 
+int find_class_idx(const DexClasses& classes, const char* name) {
+  for (size_t i = 0; i < classes.size(); ++i) {
+    if (!strcmp(name, classes[i]->get_name()->c_str())) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 DexClass* find_class_named(const DexClasses& classes, const char* name) {
   auto it =
       std::find_if(classes.begin(), classes.end(), [&name](DexClass* cls) {
         return !strcmp(name, cls->get_name()->c_str());
+      });
+  return it == classes.end() ? nullptr : *it;
+}
+
+DexClass* find_class_named(const DexClasses& classes,
+                           const std::function<bool(const char*)>& matcher) {
+  auto it =
+      std::find_if(classes.begin(), classes.end(), [&matcher](DexClass* cls) {
+        return matcher(cls->get_name()->c_str());
       });
   return it == classes.end() ? nullptr : *it;
 }
@@ -63,6 +81,16 @@ DexMethod* find_vmethod_named(const DexClass& cls, const char* name) {
       std::find_if(vmethods.begin(), vmethods.end(), [&name](DexMethod* m) {
         return strcmp(name, m->get_name()->c_str()) == 0;
       });
+  return it == vmethods.end() ? nullptr : *it;
+}
+
+DexMethod* find_vmethod(const DexClass& cls,
+                        const char* name,
+                        const DexProto* proto) {
+  auto vmethods = cls.get_vmethods();
+  auto it = std::find_if(vmethods.begin(), vmethods.end(), [&](DexMethod* m) {
+    return strcmp(name, m->get_name()->c_str()) == 0 && m->get_proto() == proto;
+  });
   return it == vmethods.end() ? nullptr : *it;
 }
 
@@ -113,6 +141,27 @@ DexOpcodeMethod* find_invoke(std::vector<DexInstruction*>::iterator begin,
   return it == end ? nullptr : static_cast<DexOpcodeMethod*>(*it);
 }
 
+size_t find_num_invoke(const DexMethod* m,
+                       DexOpcode opcode,
+                       const char* target_mname,
+                       DexType* receiver) {
+  size_t num = 0;
+  for (const auto& insn : m->get_dex_code()->get_instructions()) {
+    if (insn->opcode() != opcode) {
+      continue;
+    }
+    auto meth = static_cast<DexOpcodeMethod*>(insn)->get_method();
+    if (receiver && meth->get_class() != receiver) {
+      continue;
+    }
+    auto mname = static_cast<DexOpcodeMethod*>(insn)->get_method()->get_name();
+    if (mname == DexString::get_string(target_mname)) {
+      num++;
+    }
+  }
+  return num;
+}
+
 // Given a semicolon delimited list of extracted files from the APK, return a
 // map of the original APK's file path to its path on disk.
 ResourceFiles decode_resource_paths(const char* location, const char* suffix) {
@@ -144,7 +193,7 @@ DexInstruction* find_instruction(DexMethod* m, DexOpcode opcode) {
   return it == insns.end() ? nullptr : *it;
 }
 
-void verify_type_erased(const DexClass* cls, size_t num_dmethods) {
+void verify_class_merged(const DexClass* cls, size_t num_dmethods) {
   if (!cls) {
     ASSERT_EQ(num_dmethods, 0)
         << "cls is null, can not have " << num_dmethods << " dmethods\n";

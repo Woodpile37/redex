@@ -27,6 +27,15 @@ class FinalInlinePass : public Pass {
  public:
   FinalInlinePass() : Pass("FinalInlinePass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+    };
+  }
+
   void bind_config() override {
     bind("blocklist_annos",
          {},
@@ -52,6 +61,8 @@ class FinalInlinePass : public Pass {
   static size_t propagate_constants_for_test(Scope& scope,
                                              bool inline_string_fields,
                                              bool inline_wide_fields);
+
+  bool is_cfg_legacy() override { return true; }
 
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 

@@ -37,7 +37,8 @@ void load_types(const std::vector<std::string>& type_names, Types& types) {
 /**
  * Verify model specs are consistent
  */
-bool verify_model_spec(const ModelSpec& model_spec) {
+bool verify_model_spec(const std::vector<ModelSpec>& model_specs,
+                       const ModelSpec& model_spec) {
   always_assert_log(
       !model_spec.name.empty(),
       "[ClassMerging] Wrong specification: model must have \"name\"");
@@ -60,6 +61,20 @@ bool verify_model_spec(const ModelSpec& model_spec) {
         root,
         "[ClassMerging] Wrong specification: model %s must have \"roots\"",
         model_spec.name.c_str());
+    if (type_class(root) == nullptr) {
+      TRACE(CLMG, 2,
+            "[ClassMerging] Wrong specification: model %s has \"root\" %s w/o "
+            "definition",
+            model_spec.name.c_str(), SHOW(root));
+      return false;
+    }
+  }
+
+  for (const auto& spec : model_specs) {
+    bool duplicated =
+        spec.name == model_spec.name || spec.roots == model_spec.roots;
+    always_assert_log(!duplicated, "Duplicated model spec %s",
+                      model_spec.name.c_str());
   }
   return true;
 }
@@ -92,6 +107,14 @@ TypeTagConfig get_type_tag_config(const std::string& type_tag_config) {
   TRACE(CLMG, 5, "type tag config %s %d", type_tag_config.c_str(),
         string_to_config.at(type_tag_config));
   return string_to_config.at(type_tag_config);
+}
+
+TypeLikeStringConfig get_type_like_string_config(
+    const std::string& type_like_string_config) {
+  const static std::unordered_map<std::string, TypeLikeStringConfig>
+      string_to_config = {{"replace", TypeLikeStringConfig::REPLACE},
+                          {"exclude", TypeLikeStringConfig::EXCLUDE}};
+  return string_to_config.at(type_like_string_config);
 }
 
 } // namespace
@@ -218,31 +241,41 @@ void ClassMergingPass::bind_config() {
       model_spec.get("merge_types_with_static_fields", false,
                      model.merge_types_with_static_fields);
       model_spec.get("keep_debug_info", false, model.keep_debug_info);
-      model_spec.get("replace_type_like_const_strings", true,
-                     model.replace_type_like_const_strings);
-      model_spec.get("type_like_const_strings_unsafe", false,
-                     model.type_like_const_strings_unsafe);
+
+      // TypeLikeStringConfig defaults to `exclude`.
+      std::string type_like_string_config;
+      model_spec.get("type_like_string_config", "exclude",
+                     type_like_string_config);
+      model.type_like_string_confg =
+          get_type_like_string_config(type_like_string_config);
+      if (model.type_like_string_confg == TypeLikeStringConfig::REPLACE) {
+        always_assert_log(
+            model.type_tag_config != TypeTagConfig::GENERATE,
+            "Type like strings are not safe to replace with TypeTagConfig %s",
+            type_tag_config.c_str());
+      }
+
       if (max_count > 0) {
         model.max_count = boost::optional<size_t>(max_count);
       }
       model.process_method_meta = process_method_meta;
       model.max_num_dispatch_target = m_max_num_dispatch_target;
       // Assume config based models are all generated code.
-      model.is_generated_code = true;
+      model_spec.get("is_generated_code", true, model.is_generated_code);
 
       std::string usage_mode_str =
           model_spec.get("type_usage_mode", std::string(""));
       model.interdex_grouping_inferring_mode =
           parse_grouping_inferring_mode(usage_mode_str, default_mode);
 
-      if (!verify_model_spec(model)) {
+      if (!verify_model_spec(m_model_specs, model)) {
         continue;
       }
 
       m_model_specs.emplace_back(std::move(model));
     }
 
-    TRACE(CLMG, 2, "[ClassMerging] valid model specs %ld",
+    TRACE(CLMG, 2, "[ClassMerging] valid model specs %zu",
           m_model_specs.size());
   });
 }

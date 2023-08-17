@@ -16,8 +16,6 @@
 #include "Trace.h"
 #include "Walkers.h"
 
-namespace mog = method_override_graph;
-
 namespace {
 
 std::unordered_set<DexMethod*> methodgroups_to_methodset(
@@ -111,7 +109,7 @@ void generate_dispatches(
     uint32_t id = 0;
     for (auto it = p.second.begin(); it != p.second.end(); ++it) {
       auto cur_meth = *it;
-      code_size += cur_meth->get_code()->sum_opcode_sizes();
+      code_size += cur_meth->get_code()->estimate_code_units();
       if (code_size > HARD_MAX_INSTRUCTION_SIZE) {
         create_one_dispatch(indices_to_callee, min_method_group_size,
                             old_to_new, stats);

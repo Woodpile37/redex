@@ -10,6 +10,7 @@
 #include "BuilderAnalysis.h"
 #include "DexClass.h"
 #include "Inliner.h"
+#include "InlinerConfig.h"
 #include "TypeSystem.h"
 
 namespace builder_pattern {
@@ -50,7 +51,7 @@ class BuilderTransform {
   const DexType* m_root;
   std::unique_ptr<MultiMethodInliner> m_inliner;
   inliner::InlinerConfig m_inliner_config;
-  ConcurrentMethodRefCache m_concurrent_resolved_refs;
+  ConcurrentMethodResolver m_concurrent_method_resolver;
 
   // Used for tracking changes that we need to restore.
   std::unordered_map<DexMethod*, DexMethod*> m_method_copy;

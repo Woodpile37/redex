@@ -26,7 +26,7 @@ struct LocalDceTryTest : public RedexTest {
   LocalDceTryTest() {
     // Calling get_vmethods under the hood initializes the object-class, which
     // we need in the tests to create a proper scope
-    get_vmethods(type::java_lang_Object());
+    virt_scope::get_vmethods(type::java_lang_Object());
 
     auto args = DexTypeList::make_type_list({});
     auto proto = DexProto::make_proto(type::_void(), args);
@@ -582,6 +582,28 @@ TEST_F(LocalDceTryTest, invoked_static_method_with_pure_external_barrier) {
   LocalDce ldce(&init_classes_with_side_effects, pure_methods);
   IRCode* ircode = code.get();
   ldce.dce(ircode);
+  EXPECT_CODE_EQ(ircode, expected_code.get());
+}
+
+TEST_F(LocalDceTryTest, new_instances_infinite_loop) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (new-instance "Ljava/lang/Object;")
+      (move-result-pseudo-object v0)
+      (:loop)
+      (goto :loop)
+    )
+  )");
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (:loop)
+      (goto :loop)
+    )
+  )");
+
+  Scope scope{type_class(type::java_lang_Object())};
+  IRCode* ircode = code.get();
+  dce(ircode);
   EXPECT_CODE_EQ(ircode, expected_code.get());
 }
 

@@ -9,6 +9,7 @@
 
 #include <boost/range/any_range.hpp>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ class DexFieldRef;
 class DexMethodHandle;
 class DexMethodRef;
 class DexOpcodeData;
+class DexProto;
 class DexString;
 class DexType;
 
@@ -184,6 +186,8 @@ class IRInstruction final {
   }
 
   bool has_data() const { return opcode::ref(m_opcode) == opcode::Ref::Data; }
+
+  bool has_proto() const { return opcode::ref(m_opcode) == opcode::Ref::Proto; }
 
   /*
    * Number of registers used.
@@ -354,9 +358,16 @@ class IRInstruction final {
     return m_data;
   }
 
-  IRInstruction* set_data(DexOpcodeData* data) {
-    always_assert(has_data());
-    m_data = data;
+  IRInstruction* set_data(std::unique_ptr<DexOpcodeData> data);
+
+  DexProto* get_proto() const {
+    always_assert(has_proto());
+    return m_proto;
+  }
+
+  IRInstruction* set_proto(DexProto* proto) {
+    always_assert(has_proto());
+    m_proto = proto;
     return this;
   }
 
@@ -419,6 +430,7 @@ class IRInstruction final {
     DexOpcodeData* m_data;
     DexCallSite* m_callsite;
     DexMethodHandle* m_methodhandle;
+    DexProto* m_proto;
   };
   // 16 bytes so far
   union {

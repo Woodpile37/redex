@@ -8,6 +8,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <sys/types.h>
@@ -19,10 +20,12 @@
 #include "utils/Serialize.h"
 #include "utils/Visitor.h"
 
+#include "GlobalConfig.h"
 #include "RedexMappedFile.h"
 #include "RedexResources.h"
 
 // Compiled XML reading helper functions. Only applicable to APK input files.
+std::string convert_from_string16(const android::String16& string16);
 std::string get_string_attribute_value(const android::ResXMLTree& parser,
                                        const android::String16& attribute_name);
 
@@ -42,8 +45,33 @@ bool get_bool_attribute_value(const android::ResXMLTree& parser,
                               bool default_value);
 
 namespace apk {
-std::string get_string_from_pool(const android::ResStringPool& pool,
-                                 size_t idx);
+class XmlValueCollector : public arsc::XmlFileVisitor {
+ public:
+  ~XmlValueCollector() override {}
+
+  bool visit_attribute_ids(uint32_t* id, size_t count) override {
+    for (size_t i = 0; i < count; i++) {
+      auto res_id = id[i];
+      if (res_id > PACKAGE_RESID_START) {
+        m_ids.emplace(res_id);
+      }
+    }
+    return true;
+  }
+
+  bool visit_typed_data(android::Res_value* value) override {
+    auto data_type = value->dataType;
+    auto res_id = dtohl(value->data);
+    if (res_id > PACKAGE_RESID_START &&
+        (data_type == android::Res_value::TYPE_REFERENCE ||
+         data_type == android::Res_value::TYPE_ATTRIBUTE)) {
+      m_ids.emplace(res_id);
+    }
+    return true;
+  }
+
+  std::unordered_set<uint32_t> m_ids;
+};
 
 class XmlFileEditor : public arsc::XmlFileVisitor {
  public:
@@ -120,11 +148,13 @@ class TableEntryParser : public TableParser {
   std::vector<android::ResTable_config*> get_configs(uint32_t package_id,
                                                      uint8_t type_id) {
     std::vector<android::ResTable_config*> vec;
-    auto& types =
-        m_types_to_configs.at(make_package_type_id(package_id, type_id));
-    vec.reserve(types.size());
-    for (auto& t : types) {
-      vec.emplace_back(&t->config);
+    auto key = make_package_type_id(package_id, type_id);
+    if (m_types_to_configs.count(key) > 0) {
+      auto& types = m_types_to_configs.at(key);
+      vec.reserve(types.size());
+      for (auto& t : types) {
+        vec.emplace_back(&t->config);
+      }
     }
     return vec;
   }
@@ -226,7 +256,8 @@ class ResourcesArscFile : public ResourceTableFile {
       const std::vector<std::string>& resource_files,
       const std::map<std::string, std::string>& filepath_old_to_new,
       const std::unordered_set<uint32_t>& allowed_types,
-      const std::unordered_set<std::string>& keep_resource_prefixes) override;
+      const std::unordered_set<std::string>& keep_resource_prefixes,
+      const std::unordered_set<std::string>& keep_resource_specific) override;
   size_t serialize();
 
   size_t package_count() override;
@@ -251,7 +282,7 @@ class ResourcesArscFile : public ResourceTableFile {
   void remap_file_paths_and_serialize(
       const std::vector<std::string>& resource_files,
       const std::unordered_map<std::string, std::string>& old_to_new) override;
-  void remove_unreferenced_strings() override;
+  void finalize_resource_table(const ResourceConfig& config) override;
   std::vector<std::string> get_files_by_rid(
       uint32_t res_id,
       ResourcePathType path_type = ResourcePathType::DevicePath) override;
@@ -302,6 +333,13 @@ class ApkResources : public AndroidResources {
       std::unordered_set<std::string>* out_classes,
       std::unordered_multimap<std::string, std::string>* out_attributes)
       override;
+  void collect_xml_attribute_string_values_for_file(
+      const std::string& file_path,
+      std::unordered_set<std::string>* out) override;
+  void fully_qualify_layout(
+      const std::unordered_map<std::string, std::string>& element_to_class_name,
+      const std::string& file_path,
+      size_t* changes) override;
 
   // Given the bytes of a binary XML file, replace the entries (if any) in the
   // ResStringPool. Writes result to the given Vector output param.
@@ -321,6 +359,9 @@ class ApkResources : public AndroidResources {
   std::unordered_set<std::string> find_all_xml_files() override;
   std::vector<std::string> find_resources_files() override;
   std::string get_base_assets_dir() override;
+  void obfuscate_xml_files(const std::unordered_set<std::string>& allowed_types,
+                           const std::unordered_set<std::string>&
+                               do_not_obfuscate_elements) override;
 
  protected:
   std::vector<std::string> find_res_directories() override;

@@ -7,12 +7,13 @@
 
 #pragma once
 
-#include "ConstantAbstractDomain.h"
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/DisjointUnionAbstractDomain.h>
+#include <sparta/FiniteAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/ReducedProductAbstractDomain.h>
+
 #include "DexUtil.h"
-#include "DisjointUnionAbstractDomain.h"
-#include "FiniteAbstractDomain.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "ReducedProductAbstractDomain.h"
 
 enum Nullness {
   NN_BOTTOM,
@@ -23,7 +24,8 @@ enum Nullness {
   NN_TOP // Nullable
 };
 
-using NullnessLattice = sparta::BitVectorLattice<Nullness, 5, std::hash<int>>;
+using NullnessLattice = sparta::BitVectorLattice<Nullness,
+                                                 /* kCardinality */ 5>;
 
 /*
  *         TOP (Nullable)
@@ -61,7 +63,7 @@ using ConstantDomain = sparta::ConstantAbstractDomain<int64_t>;
  *
  * A const integer value can have nullness. E.g., const 0 -> NULL.
  */
-class ConstNullnessDomain
+class ConstNullnessDomain final
     : public sparta::ReducedProductAbstractDomain<ConstNullnessDomain,
                                                   ConstantDomain,
                                                   NullnessDomain> {
@@ -181,12 +183,12 @@ class ArrayNullnessDomain final
     });
   }
 
-  void join_with(const ArrayNullnessDomain& other) override {
+  void join_with(const ArrayNullnessDomain& other) {
     BaseType::join_with(other);
     reduce();
   }
 
-  void widen_with(const ArrayNullnessDomain& other) override {
+  void widen_with(const ArrayNullnessDomain& other) {
     BaseType::widen_with(other);
     reduce();
   }

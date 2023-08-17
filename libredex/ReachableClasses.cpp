@@ -17,6 +17,7 @@
 #include <unordered_set>
 
 #include "ClassHierarchy.h"
+#include "ControlFlow.h"
 #include "DexClass.h"
 #include "FbjniMarker.h"
 #include "Match.h"
@@ -192,7 +193,9 @@ void analyze_reflection(const Scope& scope) {
   std::mutex mutation_mutex;
   walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
     std::unique_ptr<ReflectionAnalysis> analysis = nullptr;
-    for (auto& mie : InstructionIterable(code)) {
+    code.build_cfg(true, false);
+    auto& cfg = code.cfg();
+    for (auto& mie : InstructionIterable(cfg)) {
       IRInstruction* insn = mie.insn;
       if (!opcode::is_an_invoke(insn->opcode())) {
         continue;
@@ -275,6 +278,7 @@ void analyze_reflection(const Scope& scope) {
         break;
       }
     }
+    code.clear_cfg();
   });
 }
 
@@ -348,15 +352,15 @@ void mark_reachable_by_classname(DexType* dtype) {
 // https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r15/core/java/android/view/View.java#5331
 // Returns true if it matches that criteria, and it's in the set of known
 // attribute values.
-bool matches_onclick_method(const DexMethod* dmethod,
-                            const std::set<std::string>& names_to_keep) {
+bool matches_onclick_method(
+    const DexMethod* dmethod,
+    const std::unordered_set<std::string_view>& names_to_keep) {
   auto prototype = dmethod->get_proto();
   auto args_list = prototype->get_args();
   if (args_list->size() == 1) {
     auto first_type = args_list->at(0);
-    if (strcmp(first_type->c_str(), "Landroid/view/View;") == 0) {
-      std::string method_name = dmethod->c_str();
-      return names_to_keep.count(method_name) > 0;
+    if (first_type->str() == "Landroid/view/View;") {
+      return names_to_keep.count(dmethod->str()) > 0;
     }
   }
   return false;
@@ -371,7 +375,8 @@ bool matches_onclick_method(const DexMethod* dmethod,
 // is overkill. We only need to keep methods "foo" defined on a subclass of
 // android.content.Context that accept 1 argument (an android.view.View).
 void mark_onclick_attributes_reachable(
-    const Scope& scope, const std::set<std::string>& onclick_attribute_values) {
+    const Scope& scope,
+    const std::unordered_set<std::string_view>& onclick_attribute_values) {
   if (onclick_attribute_values.empty()) {
     return;
   }
@@ -398,7 +403,7 @@ void mark_onclick_attributes_reachable(
 }
 
 DexClass* maybe_class_from_string(const std::string& classname) {
-  auto dtype = DexType::get_type(classname.c_str());
+  auto dtype = DexType::get_type(classname);
   if (dtype == nullptr) {
     return nullptr;
   }
@@ -571,15 +576,15 @@ void initialize_reachable_for_json_serde(
 }
 
 void keep_methods(const Scope& scope, const std::vector<std::string>& ms) {
-  std::set<std::string> methods_to_keep(ms.begin(), ms.end());
+  std::unordered_set<std::string_view> methods_to_keep(ms.begin(), ms.end());
   for (const auto* cls : scope) {
     for (auto* m : cls->get_dmethods()) {
-      if (methods_to_keep.count(m->get_name()->c_str())) {
+      if (methods_to_keep.count(m->get_name()->str())) {
         m->rstate.ref_by_string();
       }
     }
     for (auto* m : cls->get_vmethods()) {
-      if (methods_to_keep.count(m->get_name()->c_str())) {
+      if (methods_to_keep.count(m->get_name()->str())) {
         m->rstate.ref_by_string();
       }
     }
@@ -627,8 +632,7 @@ void analyze_serializable(const Scope& scope) {
     // any Serializable class, if they are themselves not Serializable.
     if (!children.count(child_super_type)) {
       for (auto meth : child_supercls->get_dmethods()) {
-        if (method::is_init(meth) &&
-            meth->get_proto()->get_args()->size() == 0) {
+        if (method::is_init(meth) && meth->get_proto()->get_args()->empty()) {
           meth->rstate.set_root(keep_reason::SERIALIZABLE);
         }
       }
@@ -653,7 +657,6 @@ void init_reachable_classes(const Scope& scope,
                             const ReachableClassesConfig& config) {
   {
     Timer t{"Mark keep-methods"};
-    std::vector<std::string> methods;
     keep_methods(scope, config.keep_methods);
   }
 
@@ -672,7 +675,7 @@ void init_reachable_classes(const Scope& scope,
       // Classnames present in native libraries (lib/*/*.so)
       auto resources = create_resource_reader(config.apk_dir);
       for (const std::string& classname : resources->get_native_classes()) {
-        auto type = DexType::get_type(classname.c_str());
+        auto type = DexType::get_type(classname);
         if (type == nullptr) continue;
         TRACE(PGR, 3, "native_lib: %s", classname.c_str());
         mark_reachable_by_classname(type);
@@ -697,7 +700,6 @@ void init_reachable_classes(const Scope& scope,
   {
     Timer t{"Analyzing reflection"};
     analyze_reflection(scope);
-
     std::unordered_set<DexClass*> reflected_package_classes;
     for (auto clazz : scope) {
       const auto name = clazz->get_type()->get_name()->str();

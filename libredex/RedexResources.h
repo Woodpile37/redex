@@ -25,6 +25,7 @@
 #include "androidfw/ResourceTypes.h"
 
 #include "Debug.h"
+#include "GlobalConfig.h"
 #include "RedexMappedFile.h"
 
 const char* const ONCLICK_ATTRIBUTE = "android:onClick";
@@ -43,6 +44,24 @@ struct TypeDefinition {
   std::string name;
   std::vector<android::ResTable_config*> configs;
   std::vector<uint32_t> source_res_ids;
+};
+
+inline bool is_resource_class_name(const std::string_view c_name) {
+  return c_name.find("/R$") != std::string::npos;
+}
+bool is_r_class(const DexClass* cls);
+void gather_r_classes(const Scope& scope, std::vector<DexClass*>* vec);
+// List of tags in xml documents for which we should hunt in attribute values
+// for class names.
+const inline std::unordered_set<std::string>
+    KNOWN_ELEMENTS_WITH_CLASS_ATTRIBUTES = {
+        "fragment", "view",   "dialog",
+        "activity", "intent", "androidx.fragment.app.FragmentContainerView",
+};
+const inline std::vector<std::string> POSSIBLE_CLASS_ATTRIBUTES = {
+    "class",
+    "name",
+    "targetClass",
 };
 } // namespace resources
 
@@ -126,8 +145,18 @@ class ResourceTableFile {
   // This API is wonky, but meant to mimic iterating over the .arsc file type
   // string pool and how that would behave.
   virtual void get_type_names(std::vector<std::string>* type_names) = 0;
+  // Return type ids for the given set of type names. Type ids will be shifted
+  // to TT0000 range, so type 0x1 will be returned as 0x10000 (for ease of
+  // comparison with resource IDs).
   virtual std::unordered_set<uint32_t> get_types_by_name(
       const std::unordered_set<std::string>& type_names) = 0;
+  // Same as above, return values will be given in no particular order.
+  std::unordered_set<uint32_t> get_types_by_name(
+      const std::vector<std::string>& type_names) {
+    std::unordered_set<std::string> set;
+    set.insert(type_names.begin(), type_names.end());
+    return get_types_by_name(set);
+  }
   virtual std::unordered_set<uint32_t> get_types_by_name_prefixes(
       const std::unordered_set<std::string>& type_name_prefixes) = 0;
   virtual void delete_resource(uint32_t red_id) = 0;
@@ -148,18 +177,21 @@ class ResourceTableFile {
   virtual void remap_file_paths_and_serialize(
       const std::vector<std::string>& resource_files,
       const std::unordered_map<std::string, std::string>& old_to_new) = 0;
-  // Rename qualified resource names that are in allowed type and don't have
-  // keep_resource_prefixes to "(name removed)". Also rename filepaths
-  // according to filepath_old_to_new.
+  // Rename qualified resource names that are in allowed type, and are not in
+  // the specific list of resource names to keep and don't have a prefix in the
+  // keep_resource_prefixes set. All such resource names will be rewritten to
+  // "(name removed)". Also, rename filepaths according to filepath_old_to_new.
   virtual size_t obfuscate_resource_and_serialize(
       const std::vector<std::string>& resource_files,
       const std::map<std::string, std::string>& filepath_old_to_new,
       const std::unordered_set<uint32_t>& allowed_types,
-      const std::unordered_set<std::string>& keep_resource_prefixes) = 0;
+      const std::unordered_set<std::string>& keep_resource_prefixes,
+      const std::unordered_set<std::string>& keep_resource_specific) = 0;
 
   // Removes entries from string pool structures that are not referenced by
-  // entries/values in the resource table
-  virtual void remove_unreferenced_strings();
+  // entries/values in the resource table and other structural changes that are
+  // better left until all passes have run.
+  virtual void finalize_resource_table(const ResourceConfig& config);
 
   // Returns any file paths from entries in the given ID. A non-existent ID or
   // an for which all values are not files will return an empty vector.
@@ -220,6 +252,22 @@ class ResourceTableFile {
     return std::vector<uint32_t>{};
   }
 
+  // For a given type name like "layout" return all resource ids in that type.
+  std::vector<uint32_t> get_res_ids_by_type_name(const std::string& type) {
+    std::vector<uint32_t> result;
+    std::unordered_set<std::string> types{type};
+    auto type_ids = get_types_by_name(types);
+    if (!type_ids.empty()) {
+      auto type_id = *type_ids.begin();
+      for (const auto& id : sorted_res_ids) {
+        if ((id & type_id) == type_id) {
+          result.emplace_back(id);
+        }
+      }
+    }
+    return result;
+  }
+
   std::vector<uint32_t> sorted_res_ids;
   std::map<uint32_t, std::string> id_to_name;
   std::map<std::string, std::vector<uint32_t>> name_to_ids;
@@ -263,6 +311,22 @@ class AndroidResources {
       const std::unordered_set<std::string>& attributes_to_read,
       std::unordered_set<std::string>* out_classes,
       std::unordered_multimap<std::string, std::string>* out_attributes) = 0;
+  // Similar to collect_layout_classes_and_attributes, but less focused to cover
+  // custom View subclasses that might be doing interesting things with string
+  // values
+  void collect_xml_attribute_string_values(
+      std::unordered_set<std::string>* out);
+  // As above, for single file.
+  virtual void collect_xml_attribute_string_values_for_file(
+      const std::string& file_path, std::unordered_set<std::string>* out) = 0;
+  // Transforms element names in the given map to be <view> elements with their
+  // class name specified fully qualified. Out param indicates the number of
+  // elements that were changed.
+  virtual void fully_qualify_layout(
+      const std::unordered_map<std::string, std::string>& element_to_class_name,
+      const std::string& file_path,
+      size_t* changes) = 0;
+
   virtual std::unique_ptr<ResourceTableFile> load_res_table() = 0;
   virtual size_t remap_xml_reference_attributes(
       const std::string& filename,
@@ -270,7 +334,16 @@ class AndroidResources {
   virtual std::unordered_set<std::string> find_all_xml_files() = 0;
   virtual std::vector<std::string> find_resources_files() = 0;
   virtual std::string get_base_assets_dir() = 0;
-
+  // For drawable/layout .xml files, remove/shorten attribute names where
+  // possible. Any file with an element name in the given set will be kept
+  // intact by convention (this method will be overly cautious when applying
+  // keeps).
+  virtual void obfuscate_xml_files(
+      const std::unordered_set<std::string>& allowed_types,
+      const std::unordered_set<std::string>& do_not_obfuscate_elements) = 0;
+  bool can_obfuscate_xml_file(
+      const std::unordered_set<std::string>& allowed_types,
+      const std::string& dirname);
   // Classnames present in native libraries (lib/*/*.so)
   std::unordered_set<std::string> get_native_classes();
 
@@ -312,7 +385,7 @@ bool is_raw_resource(const std::string& filename);
 
 // Convenience method for copying values in a multimap to a set, for a
 // particular key.
-std::set<std::string> multimap_values_to_set(
+std::unordered_set<std::string_view> multimap_values_to_set(
     const std::unordered_multimap<std::string, std::string>& map,
     const std::string& key);
 

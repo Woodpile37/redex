@@ -7,15 +7,16 @@
 
 #include "ConstructorParams.h"
 
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/ReducedProductAbstractDomain.h>
+
 #include "BaseIRAnalyzer.h"
-#include "ConstantAbstractDomain.h"
 #include "ConstantPropagationAnalysis.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
 #include "IRList.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
 #include "ReachableClasses.h"
-#include "ReducedProductAbstractDomain.h"
 #include "Resolver.h"
 #include "ScopedCFG.h"
 #include "Walkers.h"
@@ -131,7 +132,7 @@ class InitFixpointIterator final
           env->set(RESULT_REGISTER, ParamIdxDomain::top());
           return;
         }
-        boost::lock_guard<boost::mutex> lock(
+        std::unique_lock<std::mutex> lock(
             m_state.method_initializers.get_lock(method));
         auto it = m_state.method_initializers.find(method);
         if (it != m_state.method_initializers.end()) {

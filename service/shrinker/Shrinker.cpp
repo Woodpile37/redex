@@ -7,6 +7,8 @@
 
 #include "Shrinker.h"
 
+#include <fstream>
+
 #include "ConstructorParams.h"
 #include "LinearScan.h"
 #include "RandomForest.h"
@@ -78,7 +80,8 @@ Shrinker::Shrinker(
     const ShrinkerConfig& config,
     int min_sdk,
     const std::unordered_set<DexMethodRef*>& configured_pure_methods,
-    const std::unordered_set<const DexString*>& configured_finalish_field_names)
+    const std::unordered_set<const DexString*>& configured_finalish_field_names,
+    const std::unordered_set<const DexField*>& configured_finalish_fields)
     : m_forest(load(config.reg_alloc_random_forest)),
       m_xstores(stores),
       m_config(config),
@@ -89,7 +92,8 @@ Shrinker::Shrinker(
                 config.run_dedup_blocks),
       m_init_classes_with_side_effects(init_classes_with_side_effects),
       m_pure_methods(configured_pure_methods),
-      m_finalish_field_names(configured_finalish_field_names) {
+      m_finalish_field_names(configured_finalish_field_names),
+      m_finalish_fields(configured_finalish_fields) {
   // Initialize the singletons that `operator()` needs ahead of time to
   // avoid a data race.
   static_cast<void>(constant_propagation::EnumFieldAnalyzerState::get());
@@ -105,7 +109,7 @@ Shrinker::Shrinker(
     }
     if (config.run_cse) {
       m_cse_shared_state = std::make_unique<cse_impl::SharedState>(
-          m_pure_methods, m_finalish_field_names);
+          m_pure_methods, m_finalish_field_names, m_finalish_fields);
     }
     if (config.run_local_dce && config.compute_pure_methods) {
       std::unique_ptr<const method_override_graph::Graph> owned_override_graph;
@@ -148,11 +152,12 @@ constant_propagation::Transform::Stats Shrinker::constant_propagation(
       constant_propagation::ConstantPrimitiveAndBoxedAnalyzer(
           &m_immut_analyzer_state, &m_immut_analyzer_state,
           constant_propagation::EnumFieldAnalyzerState::get(),
-          constant_propagation::BoxedBooleanAnalyzerState::get(),
-          constant_propagation::ApiLevelAnalyzerState::get(m_min_sdk), nullptr),
+          constant_propagation::BoxedBooleanAnalyzerState::get(), nullptr,
+          constant_propagation::ApiLevelAnalyzerState::get(m_min_sdk), nullptr,
+          &m_immut_analyzer_state, nullptr),
       /* imprecise_switches */ true);
   fp_iter.run(initial_env);
-  constant_propagation::Transform tf(config);
+  constant_propagation::Transform tf(config, &m_runtime_cache);
   tf.apply(fp_iter, constant_propagation::WholeProgramState(), code->cfg(),
            &m_xstores, is_static, declaring_type, proto);
   return tf.get_stats();
@@ -207,6 +212,9 @@ void Shrinker::shrink_code(
   bool editable_cfg_built = code->editable_cfg_built();
   // force simplification/linearization of any existing editable cfg once, and
   // forget existing cfg for a clean start
+  if (editable_cfg_built) {
+    code->cfg().recompute_registers_size();
+  }
   code->clear_cfg();
 
   constant_propagation::Transform::Stats const_prop_stats;
@@ -221,8 +229,10 @@ void Shrinker::shrink_code(
       code->build_cfg(/* editable */ true);
     }
 
-    const_prop_stats =
-        constant_propagation(is_static, declaring_type, proto, code, {}, {});
+    constant_propagation::Transform::Config config;
+    config.pure_methods = &m_pure_methods;
+    const_prop_stats = constant_propagation(is_static, declaring_type, proto,
+                                            code, {}, config);
   }
 
   if (m_config.run_cse) {

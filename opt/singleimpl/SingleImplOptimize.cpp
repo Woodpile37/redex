@@ -55,16 +55,23 @@ void set_type_refs(const DexType* intf, const SingleImplData& data) {
  */
 DexProto* get_or_make_proto(const DexType* intf,
                             DexType* impl,
-                            DexProto* proto) {
+                            DexProto* proto,
+                            bool skip_args = false) {
   DexType* rtype = proto->get_rtype();
-  if (rtype == intf) rtype = impl;
+  if (rtype == intf) {
+    rtype = impl;
+  }
   DexTypeList* new_args = nullptr;
   const auto args = proto->get_args();
   DexTypeList::ContainerType new_arg_list;
   for (const auto arg : *args) {
     new_arg_list.push_back(arg == intf ? impl : arg);
   }
-  new_args = DexTypeList::make_type_list(std::move(new_arg_list));
+  if (skip_args) {
+    new_args = args;
+  } else {
+    new_args = DexTypeList::make_type_list(std::move(new_arg_list));
+  }
   return DexProto::make_proto(rtype, new_args, proto->get_shorty());
 }
 
@@ -174,8 +181,9 @@ using CheckCastSet = std::unordered_set<const IRInstruction*>;
 
 struct OptimizationImpl {
   OptimizationImpl(std::unique_ptr<SingleImplAnalysis> analysis,
-                   const ClassHierarchy& ch)
-      : single_impls(std::move(analysis)), ch(ch) {}
+                   const ClassHierarchy& ch,
+                   const api::AndroidSDK& api)
+      : single_impls(std::move(analysis)), ch(ch), m_api(api) {}
 
   OptimizeStats optimize(Scope& scope, const SingleImplConfig& config);
 
@@ -216,6 +224,7 @@ struct OptimizationImpl {
   std::unordered_set<DexType*> optimized;
   const ClassHierarchy& ch;
   std::unordered_map<std::string_view, size_t> deobfuscated_name_counters;
+  const api::AndroidSDK& m_api;
 };
 
 /**
@@ -413,6 +422,12 @@ CheckCastSet OptimizationImpl::fix_instructions(const DexType* intf,
             continue;
           }
 
+          // Return.
+          if (opcode::is_return_object(insn->opcode())) {
+            reg_t casted = add_check_cast(insn->src(0));
+            insn->set_src(0, casted);
+          }
+
           // Others do not need fixup.
         }
       },
@@ -591,6 +606,28 @@ EscapeReason OptimizationImpl::check_method_collision(
                                  proto,
                                  type_class(method->get_class()),
                                  method->is_virtual());
+    }
+    // For bridge method, a collision could exist with the actual implementation
+    // method if the interface to be removed is also on the parameter list.
+    // Example:
+    //   interface Intf { Intf setup(Intf i); }
+    //   class Impl {
+    //     Impl setup(Intf i) {
+    //       return this;
+    //     }
+    //   }
+    //
+    // The bridge method on class Impl is Intf setup(Intf).
+    // The actual implementation method on class Impl is Impl setup(Intf).
+    // The collision only exists if we update the proto for both methods.
+    // Alternatively, for the bridge method, we can perform additional collision
+    // check by only update the rtype on the proto (Impl is Impl setup(Intf) in
+    // the above example) just to be conservative.
+    if (!collision && is_bridge(method)) {
+      proto = get_or_make_proto(intf, data.cls, method->get_proto(),
+                                /* skip_args */ true);
+      collision =
+          DexMethod::get_method(method->get_class(), method->get_name(), proto);
     }
     if (collision) {
       TRACE(INTF, 9, "Found collision %s", SHOW(method));
@@ -790,15 +827,20 @@ check_casts::impl::Stats OptimizationImpl::post_process(
   // parallel.
   check_casts::impl::Stats stats;
   std::mutex mutex;
+  auto& api = m_api;
   for_all_methods(
       methods,
-      [&stats, &mutex, removed_instructions](const DexMethod* m_const) {
+      [&stats, &mutex, removed_instructions, &api](const DexMethod* m_const) {
         auto m = const_cast<DexMethod*>(m_const);
         auto code = m->get_code();
         always_assert(!code->editable_cfg_built());
         cfg::ScopedCFG cfg(code);
-        check_casts::CheckCastConfig config;
-        check_casts::impl::CheckCastAnalysis analysis(config, m);
+        // T131253060 If enable weaken, we are hitting an assertion in
+        // CheckCastAnalysis where a definition of a value is unknown. This only
+        // occurs here within SingleImplPass, but not in subsequent
+        // CheckCastRemovals where weaken is enabled by default.
+        check_casts::CheckCastConfig config{.weaken = false};
+        check_casts::impl::CheckCastAnalysis analysis(config, m, api);
         auto casts = analysis.collect_redundant_checks_replacement();
         auto local_stats = check_casts::impl::apply(m, casts);
         std::lock_guard<std::mutex> lock_guard(mutex);
@@ -819,7 +861,8 @@ check_casts::impl::Stats OptimizationImpl::post_process(
 OptimizeStats optimize(std::unique_ptr<SingleImplAnalysis> analysis,
                        const ClassHierarchy& ch,
                        Scope& scope,
-                       const SingleImplConfig& config) {
-  OptimizationImpl optimizer(std::move(analysis), ch);
+                       const SingleImplConfig& config,
+                       const api::AndroidSDK& api) {
+  OptimizationImpl optimizer(std::move(analysis), ch, api);
   return optimizer.optimize(scope, config);
 }

@@ -11,20 +11,21 @@
 
 #include <boost/optional.hpp>
 
-#include "AbstractDomain.h"
+#include <sparta/AbstractDomain.h>
+#include <sparta/FiniteAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/PatriciaTreeSet.h>
+#include <sparta/ReducedProductAbstractDomain.h>
+
 #include "DexUtil.h"
-#include "FiniteAbstractDomain.h"
 #include "NullnessDomain.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "PatriciaTreeSet.h"
-#include "ReducedProductAbstractDomain.h"
 #include "TypeUtil.h"
 
 namespace dtv_impl {
 
 class DexTypeValue final : public sparta::AbstractValue<DexTypeValue> {
  public:
-  ~DexTypeValue() override {
+  ~DexTypeValue() {
     static_assert(std::is_default_constructible<DexType*>::value,
                   "Constant is not default constructible");
     static_assert(std::is_copy_constructible<DexType*>::value,
@@ -37,9 +38,9 @@ class DexTypeValue final : public sparta::AbstractValue<DexTypeValue> {
 
   explicit DexTypeValue(const DexType* dex_type) : m_dex_type(dex_type) {}
 
-  void clear() override { m_dex_type = nullptr; }
+  void clear() { m_dex_type = nullptr; }
 
-  sparta::AbstractValueKind kind() const override {
+  sparta::AbstractValueKind kind() const {
     return sparta::AbstractValueKind::Value;
   }
 
@@ -60,7 +61,7 @@ class DexTypeValue final : public sparta::AbstractValue<DexTypeValue> {
    */
   bool is_none() const { return m_dex_type == nullptr; }
 
-  bool leq(const DexTypeValue& other) const override {
+  bool leq(const DexTypeValue& other) const {
     if (equals(other)) {
       return true;
     }
@@ -75,13 +76,13 @@ class DexTypeValue final : public sparta::AbstractValue<DexTypeValue> {
     return type::check_cast(l, r);
   }
 
-  bool equals(const DexTypeValue& other) const override {
+  bool equals(const DexTypeValue& other) const {
     return m_dex_type == other.get_dex_type();
   }
 
-  sparta::AbstractValueKind join_with(const DexTypeValue& other) override;
+  sparta::AbstractValueKind join_with(const DexTypeValue& other);
 
-  sparta::AbstractValueKind widen_with(const DexTypeValue& other) override {
+  sparta::AbstractValueKind widen_with(const DexTypeValue& other) {
     if (equals(other)) {
       return kind();
     }
@@ -96,7 +97,7 @@ class DexTypeValue final : public sparta::AbstractValue<DexTypeValue> {
     return sparta::AbstractValueKind::Top;
   }
 
-  sparta::AbstractValueKind meet_with(const DexTypeValue& other) override {
+  sparta::AbstractValueKind meet_with(const DexTypeValue& other) {
     if (equals(other)) {
       return sparta::AbstractValueKind::Value;
     }
@@ -104,7 +105,7 @@ class DexTypeValue final : public sparta::AbstractValue<DexTypeValue> {
     return sparta::AbstractValueKind::Bottom;
   }
 
-  sparta::AbstractValueKind narrow_with(const DexTypeValue& other) override {
+  sparta::AbstractValueKind narrow_with(const DexTypeValue& other) {
     return meet_with(other);
   }
 
@@ -187,44 +188,40 @@ class SmallSetDexTypeDomain final
     m_kind = sparta::AbstractValueKind::Value;
   }
 
-  bool is_bottom() const override {
-    return m_kind == sparta::AbstractValueKind::Bottom;
-  }
+  bool is_bottom() const { return m_kind == sparta::AbstractValueKind::Bottom; }
 
-  bool is_top() const override {
-    return m_kind == sparta::AbstractValueKind::Top;
-  }
+  bool is_top() const { return m_kind == sparta::AbstractValueKind::Top; }
 
-  void set_to_bottom() override {
+  void set_to_bottom() {
     m_kind = sparta::AbstractValueKind::Bottom;
     m_types.clear();
   }
 
-  void set_to_top() override {
+  void set_to_top() {
     m_kind = sparta::AbstractValueKind::Top;
     m_types.clear();
   }
 
   sparta::AbstractValueKind kind() const { return m_kind; }
 
-  sparta::PatriciaTreeSet<const DexType*> get_types() const {
+  const sparta::PatriciaTreeSet<const DexType*>& get_types() const {
     always_assert(!is_top());
     return m_types;
   }
 
-  bool leq(const SmallSetDexTypeDomain& other) const override;
+  bool leq(const SmallSetDexTypeDomain& other) const;
 
-  bool equals(const SmallSetDexTypeDomain& other) const override;
+  bool equals(const SmallSetDexTypeDomain& other) const;
 
-  void join_with(const SmallSetDexTypeDomain& other) override;
+  void join_with(const SmallSetDexTypeDomain& other);
 
-  void widen_with(const SmallSetDexTypeDomain& other) override;
+  void widen_with(const SmallSetDexTypeDomain& other);
 
-  void meet_with(const SmallSetDexTypeDomain& /* other */) override {
+  void meet_with(const SmallSetDexTypeDomain& /* other */) {
     throw std::runtime_error("meet_with not implemented!");
   }
 
-  void narrow_with(const SmallSetDexTypeDomain& /* other */) override {
+  void narrow_with(const SmallSetDexTypeDomain& /* other */) {
     throw std::runtime_error("narrow_with not implemented!");
   }
 
@@ -237,15 +234,27 @@ class SmallSetDexTypeDomain final
 };
 
 /*
- *
- * NullnessDomain X SingletonDexTypeDomain
- *
+ * Domain for StringDef and IntDef annotations, where the DexType will track the
+ * annotation name. This will enforce null safety and prevent the joins of two
+ * different annotations.
+ * https://developer.android.com/studio/write/annotations#enum-annotations
  */
-class DexTypeDomain
+using TypedefAnnotationDomain = SingletonDexTypeDomain;
+
+/*
+ *
+ * ArrayConstNullnessDomain X SingletonDexTypeDomain X SmallSetDexTypeDomain
+ *
+ *
+ * When the SmallSetDexTypeDomain has elements, then they represent an exact set
+ * of non-interface classes (including arrays), or possibly java.lang.Throwable.
+ */
+class DexTypeDomain final
     : public sparta::ReducedProductAbstractDomain<DexTypeDomain,
                                                   ArrayConstNullnessDomain,
                                                   SingletonDexTypeDomain,
-                                                  SmallSetDexTypeDomain> {
+                                                  SmallSetDexTypeDomain,
+                                                  TypedefAnnotationDomain> {
  public:
   using ReducedProductAbstractDomain::ReducedProductAbstractDomain;
 
@@ -253,7 +262,8 @@ class DexTypeDomain
       sparta::ReducedProductAbstractDomain<DexTypeDomain,
                                            ArrayConstNullnessDomain,
                                            SingletonDexTypeDomain,
-                                           SmallSetDexTypeDomain>;
+                                           SmallSetDexTypeDomain,
+                                           TypedefAnnotationDomain>;
 
   // Some older compilers complain that the class is not default
   // constructible. We intended to use the default constructors of the base
@@ -265,30 +275,40 @@ class DexTypeDomain
       : ReducedProductAbstractDomain(
             std::make_tuple(ConstNullnessDomain(v),
                             SingletonDexTypeDomain(),
-                            SmallSetDexTypeDomain::top())) {}
+                            SmallSetDexTypeDomain::top(),
+                            TypedefAnnotationDomain())) {}
 
   explicit DexTypeDomain(const DexType* array_type, uint32_t array_length)
       : ReducedProductAbstractDomain(
             std::make_tuple(ArrayNullnessDomain(array_length),
                             SingletonDexTypeDomain(array_type),
-                            SmallSetDexTypeDomain(array_type))) {}
+                            SmallSetDexTypeDomain(array_type),
+                            TypedefAnnotationDomain())) {}
 
-  explicit DexTypeDomain(const DexType* dex_type)
+  explicit DexTypeDomain(const DexType* dex_type,
+                         const DexType* annotation = nullptr)
       : ReducedProductAbstractDomain(
             std::make_tuple(ConstNullnessDomain(NOT_NULL),
                             SingletonDexTypeDomain(dex_type),
-                            SmallSetDexTypeDomain(dex_type))) {}
+                            SmallSetDexTypeDomain(dex_type),
+                            TypedefAnnotationDomain(annotation))) {}
 
-  explicit DexTypeDomain(const DexType* dex_type, const Nullness nullness)
+  explicit DexTypeDomain(const DexType* dex_type,
+                         const Nullness nullness,
+                         bool is_dex_type_exact,
+                         const DexType* annotation = nullptr)
       : ReducedProductAbstractDomain(
             std::make_tuple(ConstNullnessDomain(nullness),
                             SingletonDexTypeDomain(dex_type),
-                            SmallSetDexTypeDomain(dex_type))) {}
+                            is_dex_type_exact ? SmallSetDexTypeDomain(dex_type)
+                                              : SmallSetDexTypeDomain::top(),
+                            TypedefAnnotationDomain(annotation))) {}
 
-  static void reduce_product(std::tuple<ArrayConstNullnessDomain,
-                                        SingletonDexTypeDomain,
-                                        SmallSetDexTypeDomain>& /* product */) {
-  }
+  static void reduce_product(
+      std::tuple<ArrayConstNullnessDomain,
+                 SingletonDexTypeDomain,
+                 SmallSetDexTypeDomain,
+                 TypedefAnnotationDomain>& /* product */) {}
 
   static DexTypeDomain null() { return DexTypeDomain(IS_NULL); }
 
@@ -346,10 +366,18 @@ class DexTypeDomain
     });
   }
 
-  SingletonDexTypeDomain get_single_domain() const { return get<1>(); }
+  const SingletonDexTypeDomain& get_single_domain() const { return get<1>(); }
+
+  const TypedefAnnotationDomain& get_annotation_domain() const {
+    return get<3>();
+  }
 
   boost::optional<const DexType*> get_dex_type() const {
     return get<1>().get_dex_type();
+  }
+
+  boost::optional<const DexType*> get_annotation_type() const {
+    return get<3>().get_dex_type();
   }
 
   boost::optional<const DexClass*> get_dex_cls() const {
@@ -361,9 +389,9 @@ class DexTypeDomain
     return dex_cls ? boost::optional<const DexClass*>(dex_cls) : boost::none;
   }
 
-  SmallSetDexTypeDomain get_set_domain() { return get<2>(); }
+  const SmallSetDexTypeDomain& get_set_domain() const { return get<2>(); }
 
-  sparta::PatriciaTreeSet<const DexType*> get_type_set() {
+  const sparta::PatriciaTreeSet<const DexType*>& get_type_set() const {
     return get<2>().get_types();
   }
 
@@ -372,7 +400,8 @@ class DexTypeDomain
       : ReducedProductAbstractDomain(
             std::make_tuple(ConstNullnessDomain(nullness),
                             SingletonDexTypeDomain::none(),
-                            SmallSetDexTypeDomain())) {}
+                            SmallSetDexTypeDomain(),
+                            TypedefAnnotationDomain::none())) {}
 };
 
 /*

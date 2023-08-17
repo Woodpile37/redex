@@ -8,6 +8,7 @@
 #pragma once
 
 #include "DexClass.h"
+#include "DexStructure.h"
 #include "InterDex.h"
 #include "InterDexPassPlugin.h"
 #include "Pass.h"
@@ -25,7 +26,7 @@ constexpr const char* METRIC_REORDER_CLASSES = "num_reorder_classes";
 constexpr const char* METRIC_REORDER_RESETS = "num_reorder_resets";
 constexpr const char* METRIC_REORDER_REPRIORITIZATIONS =
     "num_reorder_reprioritization";
-constexpr const char* METRIC_REORDER_CLASSES_WORST = "reorder_classes_worst";
+constexpr const char* METRIC_REORDER_CLASSES_SEEDS = "reorder_classes_seeds";
 
 constexpr const char* METRIC_CLASSES_ADDED_FOR_RELOCATED_METHODS =
     "num_classes_added_for_relocated_methods";
@@ -49,26 +50,30 @@ constexpr const char* METRIC_RESERVED_FREFS = "reserved_frefs";
 constexpr const char* METRIC_RESERVED_TREFS = "reserved_trefs";
 constexpr const char* METRIC_RESERVED_MREFS = "reserved_mrefs";
 constexpr const char* METRIC_EMIT_CANARIES = "emit_canaries";
-
-struct ReserveRefsInfo {
-  int64_t frefs;
-  int64_t trefs;
-  int64_t mrefs;
-
-  ReserveRefsInfo(int64_t _frefs, int64_t _trefs, int64_t _mrefs)
-      : frefs(_frefs), trefs(_trefs), mrefs(_mrefs) {}
-};
+constexpr const char* METRIC_ORDER_INTERDEX = "order_interdex";
 
 class InterDexPass : public Pass {
  public:
   explicit InterDexPass(bool register_plugins = true)
       : Pass(INTERDEX_PASS_NAME) {
+
     if (register_plugins) {
       std::unique_ptr<InterDexRegistry> plugin =
           std::make_unique<InterDexRegistry>();
       PluginRegistry::get().register_pass(INTERDEX_PASS_NAME,
                                           std::move(plugin));
     }
+  }
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Establishes},
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
   }
 
   void bind_config() override;
@@ -78,26 +83,29 @@ class InterDexPass : public Pass {
                  PassManager& mgr) override {
     ++m_eval;
   }
+
+  bool is_cfg_legacy() override { return true; }
+
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
+
+  bool minimize_cross_dex_refs() const { return m_minimize_cross_dex_refs; }
 
  private:
   bool m_static_prune;
+  bool m_order_interdex;
   bool m_emit_canaries;
   bool m_normal_primary_dex;
   bool m_keep_primary_order;
   int64_t m_linear_alloc_limit;
-  int64_t m_reserved_frefs;
-  int64_t m_reserved_trefs;
-  int64_t m_reserved_mrefs;
+  ReserveRefsInfo m_reserve_refs;
   bool m_can_touch_coldstart_cls;
   bool m_can_touch_coldstart_extended_cls;
   bool m_minimize_cross_dex_refs;
+  int64_t m_minimize_cross_dex_refs_explore_alternatives;
   bool m_fill_last_coldstart_dex{false};
   cross_dex_ref_minimizer::CrossDexRefMinimizerConfig
       m_minimize_cross_dex_refs_config;
-  CrossDexRelocatorConfig m_cross_dex_relocator_config;
   bool m_expect_order_list;
-  bool m_sort_remaining_classes;
   std::vector<std::string> m_methods_for_canary_clinit_reference;
   bool m_transitively_close_interdex_order{false};
 

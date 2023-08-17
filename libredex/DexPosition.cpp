@@ -15,17 +15,25 @@
 #include "Show.h"
 #include "Trace.h"
 
-DexPosition::DexPosition(uint32_t line) : line(line) {}
+DexPosition::DexPosition(const DexString* file, uint32_t line)
+    : file(file), line(line) {
+  always_assert(file != nullptr);
+}
 
 DexPosition::DexPosition(const DexString* method,
                          const DexString* file,
                          uint32_t line)
-    : method(method), file(file), line(line) {}
+    : method(method), file(file), line(line) {
+  always_assert(file != nullptr);
+}
 
 void DexPosition::bind(const DexString* method_, const DexString* file_) {
+  always_assert(file_ != nullptr);
   this->method = method_;
   this->file = file_;
 }
+
+void DexPosition::bind(const DexString* method_) { this->method = method_; }
 
 bool DexPosition::operator==(const DexPosition& that) const {
   return method == that.method && file == that.file && line == that.line &&
@@ -59,15 +67,18 @@ PositionPatternSwitchManager::PositionPatternSwitchManager()
 
 DexPosition* PositionPatternSwitchManager::internalize(DexPosition* pos) {
   always_assert(pos);
-  auto it = m_positions.find(*pos);
-  if (it == m_positions.end()) {
-    auto cloned_position = new DexPosition(*pos);
-    if (pos->parent) {
-      cloned_position->parent = internalize(pos->parent);
-    }
-    it = m_positions.emplace(*cloned_position, cloned_position).first;
+  auto it = m_positions.find(pos);
+  if (it != m_positions.end()) {
+    return it->second.get();
   }
-  return it->second;
+
+  auto cloned_position = new DexPosition(*pos);
+  if (pos->parent) {
+    cloned_position->parent = internalize(pos->parent);
+  }
+  m_positions.emplace(cloned_position,
+                      std::unique_ptr<DexPosition>(cloned_position));
+  return cloned_position;
 }
 
 uint32_t PositionPatternSwitchManager::make_pattern(

@@ -9,6 +9,7 @@
 
 #include "Reachability.h"
 #include "RedexTest.h"
+#include "Walkers.h"
 
 class ReachabilityTest : public RedexIntegrationTest {};
 
@@ -30,21 +31,25 @@ TEST_F(ReachabilityTest, ReachabilityFromProguardTest) {
 
   reachability::ObjectCounts before = reachability::count_objects(stores);
 
-  EXPECT_EQ(before.num_classes, 19);
-  EXPECT_EQ(before.num_methods, 35);
+  EXPECT_EQ(before.num_classes, 20);
+  EXPECT_EQ(before.num_methods, 39);
   EXPECT_EQ(before.num_fields, 3);
 
   int num_ignore_check_strings = 0;
   reachability::IgnoreSets ig_sets;
+  reachability::ReachableAspects reachable_aspects;
+  auto scope = build_class_scope(stores);
+  walk::parallel::code(scope, [&](auto*, auto& code) { code.build_cfg(); });
   auto reachable_objects = reachability::compute_reachable_objects(
-      stores, ig_sets, &num_ignore_check_strings);
+      stores, ig_sets, &num_ignore_check_strings, &reachable_aspects);
+  walk::parallel::code(scope, [&](auto*, auto& code) { code.clear_cfg(); });
 
   reachability::sweep(stores, *reachable_objects, nullptr);
 
   reachability::ObjectCounts after = reachability::count_objects(stores);
 
   EXPECT_EQ(after.num_classes, 7);
-  EXPECT_EQ(after.num_methods, 13);
+  EXPECT_EQ(after.num_methods, 14);
   EXPECT_EQ(after.num_fields, 2);
 }
 
@@ -66,22 +71,28 @@ TEST_F(ReachabilityTest, ReachabilityMarkAllTest) {
 
   reachability::ObjectCounts before = reachability::count_objects(stores);
 
-  EXPECT_EQ(before.num_classes, 19);
-  EXPECT_EQ(before.num_methods, 35);
+  EXPECT_EQ(before.num_classes, 20);
+  EXPECT_EQ(before.num_methods, 39);
   EXPECT_EQ(before.num_fields, 3);
 
   int num_ignore_check_strings = 0;
   reachability::IgnoreSets ig_sets;
+  reachability::ReachableAspects reachable_aspects;
+  auto scope = build_class_scope(stores);
+  walk::parallel::code(scope, [&](auto*, auto& code) { code.build_cfg(); });
   auto reachable_objects = reachability::compute_reachable_objects(
-      stores, ig_sets, &num_ignore_check_strings,
-      /* record_reachability */ false, /* should_mark_all_as_seed */ true,
-      nullptr);
+      stores, ig_sets, &num_ignore_check_strings, &reachable_aspects,
+      /* record_reachability */ false, /* relaxed_keep_class_members */ false,
+      /* cfg_gathering_check_instantiable */ false,
+      /* cfg_gathering_check_instance_callable */ false,
+      /* should_mark_all_as_seed */ true, nullptr);
+  walk::parallel::code(scope, [&](auto*, auto& code) { code.clear_cfg(); });
 
   reachability::sweep(stores, *reachable_objects, nullptr);
 
   reachability::ObjectCounts after = reachability::count_objects(stores);
 
-  EXPECT_EQ(after.num_classes, 19);
-  EXPECT_EQ(after.num_methods, 35);
+  EXPECT_EQ(after.num_classes, 20);
+  EXPECT_EQ(after.num_methods, 39);
   EXPECT_EQ(after.num_fields, 3);
 }

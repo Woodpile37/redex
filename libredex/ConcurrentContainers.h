@@ -10,13 +10,13 @@
 #include <functional>
 #include <initializer_list>
 #include <iterator>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
-#include <boost/thread.hpp>
-
 #include "Debug.h"
+#include "Timer.h"
 
 // Forward declaration.
 namespace cc_impl {
@@ -24,7 +24,37 @@ namespace cc_impl {
 template <typename Container, size_t n_slots>
 class ConcurrentContainerIterator;
 
+inline AccumulatingTimer s_destructor{};
+
+inline double get_destructor_seconds() { return s_destructor.get_seconds(); }
+
+inline size_t s_concurrent_destruction_threshold{
+    std::numeric_limits<size_t>::max()};
+
+void workqueue_run_for(size_t start,
+                       size_t end,
+                       const std::function<void(size_t)>& fn);
+
 } // namespace cc_impl
+
+// Use this scope at the top-level function of your application to allow for
+// fast concurrent destruction. Avoid changing the threshold in the global scope
+// due to hard to control global destruction order, and our dependency on
+// threading / the sparta-workqueue for concurrent destruction.
+class ConcurrentContainerConcurrentDestructionScope {
+  size_t m_last_threshold;
+
+ public:
+  explicit ConcurrentContainerConcurrentDestructionScope(
+      size_t threshold = 4096)
+      : m_last_threshold(threshold) {
+    std::swap(cc_impl::s_concurrent_destruction_threshold, m_last_threshold);
+  }
+
+  ~ConcurrentContainerConcurrentDestructionScope() {
+    std::swap(cc_impl::s_concurrent_destruction_threshold, m_last_threshold);
+  }
+};
 
 /*
  * This class implements the common functionalities of concurrent sets and maps.
@@ -56,7 +86,17 @@ class ConcurrentContainer {
   using const_iterator =
       cc_impl::ConcurrentContainerIterator<const Container, n_slots>;
 
-  virtual ~ConcurrentContainer() {}
+  virtual ~ConcurrentContainer() {
+    auto timer_scope = cc_impl::s_destructor.scope();
+    if (size() <= cc_impl::s_concurrent_destruction_threshold) {
+      for (size_t slot = 0; slot < n_slots; ++slot) {
+        m_slots[slot] = Container();
+      }
+      return;
+    }
+    cc_impl::workqueue_run_for(
+        0, n_slots, [this](size_t slot) { m_slots[slot] = Container(); });
+  }
 
   /*
    * Using iterators or accessor functions while the container is concurrently
@@ -132,7 +172,7 @@ class ConcurrentContainer {
    */
   size_t count(const Key& key) const {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(m_locks[slot]);
+    std::unique_lock<std::mutex> lock{m_locks[slot]};
     return m_slots[slot].count(key);
   }
 
@@ -146,7 +186,7 @@ class ConcurrentContainer {
    */
   size_t erase(const Key& key) {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(m_locks[slot]);
+    std::unique_lock<std::mutex> lock{m_locks[slot]};
     return m_slots[slot].erase(key);
   }
 
@@ -162,9 +202,24 @@ class ConcurrentContainer {
    * WARNING: Only use with unsafe functions, or risk deadlock or undefined
    * behavior!
    */
-  boost::mutex& get_lock(const Key& key) const {
+  std::mutex& get_lock(const Key& key) const {
     size_t slot = Hash()(key) % n_slots;
-    return get_lock(slot);
+    return get_lock_by_slot(slot);
+  }
+
+  /*
+   * This operation is not thread-safe.
+   */
+  Container move_to_container() {
+    Container res;
+    res.reserve(size());
+    for (size_t slot = 0; slot < n_slots; ++slot) {
+      auto& c = m_slots[slot];
+      res.insert(std::make_move_iterator(c.begin()),
+                 std::make_move_iterator(c.end()));
+      c.clear();
+    }
+    return res;
   }
 
  protected:
@@ -187,10 +242,9 @@ class ConcurrentContainer {
 
   const Container& get_container(size_t slot) const { return m_slots[slot]; }
 
-  boost::mutex& get_lock(size_t slot) const { return m_locks[slot]; }
+  std::mutex& get_lock_by_slot(size_t slot) const { return m_locks[slot]; }
 
- protected:
-  mutable boost::mutex m_locks[n_slots];
+  mutable std::mutex m_locks[n_slots];
   Container m_slots[n_slots];
 };
 
@@ -258,7 +312,7 @@ class ConcurrentMapContainer
    */
   Value at(const Key& key) const {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     return this->get_container(slot).at(KeyProjection()(key));
   }
 
@@ -295,7 +349,7 @@ class ConcurrentMapContainer
    */
   Value get(const Key& key, Value default_value) const {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     const auto& map = this->get_container(slot);
     const auto& it = map.find(KeyProjection()(key));
     if (it == map.end()) {
@@ -315,7 +369,7 @@ class ConcurrentMapContainer
    */
   bool insert(const std::pair<Key, Value>& entry) {
     size_t slot = Hash()(entry.first) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     auto& map = this->get_container(slot);
     return map
         .insert(std::make_pair(KeyProjection()(entry.first), entry.second))
@@ -346,7 +400,7 @@ class ConcurrentMapContainer
    */
   void insert_or_assign(const std::pair<Key, Value>& entry) {
     size_t slot = Hash()(entry.first) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     auto& map = this->get_container(slot);
     map[KeyProjection()(entry.first)] = entry.second;
   }
@@ -358,7 +412,18 @@ class ConcurrentMapContainer
   bool emplace(Args&&... args) {
     std::pair<Key, Value> entry(std::forward<Args>(args)...);
     size_t slot = Hash()(entry.first) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
+    auto& map = this->get_container(slot);
+    return map
+        .emplace(KeyProjection()(std::move(entry.first)),
+                 std::move(entry.second))
+        .second;
+  }
+
+  template <typename... Args>
+  bool emplace_unsafe(Args&&... args) {
+    std::pair<Key, Value> entry(std::forward<Args>(args)...);
+    size_t slot = Hash()(entry.first) % n_slots;
     auto& map = this->get_container(slot);
     return map
         .emplace(KeyProjection()(std::move(entry.first)),
@@ -375,7 +440,7 @@ class ConcurrentMapContainer
       typename UpdateFn = const std::function<void(const Key&, Value&, bool)>&>
   void update(const Key& key, UpdateFn updater) {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     auto& map = this->get_container(slot);
     auto it = map.find(KeyProjection()(key));
     if (it == map.end()) {
@@ -446,7 +511,7 @@ class ConcurrentSet final
    */
   bool insert(const Key& key) {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     auto& set = this->get_container(slot);
     return set.insert(key).second;
   }
@@ -477,7 +542,7 @@ class ConcurrentSet final
   bool emplace(Args&&... args) {
     Key key(std::forward<Args>(args)...);
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     auto& set = this->get_container(slot);
     return set.emplace(std::move(key)).second;
   }
@@ -517,7 +582,7 @@ class InsertOnlyConcurrentSetContainer final
    */
   std::pair<const Key*, bool> insert(const Key& key) {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     auto& set = this->get_container(slot);
     // `std::unordered_set::insert` does not invalidate references,
     // thus it is safe to return a reference on the object.
@@ -531,7 +596,7 @@ class InsertOnlyConcurrentSetContainer final
    */
   const Key* get(const Key& key) const {
     size_t slot = Hash()(key) % n_slots;
-    boost::lock_guard<boost::mutex> lock(this->get_lock(slot));
+    std::unique_lock<std::mutex> lock(this->get_lock_by_slot(slot));
     const auto& set = this->get_container(slot);
     auto result = set.find(key);
     if (result == set.end()) {

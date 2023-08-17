@@ -12,67 +12,11 @@
 
 #include "ConstantPropagationAnalysis.h"
 #include "ControlFlow.h"
+#include "SwitchEquivPrerequisites.h"
 
 namespace cp = constant_propagation;
 
 namespace {
-
-/**
- * The "determining" register is the one that holds the value that decides which
- * case block we go to.
- */
-reg_t find_determining_reg(
-    cfg::Block* b, const cp::intraprocedural::FixpointIterator& fixpoint) {
-  auto last_it = b->get_last_insn();
-  always_assert_log(last_it != b->end(), "non-leaf nodes should not be empty");
-  auto last = last_it->insn;
-  always_assert_log(opcode::is_branch(last->opcode()),
-                    "%s is not a branch instruction", SHOW(last));
-  boost::optional<reg_t> candidate_reg;
-  auto srcs_size = last->srcs_size();
-  if (srcs_size == 1) {
-    // SWITCH_* or IF_*Z
-    return last->src(0);
-  } else if (srcs_size == 2) {
-    // Expecting code like this:
-    //   CONST vA/B X
-    //   ...
-    //   IF_* vA, vB
-    // We want to return whichever register wasn't loaded by the constant
-    // instruction. For example, on this code:
-    //   CONST v0 2
-    //   IF_EQ v0 v1
-    // this method should return 1
-    const auto& env = fixpoint.get_exit_state_at(b);
-    reg_t left_reg = last->src(0);
-    reg_t right_reg = last->src(1);
-    const auto& is_known = [&env](reg_t reg) -> bool {
-      const auto& domain = env.get<SignedConstantDomain>(reg);
-      if (domain.is_top()) {
-        return false;
-      }
-      return domain.get_constant() != boost::none;
-    };
-    bool left_is_known = is_known(left_reg);
-    bool right_is_known = is_known(right_reg);
-    // The determining register should have an unknown value at the end of this
-    // block, whereas the other register should have a known constant
-    if (!left_is_known && right_is_known) {
-      return left_reg;
-    } else if (left_is_known && !right_is_known) {
-      return right_reg;
-    } else {
-      not_reached_log(
-          "Could not find determining register (unexpected structure of "
-          "non-leaf node)\n%s",
-          SHOW(b));
-    }
-  }
-  not_reached_log(
-      "Could not find determining register (unrecognized last instruction)\n%s",
-      SHOW(b));
-}
-
 /**
  * Fill `prologue_blocks` and derive the structure of the method. Return
  * Return a `reg_t` of the register if the method is a switch or if-else
@@ -82,20 +26,20 @@ reg_t find_determining_reg(
  * `IllegalArgumentException`).
  */
 boost::variant<reg_t, bool> compute_prologue_blocks(
-    cfg::ControlFlowGraph* cfg,
+    cfg::ControlFlowGraph& cfg,
     const cp::intraprocedural::FixpointIterator& fixpoint,
     bool verify_default_case,
     std::vector<cfg::Block*>& prologue_blocks) {
-  for (const cfg::Block* b : cfg->blocks()) {
+  for (const cfg::Block* b : cfg.blocks()) {
     always_assert_log(!b->is_catch(),
                       "SwitchMethodPartitioning does not support methods with "
                       "catch blocks. %zu has a catch block in %s",
-                      b->id(), SHOW(*cfg));
+                      b->id(), SHOW(cfg));
   }
 
   // First, add all the prologue blocks that forma a linear chain before the
   // case block selection blocks (a switch or an if-else tree) begin.
-  for (cfg::Block* b = cfg->entry_block(); b != nullptr;
+  for (cfg::Block* b = cfg.entry_block(); b != nullptr;
        b = b->goes_to_only_edge()) {
     prologue_blocks.push_back(b);
   }
@@ -111,7 +55,7 @@ boost::variant<reg_t, bool> compute_prologue_blocks(
     auto op = last_prologue_insn->opcode();
     always_assert_log(!verify_default_case || opcode::is_branch(op) ||
                           opcode::is_a_return(op) || op == OPCODE_THROW,
-                      "%s in %s", SHOW(last_prologue_insn), SHOW(*cfg));
+                      "%s in %s", SHOW(last_prologue_insn), SHOW(cfg));
 
     if (!opcode::is_branch(op)) {
       return opcode::is_throw(op);
@@ -168,19 +112,21 @@ boost::variant<reg_t, bool> compute_prologue_blocks(
       }
 
       // Make sure all blocks agree on which register is the determiner
-      reg_t candidate_reg = ::find_determining_reg(b, fixpoint);
+      reg_t candidate_reg;
+      always_assert_log(find_determining_reg(fixpoint, b, &candidate_reg),
+                        "Couldn't find determining register in %s", SHOW(cfg));
       if (determining_reg == boost::none) {
         determining_reg = candidate_reg;
       } else {
         always_assert_log(
             *determining_reg == candidate_reg,
             "Conflict: which register are we switching on? %d != %d in %s",
-            *determining_reg, candidate_reg, SHOW(*cfg));
+            *determining_reg, candidate_reg, SHOW(cfg));
       }
     }
   }
   always_assert_log(determining_reg != boost::none,
-                    "Couldn't find determining register in %s", SHOW(*cfg));
+                    "Couldn't find determining register in %s", SHOW(cfg));
   return *determining_reg;
 }
 
@@ -200,26 +146,25 @@ bool throws(cfg::Block* block) {
 }
 } // namespace
 
-boost::optional<SwitchMethodPartitioning> SwitchMethodPartitioning::create(
+std::unique_ptr<SwitchMethodPartitioning> SwitchMethodPartitioning::create(
     IRCode* code, bool verify_default_case) {
-  code->build_cfg(/* editable */ true);
-  auto& cfg = code->cfg();
+  cfg::ScopedCFG cfg(code);
   // Note that a single-case switch can be compiled as either a switch opcode or
   // a series of if-* opcodes. We can use constant propagation to handle these
   // cases uniformly: to determine the case key, we use the inferred value of
   // the operand to the branching opcode in the successor blocks.
   cp::intraprocedural::FixpointIterator fixpoint(
-      cfg, cp::ConstantPrimitiveAnalyzer());
+      *cfg, cp::ConstantPrimitiveAnalyzer());
   fixpoint.run(ConstantEnvironment());
 
   std::vector<cfg::Block*> prologue_blocks;
-  auto res = compute_prologue_blocks(&cfg, fixpoint, verify_default_case,
+  auto res = compute_prologue_blocks(*cfg, fixpoint, verify_default_case,
                                      prologue_blocks);
 
   reg_t determining_reg{0};
   if (res.which() == 1) {
     if (!boost::get<bool>(res)) {
-      return boost::none;
+      return nullptr;
     }
   } else {
     determining_reg = boost::get<reg_t>(res);
@@ -238,19 +183,19 @@ boost::optional<SwitchMethodPartitioning> SwitchMethodPartitioning::create(
 
   if (res.which() == 1 && !cases.empty()) {
     // This does not look like the simple throw function we expect!
-    return boost::none;
+    return nullptr;
   }
 
   std::unordered_map<int32_t, cfg::Block*> key_to_block;
   for (auto edge : cases) {
     auto case_block = edge->target();
-    auto env = fixpoint.get_entry_state_at(case_block);
+    const auto& env = fixpoint.get_entry_state_at(case_block);
     auto case_key = env.get<SignedConstantDomain>(determining_reg);
     if (case_key.is_top() && verify_default_case) {
       always_assert_log(throws(case_block),
                         "Could not determine key for block that does not look "
                         "like it throws an IllegalArgumentException: %zu in %s",
-                        case_block->id(), SHOW(cfg));
+                        case_block->id(), SHOW(*cfg));
     } else if (!case_key.is_top()) {
       const auto& c = case_key.get_constant();
       if (c != boost::none) {
@@ -274,6 +219,7 @@ boost::optional<SwitchMethodPartitioning> SwitchMethodPartitioning::create(
     }
   }
 
-  return SwitchMethodPartitioning(code, std::move(prologue_blocks),
-                                  std::move(key_to_block));
+  // Can't use make_unique because constructor is private
+  return std::unique_ptr<SwitchMethodPartitioning>(new SwitchMethodPartitioning(
+      std::move(cfg), std::move(prologue_blocks), std::move(key_to_block)));
 }

@@ -5,14 +5,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 
+#include <boost/functional/hash.hpp>
+
+#include <sparta/PatriciaTreeSet.h>
+
 #include "ControlFlow.h"
 #include "IRInstruction.h"
-#include "PatriciaTreeSet.h"
 #include "ReachingDefinitions.h"
 
 class IRCode;
@@ -62,6 +64,9 @@ class Chains {
                   bool ignore_unreachable = false);
   UseDefChains get_use_def_chains() const;
   DefUseChains get_def_use_chains() const;
+  const reaching_defs::FixpointIterator& get_fp_iter() const {
+    return m_fp_iter;
+  }
 
  private:
   const cfg::ControlFlowGraph& m_cfg;
@@ -75,6 +80,9 @@ class MoveAwareChains {
                            bool ignore_unreachable = false);
   UseDefChains get_use_def_chains() const;
   DefUseChains get_def_use_chains() const;
+  const reaching_defs::MoveAwareFixpointIterator& get_fp_iter() const {
+    return m_fp_iter;
+  }
 
  private:
   const cfg::ControlFlowGraph& m_cfg;

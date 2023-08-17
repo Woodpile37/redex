@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <json/json.h>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "IRList.h"
 #include "ObjectEscapeAnalysis.h"
 #include "RedexTest.h"
+#include "Show.h"
 #include "VirtualScope.h"
 
 class ObjectEscapeAnalysisTest : public RedexIntegrationTest {
@@ -31,7 +33,7 @@ class ObjectEscapeAnalysisTest : public RedexIntegrationTest {
   ObjectEscapeAnalysisTest() {
     // Calling get_vmethods under the hood initializes the object-class, which
     // we need in the tests to create a proper scope
-    get_vmethods(type::java_lang_Object());
+    virt_scope::get_vmethods(type::java_lang_Object());
 
     auto object_ctor = static_cast<DexMethod*>(method::java_lang_Object_ctor());
     object_ctor->set_access(ACC_PUBLIC | ACC_CONSTRUCTOR);
@@ -312,4 +314,72 @@ TEST_F(ObjectEscapeAnalysisTest, reduceTo42WithExpandedCtor) {
 )");
   ASSERT_EQ(actual_expanded_ctor.str(),
             assembler::to_s_expr(expected_expanded_ctor.get()).str());
+}
+
+TEST_F(ObjectEscapeAnalysisTest, reduceTo42WithExpandedMethod) {
+  run();
+
+  auto actual = get_s_expr(
+      "Lcom/facebook/redextest/"
+      "ObjectEscapeAnalysisTest;.reduceTo42WithExpandedMethod:()V");
+  auto expected = assembler::ircode_from_string(R"(
+    (
+      (const v2 42)
+      (invoke-static (v2) "Lcom/facebook/redextest/ObjectEscapeAnalysisTest$N;.onlyUseInstanceField$oea$0:(I)V")
+      (return-void)
+    )
+)");
+  ASSERT_EQ(actual.str(), assembler::to_s_expr(expected.get()).str());
+
+  auto actual_expanded_method = get_s_expr(
+      "Lcom/facebook/redextest/"
+      "ObjectEscapeAnalysisTest$N;.onlyUseInstanceField$oea$0:(I)V");
+  auto expected_expanded_ctor = assembler::ircode_from_string(R"(
+    (
+      (load-param v3)
+      (const v2 0)
+      (sget-object "Ljava/lang/System;.out:Ljava/io/PrintStream;")
+      (move-result-pseudo-object v0)
+      (move v1 v3)
+      (invoke-virtual (v0 v1) "Ljava/io/PrintStream;.println:(I)V")
+      (return-void)
+    )
+  )");
+  ASSERT_EQ(actual_expanded_method.str(),
+            assembler::to_s_expr(expected_expanded_ctor.get()).str());
+}
+
+TEST_F(ObjectEscapeAnalysisTest, reduceTo42IncompleteInlinableType) {
+  run();
+
+  auto actual = get_s_expr(
+      "Lcom/facebook/redextest/"
+      "ObjectEscapeAnalysisTest;.reduceTo42IncompleteInlinableType:()I");
+  auto expected = assembler::ircode_from_string(R"(
+   (
+      (const v1 42)
+      (return v1)
+    )
+)");
+  ASSERT_EQ(actual.str(), assembler::to_s_expr(expected.get()).str());
+}
+
+TEST_F(ObjectEscapeAnalysisTest, reduceTo42IncompleteInlinableTypeB) {
+  run();
+
+  auto actual = get_s_expr(
+      "Lcom/facebook/redextest/"
+      "ObjectEscapeAnalysisTest;.reduceTo42IncompleteInlinableTypeB:()I");
+  auto expected = assembler::ircode_from_string(R"(
+   (
+      (const v2 16)
+      (new-instance "Lcom/facebook/redextest/ObjectEscapeAnalysisTest$O;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v1 v2) "Lcom/facebook/redextest/ObjectEscapeAnalysisTest$O;.<init>:(I)V")
+      (sput-object v1 "Lcom/facebook/redextest/ObjectEscapeAnalysisTest$O;.instance:Lcom/facebook/redextest/ObjectEscapeAnalysisTest$O;")
+      (const v1 42)
+      (return v1)
+   )
+)");
+  ASSERT_EQ(actual.str(), assembler::to_s_expr(expected.get()).str());
 }

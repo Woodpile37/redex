@@ -115,6 +115,19 @@ class AnnoKill {
 class AnnoKillPass : public Pass {
  public:
   AnnoKillPass() : Pass("AnnoKillPass") {}
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoResolvablePureRefs, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   explicit AnnoKillPass(const std::string& name) : Pass(name) {}
 
   void bind_config() override {
@@ -126,6 +139,8 @@ class AnnoKillPass : public Pass {
     bind("annotated_keep_annos", {}, m_annotated_keep_annos);
     bind("only_force_kill", false, m_only_force_kill);
   }
+
+  bool is_cfg_legacy() override { return true; }
 
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 

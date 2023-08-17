@@ -26,6 +26,10 @@ class TypeAnalysisAwareRemoveUnreachablePass
       const DexStoresVector& stores,
       PassManager& pm,
       int* num_ignore_check_strings,
+      reachability::ReachableAspects* reachable_aspects,
       bool emit_graph_this_run,
+      bool relaxed_keep_class_members,
+      bool cfg_gathering_check_instantiable,
+      bool cfg_gathering_check_instance_callable,
       bool remove_no_argument_constructors) override;
 };

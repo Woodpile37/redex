@@ -16,18 +16,23 @@
 #include "Trace.h"
 #include "Walkers.h"
 
+namespace {
+
 constexpr const char* METRIC_REMOVED_EMPTY_CLASSES =
     "num_empty_classes_removed";
 
-void remove_clinit_if_trivial(DexClass* cls) {
+bool remove_clinit_if_trivial(DexClass* cls) {
   DexMethod* clinit = cls->get_clinit();
   if (clinit && method::is_trivial_clinit(*clinit->get_code())) {
     cls->remove_method(clinit);
+    DexMethod::delete_method(clinit);
+    return true;
   }
+  return false;
 }
 
 bool is_empty_class(DexClass* cls,
-                    ConcurrentSet<const DexType*>& class_references) {
+                    const ConcurrentSet<const DexType*>& class_references) {
   bool empty_class = cls->get_dmethods().empty() &&
                      cls->get_vmethods().empty() &&
                      cls->get_sfields().empty() && cls->get_ifields().empty();
@@ -88,6 +93,7 @@ void process_code(ConcurrentSet<const DexType*>* class_references,
     } else if (opcode->has_method()) {
       auto const& m = opcode->get_method();
       process_proto(class_references, m);
+      class_references->insert(m->get_class());
     }
   }
   // Also gather exception types that are caught.
@@ -98,8 +104,12 @@ void process_code(ConcurrentSet<const DexType*>* class_references,
   }
 }
 
-size_t remove_empty_classes(Scope& classes) {
+struct Stats {
+  size_t num_classes_removed{0};
+  size_t num_clinit_removed{0};
+};
 
+Stats remove_empty_classes(Scope& classes) {
   // class_references is a set of type names which represent classes
   // which should not be deleted even if they are deemed to be empty.
   ConcurrentSet<const DexType*> class_references;
@@ -120,8 +130,7 @@ size_t remove_empty_classes(Scope& classes) {
       process_code(&class_references, meth, *code);
     });
 
-    // Ennumerate super classes and remove trivial clinit if the class has any.
-    remove_clinit_if_trivial(cls);
+    // Ennumerate super classes
     DexType* s = cls->get_super_class();
     class_references.insert(s);
 
@@ -130,6 +139,13 @@ size_t remove_empty_classes(Scope& classes) {
       class_references.insert(
           type::get_element_type_if_array(field->get_type()));
     });
+  });
+
+  std::atomic<size_t> clinit_removed{0};
+  walk::parallel::classes(classes, [&clinit_removed](DexClass* cls) {
+    if (remove_clinit_if_trivial(cls)) {
+      clinit_removed.fetch_add(1);
+    }
   });
 
   size_t classes_before_size = classes.size();
@@ -141,23 +157,20 @@ size_t remove_empty_classes(Scope& classes) {
                 classes.end());
 
   auto num_classes_removed = classes_before_size - classes.size();
-  TRACE(EMPTY, 1, "Empty classes removed: %ld", num_classes_removed);
-  return num_classes_removed;
+  TRACE(EMPTY, 1, "Empty classes removed: %zu", num_classes_removed);
+  return Stats{num_classes_removed, clinit_removed.load()};
 }
+
+} // namespace
 
 void RemoveEmptyClassesPass::run_pass(DexStoresVector& stores,
                                       ConfigFiles& /* conf */,
                                       PassManager& mgr) {
-  if (mgr.no_proguard_rules()) {
-    TRACE(EMPTY, 1,
-          "RemoveEmptyClassesPass not run because no ProGuard configuration "
-          "was provided.");
-    return;
-  }
   auto scope = build_class_scope(stores);
-  auto num_empty_classes_removed = remove_empty_classes(scope);
+  auto stats = remove_empty_classes(scope);
 
-  mgr.incr_metric(METRIC_REMOVED_EMPTY_CLASSES, num_empty_classes_removed);
+  mgr.incr_metric(METRIC_REMOVED_EMPTY_CLASSES, stats.num_classes_removed);
+  mgr.incr_metric("num_trivial_clinit_removed", stats.num_clinit_removed);
 
   post_dexen_changes(scope, stores);
 }

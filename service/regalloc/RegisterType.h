@@ -7,9 +7,8 @@
 
 #pragma once
 
-#include <boost/functional/hash.hpp>
+#include <sparta/FiniteAbstractDomain.h>
 
-#include "FiniteAbstractDomain.h"
 #include "IRInstruction.h"
 
 namespace regalloc {
@@ -45,8 +44,7 @@ namespace register_type_impl {
 
 using Lattice =
     sparta::BitVectorLattice<RegisterType,
-                             static_cast<size_t>(RegisterType::SIZE),
-                             boost::hash<RegisterType>>;
+                             static_cast<size_t>(RegisterType::SIZE)>;
 
 extern Lattice lattice;
 

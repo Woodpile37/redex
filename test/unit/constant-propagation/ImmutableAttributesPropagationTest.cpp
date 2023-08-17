@@ -9,12 +9,13 @@
 
 #include <gtest/gtest.h>
 
+#include <sparta/S_Expression.h>
+
 #include "ConstantPropagationTestUtil.h"
 #include "ConstructorParams.h"
 #include "Creators.h"
 #include "IRAssembler.h"
 #include "JarLoader.h"
-#include "S_Expression.h"
 
 using ImmutableAnalyzer =
     InstructionAnalyzerCombiner<cp::StringAnalyzer,
@@ -111,7 +112,8 @@ struct ImmutableTest : public ConstantPropagationTest {
           return ImmutableAttr::Attr(method);
         }
       }();
-      always_assert_log(value.size() == 1, "Only accept string or integer");
+      always_assert_log(value.size() == 1,
+                        "Only accept string or integer or integer range");
       auto get_val = [&]() -> AttrDomain {
         if (value[0].is_int32()) {
           return SignedConstantDomain(value[0].get_int32());
@@ -123,6 +125,12 @@ struct ImmutableTest : public ConstantPropagationTest {
           } else {
             return StringDomain(DexString::make_string(value_s));
           }
+        } else if (value[0].is_list()) {
+          always_assert_log(value[0].size() == 2, "expected two elements");
+          always_assert_log(value[0][0].is_int32(), "expected int32");
+          always_assert_log(value[0][1].is_int32(), "expected int32");
+          return SignedConstantDomain(value[0][0].get_int32(),
+                                      value[0][1].get_int32());
         } else {
           always_assert_log(false, "value is not supported");
         };
@@ -146,25 +154,26 @@ struct ImmutableTest : public ConstantPropagationTest {
 TEST_F(ImmutableTest, abstract_domain) {
   // meet
   {
-    // Integer{100} meet Integer{100} => top
-    auto integer_100 = create_integer_abstract_value(100, false);
-    auto integer_100_2 = create_integer_abstract_value(100, false);
-    integer_100.meet_with(integer_100_2);
-    EXPECT_TRUE(integer_100.is_top());
+    // Integer{100} meet Integer{100} => Integer{100}
+    auto i100 = create_integer_abstract_value(100, false);
+    auto x = i100;
+    x.meet_with(i100);
+    EXPECT_TRUE(x.equals(i100));
   }
   {
-    // Integer{100} meet CachedInteger{100} => top
-    auto integer_100 = create_integer_abstract_value(100, false);
-    auto cached_integer_100 = create_integer_abstract_value(100, true);
-    cached_integer_100.meet_with(integer_100);
-    EXPECT_TRUE(cached_integer_100.is_top());
+    // Integer{100} meet CachedInteger{100} => Integer{100}
+    auto i100 = create_integer_abstract_value(100, false);
+    auto ci100 = create_integer_abstract_value(100, true);
+    auto x = ci100;
+    x.meet_with(i100);
+    EXPECT_TRUE(x.equals(i100));
   }
   {
     // CachedInteger{100} meet CachedInteger{100} => CachedInteger{100}
-    auto cached_integer_100 = create_integer_abstract_value(100, true);
-    auto cached_integer_100_2 = create_integer_abstract_value(100, true);
-    cached_integer_100.meet_with(cached_integer_100_2);
-    EXPECT_TRUE(cached_integer_100.is_value());
+    auto ci100 = create_integer_abstract_value(100, true);
+    auto x = ci100;
+    x.meet_with(ci100);
+    EXPECT_TRUE(x.equals(ci100));
   }
   {
     // Integer{200} meet CatchedInteger{100} => bottom
@@ -278,6 +287,22 @@ TEST_F(ImmutableTest, abstract_domain) {
     ))");
     y_object.join_with(a_1_b_3);
     EXPECT_TRUE(y_object.is_top());
+  }
+  // leq
+  {
+    auto c_1 = create_object(R"((
+      "LX;" (
+        ("c:I" #1)
+      )
+    ))");
+    auto c_12 = create_object(R"((
+      "LX;" (
+        ("c:I" (#1 #2))
+      )
+    ))");
+    // c_1 is strictly less than c_12
+    EXPECT_TRUE(c_1.leq(c_12));
+    EXPECT_TRUE(!c_12.leq(c_1));
   }
 }
 

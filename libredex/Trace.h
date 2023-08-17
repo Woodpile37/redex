@@ -33,9 +33,9 @@ class DexType;
   TM(BRIDGE)            \
   TM(BUILDERS)          \
   TM(CALLGRAPH)         \
+  TM(CCB)               \
   TM(CDDP)              \
   TM(CFG)               \
-  TM(CFP)               \
   TM(CHECKRECURSION)    \
   TM(CIC)               \
   TM(CLA)               \
@@ -66,7 +66,10 @@ class DexType;
   TM(ICL)               \
   TM(ICONSTP)           \
   TM(IDEX)              \
+  TM(IDEXR)             \
   TM(IFCS_ANALYSIS)     \
+  TM(III)               \
+  TM(IIL)               \
   TM(INL)               \
   TM(INLINE)            \
   TM(INLRES)            \
@@ -75,6 +78,7 @@ class DexType;
   TM(INTRO_SWITCH)      \
   TM(IODI)              \
   TM(ISO)               \
+  TM(ITP)               \
   TM(LCR_PASS)          \
   TM(LIB)               \
   TM(LOC)               \
@@ -92,8 +96,10 @@ class DexType;
   TM(MODULARITY)        \
   TM(MONITOR)           \
   TM(MORTIROLO)         \
+  TM(MS)                \
   TM(MTRANS)            \
   TM(NATIVE)            \
+  TM(NCI)               \
   TM(NULLCHECK)         \
   TM(OBFUSCATE)         \
   TM(OEA)               \
@@ -116,6 +122,7 @@ class DexType;
   TM(RAL)               \
   TM(RBB)               \
   TM(REACH)             \
+  TM(REFC)              \
   TM(REFL)              \
   TM(REFU)              \
   TM(REG)               \
@@ -126,6 +133,7 @@ class DexType;
   TM(RME)               \
   TM(RMGOTO)            \
   TM(RM_INTF)           \
+  TM(RMRCC)             \
   TM(RMU)               \
   TM(RMUF)              \
   TM(RMUNINST)          \
@@ -135,6 +143,7 @@ class DexType;
   TM(SDIS)              \
   TM(SHORTEN)           \
   TM(SPLIT_RES)         \
+  TM(SRC_PASS)          \
   TM(STATIC_RELO)       \
   TM(STATS)             \
   TM(STRBUILD)          \

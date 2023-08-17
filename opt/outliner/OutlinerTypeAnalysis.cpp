@@ -42,63 +42,59 @@ OutlinerTypeAnalysis::OutlinerTypeAnalysis(DexMethod* method)
       }) {}
 
 const DexType* OutlinerTypeAnalysis::get_result_type(
-    const PartialCandidate* pc,
+    const CandidateAdapter* ca,
     const std::unordered_set<const IRInstruction*>& insns,
     const DexType* optional_extra_type) {
   auto defs = get_defs(insns);
-  return defs ? get_type_of_defs(pc, *defs, optional_extra_type)
+  return defs ? get_type_of_defs(ca, *defs, optional_extra_type)
               : optional_extra_type;
 }
 
-const DexType* OutlinerTypeAnalysis::get_type_demand(
-    const PartialCandidate& pc,
-    reg_t reg,
-    const boost::optional<reg_t>& out_reg,
-    const DexType* res_type) {
-  std::unordered_set<const DexType*> type_demands;
+const DexType* OutlinerTypeAnalysis::get_type_demand(const CandidateAdapter& ca,
+                                                     reg_t reg) {
   std::unordered_set<reg_t> regs_to_track{reg};
-  get_type_demand_helper(pc.root, regs_to_track, out_reg, res_type,
-                         &type_demands);
+  std::unordered_set<const DexType*> type_demands;
+  get_type_demand_helper(ca, std::move(regs_to_track), &type_demands);
   auto type_demand = narrow_type_demands(std::move(type_demands));
   if (type_demand == nullptr) {
-    type_demand = get_inferred_type(pc, reg);
+    type_demand = get_inferred_type(ca, reg);
   }
   return type_demand;
 }
 
 const DexType* OutlinerTypeAnalysis::get_inferred_type(
-    const PartialCandidate& pc, reg_t reg) {
-  auto insn = pc.root.insns.front();
-  const auto& env = m_type_environments->at(insn);
+    const CandidateAdapter& ca, reg_t reg) {
+  const auto& env = ca.get_type_env();
   switch (env.get_type(reg).element()) {
-  case BOTTOM:
-  case ZERO:
-  case CONST:
-  case CONST1:
-  case SCALAR:
-  case SCALAR1:
+  case IRType::BOTTOM:
+  case IRType::ZERO:
+  case IRType::CONST:
+  case IRType::CONST1:
+  case IRType::SCALAR:
+  case IRType::SCALAR1:
     // Can't figure out exact type via type inference; let's try reaching-defs
-    return get_type_of_reaching_defs(nullptr, insn, reg);
-  case REFERENCE: {
+    return get_type_of_reaching_defs(ca, reg);
+  case IRType::REFERENCE: {
     auto dex_type = env.get_dex_type(reg);
     return dex_type ? *dex_type : nullptr;
   }
-  case INT:
+  case IRType::INT:
     // Could actually be boolean, byte, short; let's try reaching-defs
-    return get_type_of_reaching_defs(nullptr, insn, reg);
-  case FLOAT:
+    return get_type_of_reaching_defs(ca, reg);
+  case IRType::FLOAT:
     return type::_float();
-  case LONG1:
+  case IRType::LONG1:
     return type::_long();
-  case DOUBLE1:
+  case IRType::DOUBLE1:
     return type::_double();
-  case CONST2:
-  case DOUBLE2:
-  case LONG2:
-  case SCALAR2:
-  case TOP:
+  case IRType::CONST2:
+  case IRType::DOUBLE2:
+  case IRType::LONG2:
+  case IRType::SCALAR2:
+  case IRType::TOP:
   default:
-    not_reached();
+    // shouldn't happen for any input, but we don't need to fight that here
+    return nullptr;
   }
 }
 
@@ -191,12 +187,9 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
   case OPCODE_AND_INT:
   case OPCODE_OR_INT:
   case OPCODE_XOR_INT:
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_AND_INT_LIT8:
-  case OPCODE_OR_INT_LIT8:
-  case OPCODE_XOR_INT_LIT8:
+  case OPCODE_AND_INT_LIT:
+  case OPCODE_OR_INT_LIT:
+  case OPCODE_XOR_INT_LIT:
     // These (must) get a special handling by caller
     not_reached();
 
@@ -268,6 +261,7 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
   case OPCODE_SPUT_OBJECT:
   case OPCODE_THROW:
   case IOPCODE_INIT_CLASS:
+  case IOPCODE_INJECTION_ID:
     not_reached();
 
   case OPCODE_MOVE_EXCEPTION:
@@ -281,15 +275,12 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
   case OPCODE_SHL_INT:
   case OPCODE_SHR_INT:
   case OPCODE_USHR_INT:
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_RSUB_INT:
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8:
-  case OPCODE_RSUB_INT_LIT8:
-  case OPCODE_MUL_INT_LIT8:
-  case OPCODE_SHL_INT_LIT8:
-  case OPCODE_SHR_INT_LIT8:
-  case OPCODE_USHR_INT_LIT8:
+  case OPCODE_ADD_INT_LIT:
+  case OPCODE_RSUB_INT_LIT:
+  case OPCODE_MUL_INT_LIT:
+  case OPCODE_SHL_INT_LIT:
+  case OPCODE_SHR_INT_LIT:
+  case OPCODE_USHR_INT_LIT:
   case OPCODE_FLOAT_TO_INT:
   case OPCODE_DOUBLE_TO_INT:
   case OPCODE_LONG_TO_INT:
@@ -371,7 +362,6 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
   case OPCODE_ARRAY_LENGTH:
     return type::_int();
   case OPCODE_INSTANCE_OF:
-    return type::_boolean();
   case OPCODE_AGET_BOOLEAN:
     return type::_boolean();
   case OPCODE_AGET_BYTE:
@@ -398,6 +388,8 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
 
   case OPCODE_INVOKE_CUSTOM:
   case OPCODE_INVOKE_POLYMORPHIC:
+  case OPCODE_CONST_METHOD_HANDLE:
+  case OPCODE_CONST_METHOD_TYPE:
     not_reached_log(
         "Unsupported instruction {%s} in "
         "get_result_type_helper\n",
@@ -405,10 +397,8 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
 
   case OPCODE_DIV_INT:
   case OPCODE_REM_INT:
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8:
-  case OPCODE_REM_INT_LIT8:
+  case OPCODE_DIV_INT_LIT:
+  case OPCODE_REM_INT_LIT:
     return type::_int();
   case OPCODE_DIV_LONG:
   case OPCODE_REM_LONG:
@@ -417,12 +407,12 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
 }
 
 const DexType* OutlinerTypeAnalysis::get_type_of_reaching_defs(
-    const PartialCandidate* pc, IRInstruction* insn, reg_t reg) {
-  auto defs = m_reaching_defs_environments->at(insn).get(reg);
+    const CandidateAdapter& ca, reg_t reg) {
+  auto defs = ca.get_rdef_env().get(reg);
   if (defs.is_bottom() || defs.is_top()) {
     return nullptr;
   }
-  return get_type_of_defs(pc,
+  return get_type_of_defs(nullptr,
                           std::vector<const IRInstruction*>(
                               defs.elements().begin(), defs.elements().end()),
                           /* optional_extra_type */ nullptr);
@@ -434,11 +424,11 @@ const DexType* OutlinerTypeAnalysis::get_if_insn_type_demand(
   auto& env = m_type_environments->at(insn);
   for (size_t src_index = 0; src_index < insn->srcs_size(); src_index++) {
     auto t = env.get_type(insn->src(src_index));
-    if (t.element() == REFERENCE) {
+    if (t.element() == IRType::REFERENCE) {
       return type::java_lang_Object();
-    } else if (t.element() == FLOAT) {
+    } else if (t.element() == IRType::FLOAT) {
       return type::_float();
-    } else if (t.element() == INT) {
+    } else if (t.element() == IRType::INT) {
       return type::_int();
     }
   }
@@ -475,6 +465,7 @@ const DexType* OutlinerTypeAnalysis::get_type_demand(IRInstruction* insn,
   case OPCODE_SGET_WIDE:
   case OPCODE_SGET_OBJECT:
   case IOPCODE_INIT_CLASS:
+  case IOPCODE_INJECTION_ID:
     not_reached();
 
   case OPCODE_RETURN:
@@ -556,31 +547,23 @@ const DexType* OutlinerTypeAnalysis::get_type_demand(IRInstruction* insn,
   case OPCODE_USHR_INT:
   case OPCODE_DIV_INT:
   case OPCODE_REM_INT:
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_RSUB_INT:
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8:
-  case OPCODE_RSUB_INT_LIT8:
-  case OPCODE_MUL_INT_LIT8:
-  case OPCODE_SHL_INT_LIT8:
-  case OPCODE_SHR_INT_LIT8:
-  case OPCODE_USHR_INT_LIT8:
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8:
-  case OPCODE_REM_INT_LIT8:
+  case OPCODE_ADD_INT_LIT:
+  case OPCODE_RSUB_INT_LIT:
+  case OPCODE_MUL_INT_LIT:
+  case OPCODE_SHL_INT_LIT:
+  case OPCODE_SHR_INT_LIT:
+  case OPCODE_USHR_INT_LIT:
+  case OPCODE_DIV_INT_LIT:
+  case OPCODE_REM_INT_LIT:
     always_assert(src_index < 2);
     return type::_int();
 
   case OPCODE_AND_INT:
   case OPCODE_OR_INT:
   case OPCODE_XOR_INT:
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_AND_INT_LIT8:
-  case OPCODE_OR_INT_LIT8:
-  case OPCODE_XOR_INT_LIT8:
+  case OPCODE_AND_INT_LIT:
+  case OPCODE_OR_INT_LIT:
+  case OPCODE_XOR_INT_LIT:
     always_assert(src_index < 2);
     // Note: These opcodes can preserve boolean-ness. The caller of this
     // method needs to track that.
@@ -741,6 +724,8 @@ const DexType* OutlinerTypeAnalysis::get_type_demand(IRInstruction* insn,
   }
   case OPCODE_INVOKE_CUSTOM:
   case OPCODE_INVOKE_POLYMORPHIC:
+  case OPCODE_CONST_METHOD_HANDLE:
+  case OPCODE_CONST_METHOD_TYPE:
     not_reached_log(
         "Unsupported instruction {%s} in "
         "get_type_demand\n",
@@ -773,68 +758,28 @@ OutlinerTypeAnalysis::get_defs(
 // in the given instruction sequence.
 // The return value nullptr indicates that the demand could not be determined.
 void OutlinerTypeAnalysis::get_type_demand_helper(
-    const PartialCandidateNode& pcn,
+    const CandidateAdapter& ca,
     std::unordered_set<reg_t> regs_to_track,
-    const boost::optional<reg_t>& out_reg,
-    const DexType* res_type,
     std::unordered_set<const DexType*>* type_demands) {
-  for (size_t insn_idx = 0;
-       insn_idx < pcn.insns.size() && !regs_to_track.empty();
-       insn_idx++) {
-    bool track_dest{false};
-    auto insn = pcn.insns.at(insn_idx);
-    for (size_t i = 0; i < insn->srcs_size(); i++) {
-      if (regs_to_track.count(insn->src(i))) {
-        if (opcode::is_a_move(insn->opcode())) {
-          track_dest = true;
-          continue;
-        }
-        type_demands->insert(get_type_demand(insn, i));
-        // Check if this instruction can preserve booleanness, and if so,
-        // track its result.
-        switch (insn->opcode()) {
-        case OPCODE_AND_INT:
-        case OPCODE_OR_INT:
-        case OPCODE_XOR_INT:
-        case OPCODE_AND_INT_LIT16:
-        case OPCODE_OR_INT_LIT16:
-        case OPCODE_XOR_INT_LIT16:
-        case OPCODE_AND_INT_LIT8:
-        case OPCODE_OR_INT_LIT8:
-        case OPCODE_XOR_INT_LIT8:
-          if (!insn->has_literal() || insn->get_literal() == 0 ||
-              insn->get_literal() == 1) {
-            track_dest = true;
-          }
-          break;
-        default:
-          break;
-        }
-      }
+  auto follow = [](IRInstruction* insn, src_index_t) {
+    switch (insn->opcode()) {
+    case OPCODE_AND_INT:
+    case OPCODE_OR_INT:
+    case OPCODE_XOR_INT:
+    case OPCODE_AND_INT_LIT:
+    case OPCODE_OR_INT_LIT:
+    case OPCODE_XOR_INT_LIT:
+      return !insn->has_literal() || insn->get_literal() == 0 ||
+             insn->get_literal() == 1;
+    default:
+      return false;
     }
-    always_assert(!track_dest || insn->has_dest());
-    if (insn->has_dest()) {
-      if (track_dest) {
-        regs_to_track.insert(insn->dest());
-      } else {
-        regs_to_track.erase(insn->dest());
-      }
-      if (insn->dest_is_wide()) {
-        regs_to_track.erase(insn->dest() + 1);
-      }
-    }
-  }
-  if (pcn.succs.empty() && out_reg && regs_to_track.count(*out_reg)) {
-    type_demands->insert(res_type);
-  }
-  for (auto& p : pcn.succs) {
-    get_type_demand_helper(*p.second, regs_to_track, out_reg, res_type,
-                           type_demands);
-  }
+  };
+  ca.gather_type_demands(std::move(regs_to_track), follow, type_demands);
 }
 
 const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
-    const PartialCandidate* pc,
+    const CandidateAdapter* ca,
     const std::unordered_set<const IRInstruction*>& const_insns) {
   always_assert(!const_insns.empty());
   // 1. Let's see if we can get something out of the constant-uses analysis.
@@ -880,33 +825,19 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
   // 2. Let's go over all constant-uses, and use our own judgement.
   std::unordered_set<const DexType*> type_demands;
   bool not_object{false};
-  std::unordered_set<IRInstruction*> pc_insns;
-  std::function<void(const PartialCandidateNode&)> gather_pc_insns;
-  gather_pc_insns = [&](const PartialCandidateNode& pcn) {
-    pc_insns.insert(pcn.insns.begin(), pcn.insns.end());
-    for (auto& p : pcn.succs) {
-      gather_pc_insns(*p.second);
-    }
-  };
-  if (pc) {
-    gather_pc_insns(pc->root);
-  }
   for (auto insn : const_insns) {
     for (auto& p :
          m_constant_uses->get_constant_uses(const_cast<IRInstruction*>(insn))) {
-      if (pc_insns.count(p.first)) {
+      if (ca && ca->contains(p.first)) {
         continue;
       }
       switch (p.first->opcode()) {
       case OPCODE_AND_INT:
       case OPCODE_OR_INT:
       case OPCODE_XOR_INT:
-      case OPCODE_AND_INT_LIT16:
-      case OPCODE_OR_INT_LIT16:
-      case OPCODE_XOR_INT_LIT16:
-      case OPCODE_AND_INT_LIT8:
-      case OPCODE_OR_INT_LIT8:
-      case OPCODE_XOR_INT_LIT8:
+      case OPCODE_AND_INT_LIT:
+      case OPCODE_OR_INT_LIT:
+      case OPCODE_XOR_INT_LIT:
         if (any_outside_range(const_insns, 0, 1)) {
           type_demands.insert(type::_int());
         } else {
@@ -977,7 +908,7 @@ static const DexType* compute_joined_type(
 
 // Compute the (widened) type of all given definitions.
 const DexType* OutlinerTypeAnalysis::get_type_of_defs(
-    const PartialCandidate* pc,
+    const CandidateAdapter* ca,
     const std::vector<const IRInstruction*>& defs,
     const DexType* optional_extra_type) {
   std::unordered_set<const DexType*> types;
@@ -1001,12 +932,9 @@ const DexType* OutlinerTypeAnalysis::get_type_of_defs(
       case OPCODE_AND_INT:
       case OPCODE_OR_INT:
       case OPCODE_XOR_INT:
-      case OPCODE_AND_INT_LIT16:
-      case OPCODE_OR_INT_LIT16:
-      case OPCODE_XOR_INT_LIT16:
-      case OPCODE_AND_INT_LIT8:
-      case OPCODE_OR_INT_LIT8:
-      case OPCODE_XOR_INT_LIT8:
+      case OPCODE_AND_INT_LIT:
+      case OPCODE_OR_INT_LIT:
+      case OPCODE_XOR_INT_LIT:
         if (def->has_literal() && def->get_literal() != 0 &&
             def->get_literal() != 1) {
           // Overall result cannot be a boolean (as far as the Android type
@@ -1048,7 +976,7 @@ const DexType* OutlinerTypeAnalysis::get_type_of_defs(
 
   if (types.empty()) {
     always_assert(!const_insns.empty());
-    return get_const_insns_type_demand(pc, const_insns);
+    return get_const_insns_type_demand(ca, const_insns);
   }
 
   // Stricter primitive types can be removed

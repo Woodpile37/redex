@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "FlatSet.h"
-#include "PatriciaTreeSet.h"
+#include <sparta/FlatSet.h>
+#include <sparta/PatriciaTreeSet.h>
 
 #include <cstdint>
 #include <limits>
@@ -272,4 +272,12 @@ TYPED_TEST(UInt64SetTest, setOfUnsignedInt64) {
   for (auto x : s) {
     EXPECT_EQ(1, values.count(x));
   }
+}
+
+TEST(PatriciaTreeSet, singleton) {
+  using Set = PatriciaTreeSet<uint64_t>;
+  EXPECT_EQ(Set{}.singleton(), nullptr);
+  EXPECT_NE(Set{1}.singleton(), nullptr);
+  EXPECT_EQ(*(Set{1}.singleton()), 1);
+  EXPECT_EQ((Set{1, 2}.singleton()), nullptr);
 }

@@ -18,13 +18,23 @@ class RegAllocPass : public Pass {
  public:
   RegAllocPass() : Pass("RegAllocPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoInitClassInstructions, Preserves},
+        {RenameClass, Preserves},
+    };
+  }
+
   void bind_config() override {
     bool unused;
     bind("live_range_splitting", false, unused);
     trait(Traits::Pass::atleast, 1);
   }
-
-  bool is_editable_cfg_friendly() override { return true; }
 
   void eval_pass(DexStoresVector& stores,
                  ConfigFiles& conf,

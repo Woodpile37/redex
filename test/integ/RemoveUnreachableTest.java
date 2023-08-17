@@ -9,6 +9,10 @@ class A {
   public int foo;
   public OnlyInArray[] arr;
 
+  static {
+    // trivial
+  }
+
   public A() {
     foo = 0;
     arr = new OnlyInArray[10];
@@ -27,6 +31,10 @@ class A {
 }
 
 class D extends A {
+  static {
+    System.out.println("side effect");
+  }
+
   public int bar() { return 3; }
   public int baz() { return 4; }
   public void bor() {}
@@ -64,6 +72,13 @@ class HoneyBadger extends BadgerImpl {
   }
 }
 
+class HoneyBadgerInstantiated extends BadgerImpl {
+  @Override
+  public boolean isAwesome() {
+    return true;
+  }
+}
+
 class HogBadger implements Badger {
   @Override
   public boolean isAwesome() {
@@ -73,6 +88,7 @@ class HogBadger implements Badger {
 
 class BadgerTester {
   public static boolean testBadger(Badger b) {
+    new HoneyBadgerInstantiated();
     return b.isAwesome();
   }
 }

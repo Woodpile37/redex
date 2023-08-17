@@ -10,18 +10,22 @@
 #include <limits>
 #include <utility>
 
-#include "ConstantAbstractDomain.h"
+#include <sparta/ConstantAbstractDomain.h>
+#include <sparta/DisjointUnionAbstractDomain.h>
+#include <sparta/HashedAbstractPartition.h>
+#include <sparta/HashedSetAbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+#include <sparta/PatriciaTreeSetAbstractDomain.h>
+#include <sparta/ReducedProductAbstractDomain.h>
+
 #include "ConstantArrayDomain.h"
 #include "ControlFlow.h"
-#include "DisjointUnionAbstractDomain.h"
-#include "HashedAbstractPartition.h"
-#include "HashedSetAbstractDomain.h"
+#include "DisjointUnionWithSignedConstantDomain.h"
+#include "NewObjectDomain.h"
 #include "ObjectDomain.h"
 #include "ObjectWithImmutAttr.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
-#include "PatriciaTreeSetAbstractDomain.h"
-#include "ReducedProductAbstractDomain.h"
 #include "SignedConstantDomain.h"
+#include "SingletonObject.h"
 
 /*
  * The definitions in this file serve to abstractly model:
@@ -34,15 +38,6 @@
  * Abstract stack / environment values.
  *****************************************************************************/
 
-/*
- * This represents an object that is uniquely referenced by a single static
- * field. This enables us to compare these objects easily -- we can determine
- * whether two different SingletonObjectDomain elements are equal just based
- * on their representation in the abstract environment, without needing to
- * check if they are pointing to the same object in the abstract heap.
- */
-using SingletonObjectDomain = sparta::ConstantAbstractDomain<const DexField*>;
-
 using IntegerSetDomain = sparta::HashedSetAbstractDomain<int64_t>;
 
 using StringSetDomain = sparta::PatriciaTreeSetAbstractDomain<const DexString*>;
@@ -52,23 +47,54 @@ using StringDomain = sparta::ConstantAbstractDomain<const DexString*>;
 using ConstantClassObjectDomain =
     sparta::ConstantAbstractDomain<const DexType*>;
 
+using ConstantInjectionIdDomain = sparta::ConstantAbstractDomain<int32_t>;
+
 /*
  * This represents a new-instance or new-array instruction.
  */
 using AbstractHeapPointer =
     sparta::ConstantAbstractDomain<const IRInstruction*>;
 
+/*
+ * Identifies domains whose members are compatible with NEZ.
+ */
+class is_object_visitor : public boost::static_visitor<bool> {
+ public:
+  bool operator()(const SingletonObjectDomain&) const { return true; }
+
+  bool operator()(const StringDomain&) const { return true; }
+
+  bool operator()(const ConstantClassObjectDomain&) const { return true; }
+
+  bool operator()(const ObjectWithImmutAttrDomain&) const { return true; }
+
+  bool operator()(const AbstractHeapPointer&) const { return true; }
+
+  bool operator()(const NewObjectDomain&) const { return true; }
+
+  template <typename Domain>
+  bool operator()(const Domain&) const {
+    return false;
+  }
+};
+
 // TODO: Refactor so that we don't have to list every single possible
 // sub-Domain here.
 using ConstantValue =
-    sparta::DisjointUnionAbstractDomain<SignedConstantDomain,
-                                        SingletonObjectDomain,
-                                        IntegerSetDomain,
-                                        StringSetDomain,
-                                        StringDomain,
-                                        ConstantClassObjectDomain,
-                                        ObjectWithImmutAttrDomain,
-                                        AbstractHeapPointer>;
+    DisjointUnionWithSignedConstantDomain<is_object_visitor,
+                                          SingletonObjectDomain,
+                                          IntegerSetDomain,
+                                          StringSetDomain,
+                                          StringDomain,
+                                          ConstantClassObjectDomain,
+                                          ConstantInjectionIdDomain,
+                                          ObjectWithImmutAttrDomain,
+                                          NewObjectDomain,
+                                          AbstractHeapPointer>;
+
+struct ConstantValueDefaultValue {
+  ConstantValue operator()() { return SignedConstantDomain(0); }
+};
 
 // For storing non-escaping static and instance fields.
 using FieldEnvironment =
@@ -83,13 +109,13 @@ using ConstantRegisterEnvironment =
  * LocalPointersAnalysis for local mutable objects analysis.
  *****************************************************************************/
 
-using ConstantPrimitiveArrayDomain = ConstantArrayDomain<SignedConstantDomain>;
+using ConstantValueArrayDomain =
+    ConstantArrayDomain<ConstantValue, ConstantValueDefaultValue>;
 
 using ConstantObjectDomain = ObjectDomain<ConstantValue>;
 
-using HeapValue =
-    sparta::DisjointUnionAbstractDomain<ConstantPrimitiveArrayDomain,
-                                        ConstantObjectDomain>;
+using HeapValue = sparta::DisjointUnionAbstractDomain<ConstantValueArrayDomain,
+                                                      ConstantObjectDomain>;
 
 using ConstantHeap = sparta::PatriciaTreeMapAbstractEnvironment<
     AbstractHeapPointer::ConstantType,
@@ -225,14 +251,14 @@ class ConstantEnvironment final
    */
   ConstantEnvironment& set_array_binding(reg_t reg,
                                          uint32_t idx,
-                                         const SignedConstantDomain& value) {
+                                         const ConstantValue& value) {
     return mutate_heap([&](ConstantHeap* heap) {
       auto ptr = get<AbstractHeapPointer>(reg);
       if (!ptr.is_value()) {
         return;
       }
       heap->update(*ptr.get_constant(), [&](const HeapValue& arr) {
-        auto copy = arr.get<ConstantPrimitiveArrayDomain>();
+        auto copy = arr.get<ConstantValueArrayDomain>();
         copy.set(idx, value);
         return copy;
       });
@@ -264,9 +290,10 @@ class ConstantEnvironment final
 /*
  * For modeling the stack + heap at method return statements.
  */
-class ReturnState : public sparta::ReducedProductAbstractDomain<ReturnState,
-                                                                ConstantValue,
-                                                                ConstantHeap> {
+class ReturnState final
+    : public sparta::ReducedProductAbstractDomain<ReturnState,
+                                                  ConstantValue,
+                                                  ConstantHeap> {
  public:
   using ReducedProductAbstractDomain::ReducedProductAbstractDomain;
 
@@ -290,8 +317,3 @@ class ReturnState : public sparta::ReducedProductAbstractDomain<ReturnState,
 
   ConstantHeap get_heap() { return ReducedProductAbstractDomain::get<1>(); }
 };
-
-// TODO: Instead of this custom meet function, the ConstantValue should get a
-// custom meet AND JOIN that knows about the relationship of NEZ and certain
-// non-null custom object domains.
-ConstantValue meet(const ConstantValue& left, const ConstantValue& right);

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <fstream>
 
 #include "ConfigFiles.h"
 #include "Trace.h"
@@ -270,7 +271,7 @@ void simple_greedy_approximation(const JsonWrapper& specs,
   size_t max_distance;
   specs.get("distance", 0, max_distance);
   TRACE(CLMG, 3, "[approx] Using simple greedy algorithm.");
-  TRACE(CLMG, 3, "         distance = %ld.", max_distance);
+  TRACE(CLMG, 3, "         distance = %zu.", max_distance);
 
   // Sort shapes by the number of fields.
   std::vector<Shape> shapes_list;

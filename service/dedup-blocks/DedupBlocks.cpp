@@ -48,6 +48,8 @@
 #include "DedupBlocks.h"
 #include "DedupBlockValueNumbering.h"
 
+#include <algorithm>
+
 #include "DexPosition.h"
 #include "Lazy.h"
 #include "LiveRange.h"
@@ -289,6 +291,10 @@ class DedupBlocksImpl {
    * line up the splitting logic with the deduping logic (and install asserts
    * that they agree), or re-merge left-over block pairs, either explicitly,
    * or by running another RemoveGotos pass.
+   *
+   * TODO(T132664146): DedupBlocks's splitting algorithm unfortunately only
+   * splits out one subtree level per iteration, which could probably be
+   * improved with a better algorithm.
    */
   void split_postfix(cfg::ControlFlowGraph& cfg) {
     PostfixSplitGroupMap dups = collect_postfix_duplicates(cfg);
@@ -332,13 +338,13 @@ class DedupBlocksImpl {
   Stats& m_stats;
 
   struct LiveRanges {
-    live_range::DefUseChains def_use_chains;
-    live_range::UseDefChains use_def_chains;
-    explicit LiveRanges(cfg::ControlFlowGraph& cfg) {
-      live_range::MoveAwareChains chains(cfg);
-      def_use_chains = chains.get_def_use_chains();
-      use_def_chains = chains.get_use_def_chains();
-    }
+    live_range::MoveAwareChains chains;
+    Lazy<live_range::DefUseChains> def_use_chains;
+    Lazy<live_range::UseDefChains> use_def_chains;
+    explicit LiveRanges(cfg::ControlFlowGraph& cfg)
+        : chains(cfg),
+          def_use_chains([this] { return chains.get_def_use_chains(); }),
+          use_def_chains([this] { return chains.get_use_def_chains(); }) {}
   };
 
   // Find blocks with the same exact code
@@ -902,17 +908,15 @@ class DedupBlocksImpl {
   get_init_receiver_instructions_defined_outside_of_block(
       cfg::Block* block, Lazy<LiveRanges>& live_ranges) {
     std::vector<IRInstruction*> res;
-    boost::optional<reaching_defs::Environment> defs_in;
-    auto iterable = InstructionIterable(block);
     std::unordered_set<IRInstruction*> block_insns;
-    for (auto it = iterable.begin(); it != iterable.end(); it++) {
-      auto insn = it->insn;
+    for (auto& mie : InstructionIterable(block)) {
+      auto insn = mie.insn;
       if (opcode::is_invoke_direct(insn->opcode()) &&
           method::is_init(insn->get_method())) {
         TRACE(DEDUP_BLOCKS, 5, "[dedup blocks] found init invocation: %s",
               SHOW(insn));
-        auto& defs = live_ranges->use_def_chains[live_range::Use{insn, 0}];
-        always_assert(defs.size() > 0);
+        auto& defs = (*live_ranges->use_def_chains)[live_range::Use{insn, 0}];
+        always_assert(!defs.empty());
         if (defs.size() > 1) {
           // should never happen, but we are not going to fight that here
           TRACE(DEDUP_BLOCKS, 5, "[dedup blocks] defs.size() = %zu",
@@ -999,7 +1003,7 @@ class DedupBlocksImpl {
       if (!other_insns) {
         return true;
       } else if (!insns) {
-        insns = other_insns;
+        insns = std::move(other_insns);
       } else {
         always_assert(insns->size() == other_insns->size());
         for (size_t i = 0; i < insns->size(); i++) {
@@ -1015,54 +1019,117 @@ class DedupBlocksImpl {
     // finer-grained partitioning.
 
     // Initializing stuff...
-    auto live_in_vars =
+    const auto& live_in_vars =
         liveness_fixpoint_iter.get_live_in_vars_at(*blocks.begin());
-    if (!(live_in_vars.is_value())) {
+    always_assert(!live_in_vars.is_top());
+    if (live_in_vars.is_bottom()) {
       // should never happen, but we are not going to fight that here
       return true;
     }
     // Join together all initial type environments of the the blocks; this
     // corresponds to what will happen when we dedup the blocks.
-    boost::optional<type_inference::TypeEnvironment> joined_env;
+    auto joined_env = type_inference::TypeEnvironment::bottom();
     for (cfg::Block* block : blocks) {
-      auto env = type_inference->get_entry_state_at(block);
-      if (!joined_env) {
-        joined_env = env;
-      } else {
-        joined_env->join_with(env);
-      }
+      joined_env.join_with(type_inference->get_entry_state_at(block));
     }
-    always_assert(joined_env);
+    if (joined_env.is_bottom()) {
+      // shouldn't happen, but we are not going to fight that here
+      return true;
+    }
     // Let's see if any of the type environments of the existing blocks
-    // matches, considering live-in registers. If so, we know that things will
+    // match, considering the live-in registers. If so, we know that things will
     // verify after deduping.
-    // TODO: Can we be even more lenient without actually deduping and
-    // re-type-inferring?
-    for (cfg::Block* block : blocks) {
-      auto env = type_inference->get_entry_state_at(block);
-      bool matches = true;
-      for (auto reg : live_in_vars.elements()) {
-        auto type = joined_env->get_type(reg);
-        if (type.is_top() || type.is_bottom()) {
-          // should never happen, but we are not going to fight that here
-          return true;
+    for (auto reg : live_in_vars.elements()) {
+      auto joined_type = joined_env.get_type(reg);
+      if (!type_inference::is_safely_usable_in_ifs(joined_type.element())) {
+        return true;
+      }
+      if (joined_type.element() != IRType::REFERENCE) {
+        continue;
+      }
+      // If any of the reference types we joined might have been of an array
+      // type...
+      auto joined_type_domain = DexTypeDomain::bottom();
+      auto common_dex_type = joined_env.get_dex_type(reg);
+      bool maybe_array{false};
+      bool maybe_array_of_object{false};
+      for (cfg::Block* block : blocks) {
+        auto type_domain =
+            type_inference->get_entry_state_at(block).get_type_domain(reg);
+        auto dex_type = type_domain.get_dex_type();
+        if (type_domain.is_top() || !dex_type) {
+          maybe_array = true;
+          maybe_array_of_object = true;
+        } else if (type::is_array(*dex_type)) {
+          maybe_array = true;
+          if (type::is_object(type::get_array_component_type(*dex_type))) {
+            maybe_array_of_object = true;
+          }
         }
-        if (type != env.get_type(reg)) {
-          matches = false;
-          break;
-        }
-        if (type.element() == REFERENCE &&
-            joined_env->get_dex_type(reg) != env.get_dex_type(reg)) {
-          matches = false;
-          break;
+        joined_type_domain.join_with(type_domain);
+        if (common_dex_type && dex_type && *common_dex_type != *dex_type) {
+          common_dex_type = boost::none;
         }
       }
-      if (matches) {
-        return false;
+      always_assert(!joined_type_domain.is_bottom());
+      always_assert(!maybe_array_of_object || maybe_array);
+      if (!maybe_array) {
+        continue;
+      }
+      if (common_dex_type) {
+        // Trivial join. This is fine.
+        continue;
+      }
+      auto reaching_defs = reaching_defs::Domain::bottom();
+      auto init_reaching_defs = [&blocks, &live_ranges, &reaching_defs, reg]() {
+        if (reaching_defs.is_bottom()) {
+          const auto& fp_iter = live_ranges->chains.get_fp_iter();
+          for (cfg::Block* block : blocks) {
+            reaching_defs.join_with(fp_iter.get_entry_state_at(block).get(reg));
+          }
+          always_assert(!reaching_defs.is_bottom());
+        }
+      };
+      if (maybe_array_of_object) {
+        // Android's verifier has shortcomings around arrays of interface types,
+        // so if there's any use of the register in such a context, we give up.
+        // TODO: This is very conservative. Right now, we give up by just
+        // looking at the use-instructions. We can be more precise by analyzing
+        // the type demand of the instruction, and only give up if it involves
+        // an array of an interface type.
+        init_reaching_defs();
+        for (auto reaching_def : reaching_defs.elements()) {
+          for (const auto& use : (*live_ranges->def_use_chains)[reaching_def]) {
+            auto op = use.insn->opcode();
+            if (opcode::is_an_aget(op) || opcode::is_an_iput(op) ||
+                opcode::is_an_sput(op) || opcode::is_an_invoke(op) ||
+                opcode::is_a_return(op)) {
+              return true;
+            }
+          }
+        }
+      }
+      // ...but didn't join to an array type...
+      if (!joined_type_domain.is_top()) {
+        auto joined_dex_type = joined_type_domain.get_dex_type();
+        if (joined_dex_type && type::is_array(*joined_dex_type)) {
+          continue;
+        }
+      }
+      // ...then we need to make sure that register is not used with an
+      // instruction that expects *some* array type.
+      init_reaching_defs();
+      for (auto reaching_def : reaching_defs.elements()) {
+        for (const auto& use : (*live_ranges->def_use_chains)[reaching_def]) {
+          auto op = use.insn->opcode();
+          if (opcode::is_array_length(op) || opcode::is_an_aget(op) ||
+              opcode::is_an_aput(op) || opcode::is_fill_array_data(op)) {
+            return true;
+          }
+        }
       }
     }
-    // we did not find any matching block
-    return true;
+    return false;
   }
 
   static boost::optional<MethodItemEntry&> last_opcode(cfg::Block* block) {
@@ -1075,19 +1142,15 @@ class DedupBlocksImpl {
   }
 
   static size_t num_opcodes(cfg::Block* block) {
-    size_t result = 0;
     const auto& iterable = InstructionIterable(block);
-    for (auto it = iterable.begin(); it != iterable.end(); it++) {
-      result++;
-    }
-    return result;
+    return std::distance(iterable.begin(), iterable.end());
   }
 
   static void print_dups(const Duplicates& dups) {
     TRACE(DEDUP_BLOCKS, 4, "duplicate blocks set: {");
     for (const auto& entry : dups) {
       TRACE(
-          DEDUP_BLOCKS, 4, "  hash = %lu",
+          DEDUP_BLOCKS, 4, "  hash = %zu",
           DedupBlkValueNumbering::BlockValueHasher{}(*entry.first.block_value));
       for (cfg::Block* b : entry.second) {
         TRACE(DEDUP_BLOCKS, 4, "    block %zu", b->id());
@@ -1123,11 +1186,14 @@ DedupBlocks::DedupBlocks(const Config* config,
 void DedupBlocks::run() {
   DedupBlocksImpl impl(m_config, m_stats);
   auto& cfg = m_code->cfg();
+  uint32_t iteration = 0;
   do {
+    ++iteration;
     if (m_config->split_postfix) {
       impl.split_postfix(cfg);
     }
-  } while (impl.dedup(m_is_static, m_declaring_type, m_args, cfg));
+  } while (impl.dedup(m_is_static, m_declaring_type, m_args, cfg) &&
+           iteration < m_config->max_iteration);
 }
 
 Stats& Stats::operator+=(const Stats& that) {

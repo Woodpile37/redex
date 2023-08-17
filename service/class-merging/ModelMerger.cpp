@@ -93,6 +93,19 @@ MergerToField get_type_tag_fields(const std::vector<const MergerType*>& mergers,
   return merger_to_type_tag_field;
 }
 
+/*
+ * INSTANCE_OF needs special treatment involving the type tag.
+ */
+bool is_simple_type_ref(IRInstruction* insn) {
+  if (!insn->has_type()) {
+    return false;
+  }
+  return opcode::is_new_instance(insn->opcode()) ||
+         opcode::is_check_cast(insn->opcode()) ||
+         opcode::is_const_class(insn->opcode()) ||
+         opcode::is_new_array(insn->opcode());
+}
+
 void update_code_type_refs(
     const Scope& scope,
     const std::unordered_map<const DexType*, DexType*>& mergeable_to_merger) {
@@ -129,7 +142,8 @@ void update_code_type_refs(
         // through another interface method search. Maybe we should fix it in
         // ReBindRefs.
         if (meth_def == nullptr) {
-          auto intf_def = resolve_method(meth_ref, MethodSearch::Interface);
+          auto intf_def =
+              resolve_method(meth_ref, MethodSearch::InterfaceVirtual);
           always_assert(insn->opcode() == OPCODE_INVOKE_VIRTUAL && intf_def);
           auto new_proto =
               type_reference::get_new_proto(proto, mergeable_to_merger);
@@ -144,13 +158,7 @@ void update_code_type_refs(
       ////////////////////////////////////////
       // Update simple type refs
       ////////////////////////////////////////
-      if (!insn->has_type()) {
-        continue;
-      }
-      if (insn->opcode() != OPCODE_NEW_INSTANCE &&
-          insn->opcode() != OPCODE_CHECK_CAST &&
-          insn->opcode() != OPCODE_CONST_CLASS &&
-          insn->opcode() != OPCODE_NEW_ARRAY) {
+      if (!is_simple_type_ref(insn)) {
         continue;
       }
       const auto ref_type = insn->get_type();
@@ -617,7 +625,7 @@ std::vector<DexClass*> ModelMerger::merge_model(Scope& scope,
   rewriter::TypeStringMap type_str_mapping(mergeable_to_merger);
   rewriter::rewrite_dalvik_annotation_signature(scope, type_str_mapping);
 
-  if (model_spec.replace_type_like_const_strings) {
+  if (model_spec.replace_type_like_strings()) {
     rewriter::rewrite_string_literal_instructions(scope, type_str_mapping);
   }
 
@@ -639,8 +647,27 @@ std::vector<DexClass*> ModelMerger::merge_model(Scope& scope,
                          cls->set_super_class(type::java_lang_Object());
                          redex_assert(cls->get_vmethods().empty());
                          if (!cls->get_clinit() && cls->get_sfields().empty()) {
-                           redex_assert(cls->get_dmethods().empty());
+                           // Purge merged cls w/o static fields.
                            return true;
+                         } else {
+                           // Purge dmethods other than the clinit.
+                           // For the original dmethods on the merged classes,
+                           // we dedup them and relocate the selected ones to
+                           // the merger. We remove the replaced ones in
+                           // `ModelMethodMerger::dedup_non_ctor_non_virt_methods`.
+                           // What's left here are staticized virtual methods
+                           // left by the virtual method merging process. We did
+                           // inline their entries in the merged dispatch or
+                           // relocate if inlining failed. So what's left here
+                           // are not reachable anymore, and safe to be purged.
+                           auto dmethods = cls->get_dmethods();
+                           for (auto* m : dmethods) {
+                             if (!method::is_clinit(m)) {
+                               cls->remove_method(m);
+                               DexMethod::erase_method(m);
+                               DexMethod::delete_method(m);
+                             }
+                           }
                          }
                        }
                        return false;

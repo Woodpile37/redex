@@ -13,11 +13,24 @@ class CheckRecursionPass : public Pass {
  public:
   CheckRecursionPass() : Pass("CheckRecursionPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
+
   int bad_recursion_count{4};
 
   void bind_config() override {
     bind("bad_recursion_count", 4, bad_recursion_count);
   }
+
+  bool is_cfg_legacy() override { return true; }
 
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 };

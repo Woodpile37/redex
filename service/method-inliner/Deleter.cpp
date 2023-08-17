@@ -16,8 +16,9 @@
 std::vector<DexMethod*> delete_methods(
     std::vector<DexClass*>& scope,
     std::unordered_set<DexMethod*>& removable,
-    std::function<DexMethod*(DexMethodRef*, MethodSearch search)>
-        concurrent_resolver) {
+    std::function<DexMethod*(DexMethodRef*,
+                             MethodSearch search,
+                             const DexMethod*)> concurrent_resolver) {
 
   // if a removable candidate is invoked do not delete
   ConcurrentSet<DexMethod*> removable_to_erase;
@@ -25,8 +26,8 @@ std::vector<DexMethod*> delete_methods(
       scope, [](DexMethod* meth) { return true; },
       [&](DexMethod* meth, IRInstruction* insn) {
         if (opcode::is_an_invoke(insn->opcode())) {
-          auto callee =
-              concurrent_resolver(insn->get_method(), opcode_to_search(insn));
+          auto callee = concurrent_resolver(insn->get_method(),
+                                            opcode_to_search(insn), meth);
           if (callee != nullptr && removable.count(callee)) {
             removable_to_erase.insert(callee);
           }
@@ -54,12 +55,14 @@ std::vector<DexMethod*> delete_methods(
   for (auto callee : removable) {
     if (!callee->is_concrete()) continue;
     if (!can_delete(callee)) continue;
+    if (method::is_argless_init(callee)) continue;
     auto cls = type_class(callee->get_class());
     always_assert_log(cls != nullptr,
                       "%s is concrete but does not have a DexClass\n",
                       SHOW(callee));
     cls->remove_method(callee);
     DexMethod::erase_method(callee);
+    DexMethod::delete_method(callee);
     deleted.push_back(callee);
     TRACE(DELMET, 4, "removing %s", SHOW(callee));
   }

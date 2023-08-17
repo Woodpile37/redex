@@ -9,6 +9,10 @@
 
 #include "Pass.h"
 
+namespace cfg {
+class ControlFlowGraph;
+} // namespace cfg
+
 // A pass to insert SourceBlock MIEs into CFGs.
 //
 // This is a pass so it can be more freely scheduled. A simple example is
@@ -18,7 +22,22 @@ class InsertSourceBlocksPass : public Pass {
  public:
   InsertSourceBlocksPass() : Pass("InsertSourceBlocksPass") {}
 
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {DexLimitsObeyed, Preserves},
+        {HasSourceBlocks, Establishes},
+        {NoSpuriousGetClassCalls, Preserves},
+        {UltralightCodePatterns, Preserves},
+    };
+  }
+
   void bind_config() override;
+
+  bool is_cfg_legacy() override { return true; }
+
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:

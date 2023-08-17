@@ -22,6 +22,7 @@
 #include "Debug.h"
 #include "DetectBundle.h"
 #include "DexUtil.h"
+#include "GlobalConfig.h"
 #include "IOUtil.h"
 #include "Macros.h"
 #include "ReadMaybeMapped.h"
@@ -203,6 +204,16 @@ void find_resource_xml_files(const std::string& dir,
             handler(resource_path.string());
           }
         }
+      } else {
+        // In case input APK has resource file path changed and not in usual
+        // format.
+        // TODO(T126661220): this disabled performance improvement to read less
+        // resource files, it would be better if we have mapping file to map
+        // back resource file names.
+        if (is_regular_file(entry_path) &&
+            boost::ends_with(entry_path.string(), ".xml")) {
+          handler(entry_path.string());
+        }
       }
     }
   }
@@ -216,7 +227,7 @@ void AndroidResources::collect_layout_classes_and_attributes(
   auto collect_fn = [&](const std::vector<std::string>& prefixes) {
     std::mutex out_mutex;
     workqueue_run<std::string>(
-        [&](sparta::SpartaWorkerState<std::string>* worker_state,
+        [&](sparta::WorkerState<std::string>* worker_state,
             const std::string& input) {
           if (input.empty()) {
             // Dispatcher, find files and create tasks.
@@ -285,10 +296,43 @@ void AndroidResources::collect_layout_classes_and_attributes(
   }
 }
 
+void AndroidResources::collect_xml_attribute_string_values(
+    std::unordered_set<std::string>* out) {
+  std::mutex out_mutex;
+  workqueue_run<std::string>(
+      [&](sparta::WorkerState<std::string>* worker_state,
+          const std::string& input) {
+        if (input.empty()) {
+          // Dispatcher, find files and create tasks.
+          auto directories = find_res_directories();
+          for (const auto& dir : directories) {
+            TRACE(RES, 9, "Scanning %s for xml files for attribute values",
+                  dir.c_str());
+            find_resource_xml_files(dir, {}, [&](const std::string& file) {
+              worker_state->push_task(file);
+            });
+          }
+
+          return;
+        }
+
+        std::unordered_set<std::string> local_out_values;
+        collect_xml_attribute_string_values_for_file(input, &local_out_values);
+        if (!local_out_values.empty()) {
+          std::unique_lock<std::mutex> lock(out_mutex);
+          // C++17: use merge to avoid copies.
+          out->insert(local_out_values.begin(), local_out_values.end());
+        }
+      },
+      std::vector<std::string>{""},
+      std::min(redex_parallel::default_num_threads(), kReadXMLThreads),
+      /*push_tasks_while_running=*/true);
+}
+
 void AndroidResources::rename_classes_in_layouts(
     const std::map<std::string, std::string>& rename_map) {
   workqueue_run<std::string>(
-      [&](sparta::SpartaWorkerState<std::string>* worker_state,
+      [&](sparta::WorkerState<std::string>* worker_state,
           const std::string& input) {
         if (input.empty()) {
           // Dispatcher, find files and create tasks.
@@ -314,10 +358,10 @@ void AndroidResources::rename_classes_in_layouts(
       /*push_tasks_while_running=*/true);
 }
 
-std::set<std::string> multimap_values_to_set(
+std::unordered_set<std::string_view> multimap_values_to_set(
     const std::unordered_multimap<std::string, std::string>& map,
     const std::string& key) {
-  std::set<std::string> result;
+  std::unordered_set<std::string_view> result;
   auto range = map.equal_range(key);
   for (auto it = range.first; it != range.second; ++it) {
     result.emplace(it->second);
@@ -358,7 +402,7 @@ std::unordered_set<std::string> AndroidResources::get_native_classes() {
   std::mutex out_mutex;
   std::unordered_set<std::string> all_classes;
   workqueue_run<std::string>(
-      [&](sparta::SpartaWorkerState<std::string>* worker_state,
+      [&](sparta::WorkerState<std::string>* worker_state,
           const std::string& input) {
         if (input.empty()) {
           // Dispatcher, find files and create tasks.
@@ -393,7 +437,35 @@ std::unordered_set<std::string> AndroidResources::get_native_classes() {
   return all_classes;
 }
 
-void ResourceTableFile::remove_unreferenced_strings() {
-  // Intentionally left empty, proto resource table will not contain a relevant
-  // structure to prune.
+bool AndroidResources::can_obfuscate_xml_file(
+    const std::unordered_set<std::string>& allowed_types,
+    const std::string& dirname) {
+  for (const auto& type : allowed_types) {
+    auto path = RES_DIRECTORY + std::string("/") + type;
+    if (dirname.find(path) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
+
+void ResourceTableFile::finalize_resource_table(const ResourceConfig& config) {
+  // Intentionally left empty, proto resource table will not contain a relevant
+  // structure to clean up.
+}
+
+namespace resources {
+bool is_r_class(const DexClass* cls) {
+  const auto c_name = cls->get_name()->str();
+  const auto d_name = cls->get_deobfuscated_name_or_empty();
+  return is_resource_class_name(c_name) || is_resource_class_name(d_name);
+}
+
+void gather_r_classes(const Scope& scope, std::vector<DexClass*>* vec) {
+  for (auto c : scope) {
+    if (is_r_class(c)) {
+      vec->emplace_back(c);
+    }
+  }
+}
+} // namespace resources

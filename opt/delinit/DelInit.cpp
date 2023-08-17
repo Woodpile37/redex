@@ -54,7 +54,7 @@ DexType* get_dextype_from_dotname(const char* dotname) {
   buf += dotname;
   buf += ';';
   std::replace(buf.begin(), buf.end(), '.', '/');
-  return DexType::get_type(buf.c_str());
+  return DexType::get_type(buf);
 }
 
 // Search a class name in a list of package names, return true if there is a
@@ -85,7 +85,7 @@ void process_signature_anno(const DexString* dstring) {
   }
   std::string buf(cstr);
   buf += ';';
-  auto dtype = DexType::get_type(buf.c_str());
+  auto dtype = DexType::get_type(buf);
   referenced_classes.insert(type_class(dtype));
 }
 
@@ -133,18 +133,19 @@ void find_referenced_classes(const Scope& scope) {
       [](DexMethod*) { return true; },
       [&](DexMethod* meth, IRCode& code) {
         for (const auto& mie : InstructionIterable(meth->get_code())) {
-          auto opcode = mie.insn;
+          auto insn = mie.insn;
           // Matches any stringref that name-aliases a type.
-          if (opcode->has_string()) {
-            const DexString* dsclzref = opcode->get_string();
+          if (insn->has_string()) {
+            const DexString* dsclzref = insn->get_string();
             DexType* dtexclude = get_dextype_from_dotname(dsclzref->c_str());
             if (dtexclude == nullptr) continue;
             TRACE(PGR, 3, "string_ref: %s", SHOW(dtexclude));
             referenced_classes.insert(type_class(dtexclude));
           }
-          if (opcode->has_type()) {
-            TRACE(PGR, 3, "type_ref: %s", SHOW(opcode->get_type()));
-            referenced_classes.insert(type_class(opcode->get_type()));
+          if (opcode::is_new_instance(insn->opcode()) ||
+              opcode::is_const_class(insn->opcode())) {
+            TRACE(PGR, 3, "type_ref: %s", SHOW(insn->get_type()));
+            referenced_classes.insert(type_class(insn->get_type()));
           }
         }
       });
@@ -171,7 +172,7 @@ bool can_remove_init(const DexMethod* m,
   DexClass* clazz = type_class(m->get_class());
   if (can_remove(clazz)) {
     return true;
-  } else if (m->get_proto()->get_args()->size() == 0) {
+  } else if (m->get_proto()->get_args()->empty()) {
     // If the class is kept, we should probably keep the no argument constructor
     // Because it may be invoked with `Class.newInstance()`.
     return false;
@@ -355,7 +356,7 @@ void DeadRefs::find_unreachable(Scope& scope) {
     vmethods += p.second.vmethods.size();
     ifields += p.second.ifields.size();
   }
-  TRACE(DELINIT, 2, "Uninstantiable classes %ld: vmethods %ld, ifields %ld",
+  TRACE(DELINIT, 2, "Uninstantiable classes %zu: vmethods %zu, ifields %zu",
         classes.size(), vmethods, ifields);
 }
 
@@ -418,7 +419,7 @@ void DeadRefs::collect_dmethods(Scope& scope) {
     acc.initmethods += p.second.initmethods;
     acc.dmethods += p.second.dmethods;
   }
-  TRACE(DELINIT, 3, "Found %ld init and %ld dmethods", acc.initmethods,
+  TRACE(DELINIT, 3, "Found %zu init and %zu dmethods", acc.initmethods,
         acc.dmethods);
 }
 
@@ -485,7 +486,7 @@ void DeadRefs::track_callers(Scope& scope) {
       ci.ifields.erase(ifield);
     }
   });
-  TRACE(DELINIT, 3, "Unreachable (not called) %ld vmethods and %ld ifields",
+  TRACE(DELINIT, 3, "Unreachable (not called) %zu vmethods and %zu ifields",
         vmethods, ifields);
 }
 
@@ -502,7 +503,7 @@ int DeadRefs::remove_unreachable(Scope& scope) {
   };
   ConcurrentMap<DexClass*, LocalStats> local_stats;
   walk::parallel::classes(scope, [&](DexClass* cls) {
-    auto ci = class_infos.at(cls);
+    auto& ci = class_infos.at(cls);
     LocalStats stats;
     for (const auto& meth : ci.vmethods) {
       redex_assert(meth->is_virtual());
@@ -578,12 +579,6 @@ int DeadRefs::remove_unreachable(Scope& scope) {
 void DelInitPass::run_pass(DexStoresVector& stores,
                            ConfigFiles& /* conf */,
                            PassManager& mgr) {
-  if (mgr.no_proguard_rules()) {
-    TRACE(
-        DELINIT, 1,
-        "DelInitPass not run because no ProGuard configuration was provided.");
-    return;
-  }
   package_filter = m_package_filter;
   auto scope = build_class_scope(stores);
   find_referenced_classes(scope);

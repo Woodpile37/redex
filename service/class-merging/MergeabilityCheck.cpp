@@ -88,10 +88,8 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
       auto meth_ref = insn->get_method();
       auto type = meth_ref->get_class();
       if (m_spec.merging_targets.count(type) > 0) {
-        TRACE(CLMG,
-              5,
-              "[non mergeable] referenced by pure ref %s",
-              SHOW(meth_ref));
+        TRACE(CLMG, 5, "[non mergeable] referenced by pure ref %s in %s",
+              SHOW(meth_ref), SHOW(method));
         non_mergeables.insert(type);
       }
       continue;
@@ -99,17 +97,16 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
 
     // The presence of type-like strings can indicate that types are used by
     // reflection, and then it's not safe to merge those types.
-    if (m_spec.type_like_const_strings_unsafe &&
-        insn->opcode() == OPCODE_CONST_STRING) {
+    if (m_spec.exclude_type_like_strings() &&
+        opcode::is_const_string(insn->opcode())) {
       const DexString* str = insn->get_string();
       std::string class_name = java_names::external_to_internal(str->str());
       DexType* maybe_type = DexType::get_type(class_name);
       if (maybe_type && m_spec.merging_targets.count(maybe_type) > 0) {
         non_mergeables.insert(maybe_type);
-        TRACE(CLMG,
-              5,
-              "[non mergeable] type like const string unsafe: %s",
-              SHOW(insn));
+        TRACE(CLMG, 5,
+              "[non mergeable] type like const string unsafe: %s in %s",
+              SHOW(insn), SHOW(method));
       }
       continue;
     }
@@ -117,10 +114,9 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     // Java language level enforcement recommended!
     //
     // For mergeables with type tags, it is not safe to merge those
-    // used with CONST_CLASS or NEW_ARRAY since we will lose
-    // granularity as we can't map to the old type anymore.
-    if (has_type_tag && insn->opcode() != OPCODE_CONST_CLASS &&
-        insn->opcode() != OPCODE_NEW_ARRAY) {
+    // referenced by CONST_CLASS, since we will lose granularity as we can't map
+    // to the old type anymore.
+    if (has_type_tag && !opcode::is_const_class(insn->opcode())) {
       continue;
     }
 
@@ -138,14 +134,13 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     //      CHECK_CAST <type_0>
     //    else labe:
     //      CHECK_CAST <type_1>
-    if (!has_type_tag && insn->opcode() != OPCODE_INSTANCE_OF) {
+    if (!has_type_tag && !opcode::is_instance_of(insn->opcode())) {
       continue;
     }
 
-    const auto& type = type::get_element_type_if_array(insn->get_type());
+    const auto* type = type::get_element_type_if_array(insn->get_type());
     if (m_spec.merging_targets.count(type) > 0) {
-
-      if (insn->opcode() != OPCODE_CONST_CLASS ||
+      if (!opcode::is_const_class(insn->opcode()) ||
           m_const_class_safe_types.empty()) {
         non_mergeables.insert(type);
       } else {
@@ -182,10 +177,8 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
       auto callee = use_insn->get_method();
       auto callee_type = callee->get_class();
       if (!m_const_class_safe_types.count(callee_type)) {
-        TRACE(CLMG,
-              5,
-              "[non mergeable] const class unsafe callee %s",
-              SHOW(callee));
+        TRACE(CLMG, 5, "[non mergeable] const class unsafe callee %s in %s",
+              SHOW(callee), SHOW(method));
         non_mergeables.insert(referenced_type);
         break;
       }
@@ -236,12 +229,13 @@ void MergeabilityChecker::exclude_static_fields(TypeSet& non_mergeables) {
 
 void MergeabilityChecker::exclude_unsafe_sdk_and_store_refs(
     TypeSet& non_mergeables) {
+  const auto mog = method_override_graph::build_graph(m_scope);
   for (auto type : m_spec.merging_targets) {
     if (non_mergeables.count(type)) {
       continue;
     }
     auto cls = type_class(type);
-    if (!m_ref_checker.check_class(cls)) {
+    if (!m_ref_checker.check_class(cls, mog)) {
       non_mergeables.insert(type);
     }
     if (!m_spec.include_primary_dex && m_ref_checker.is_in_primary_dex(type)) {
@@ -255,27 +249,27 @@ TypeSet MergeabilityChecker::get_non_mergeables() {
   size_t prev_size = 0;
 
   exclude_unsupported_cls_property(non_mergeables);
-  TRACE(CLMG, 4, "Non mergeables (no delete) %ld", non_mergeables.size());
+  TRACE(CLMG, 4, "Non mergeables (no delete) %zu", non_mergeables.size());
   prev_size = non_mergeables.size();
 
   exclude_unsupported_bytecode(non_mergeables);
   TRACE(CLMG,
         4,
-        "Non mergeables (opcodes) %ld",
+        "Non mergeables (opcodes) %zu",
         non_mergeables.size() - prev_size);
   prev_size = non_mergeables.size();
 
   exclude_static_fields(non_mergeables);
   TRACE(CLMG,
         4,
-        "Non mergeables (static fields) %ld",
+        "Non mergeables (static fields) %zu",
         non_mergeables.size() - prev_size);
   prev_size = non_mergeables.size();
 
   exclude_unsafe_sdk_and_store_refs(non_mergeables);
   TRACE(CLMG,
         4,
-        "Non mergeables (unsafe refs) %ld",
+        "Non mergeables (unsafe refs) %zu",
         non_mergeables.size() - prev_size);
   return non_mergeables;
 }

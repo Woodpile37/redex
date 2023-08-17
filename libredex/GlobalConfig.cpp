@@ -16,6 +16,8 @@ void InlinerConfig::bind_config() {
        enforce_method_size_limit);
   bind("throws", throws_inline, throws_inline);
   bind("throw_after_no_return", throw_after_no_return, throw_after_no_return);
+  bind("max_cost_for_constant_propagation", max_cost_for_constant_propagation,
+       max_cost_for_constant_propagation);
   bind("multiple_callers", multiple_callers, multiple_callers);
   bind("run_const_prop", shrinker.run_const_prop, shrinker.run_const_prop);
   bind("run_cse", shrinker.run_cse, shrinker.run_cse);
@@ -50,9 +52,9 @@ void IRTypeCheckerConfig::bind_config() {
   bind("validate_invoke_super", {}, validate_invoke_super);
   bind("run_after_passes", {}, run_after_passes);
   bind("check_no_overwrite_this", {}, check_no_overwrite_this);
-  bind("check_num_of_refs", {}, check_num_of_refs);
   bind("annotated_cfg_on_error", annotated_cfg_on_error,
        annotated_cfg_on_error);
+  bind("check_classes", {}, check_classes);
 }
 
 void HasherConfig::bind_config() {
@@ -63,6 +65,7 @@ void AssessorConfig::bind_config() {
   bind("run_after_each_pass", run_after_each_pass, run_after_each_pass);
   bind("run_initially", run_initially, run_initially);
   bind("run_finally", run_finally, run_finally);
+  bind("run_sb_consistency", run_sb_consistency, run_sb_consistency);
 }
 
 void CheckUniqueDeobfuscatedNamesConfig::bind_config() {
@@ -85,17 +88,37 @@ void MethodProfileOrderingConfig::bind_config() {
 void MethodSimilarityOrderingConfig::bind_config() {
   bind("use_class_level_perf_sensitivity", use_class_level_perf_sensitivity,
        use_class_level_perf_sensitivity);
+  bind("use_compression_conscious_order", use_compression_conscious_order,
+       use_compression_conscious_order);
   bind("disable", disable, disable);
+  bind("store_name_to_disable", store_name_to_disable, store_name_to_disable);
 }
 
 void ProguardConfig::bind_config() {
   bind("blocklist", blocklist, blocklist);
   bind("disable_default_blocklist", disable_default_blocklist,
        disable_default_blocklist);
+  bind("fail_on_unknown_commands", fail_on_unknown_commands,
+       fail_on_unknown_commands);
 }
 
 void PassManagerConfig::bind_config() {
   bind("pass_aliases", pass_aliases, pass_aliases);
+  bind("jemalloc_full_stats", jemalloc_full_stats, jemalloc_full_stats);
+  bind("violations_tracking", violations_tracking, violations_tracking);
+  bind("check_pass_order_properties", check_pass_order_properties,
+       check_pass_order_properties);
+  bind("check_properties_deep", check_properties_deep, check_properties_deep);
+}
+
+void ResourceConfig::bind_config() {
+  bind("customized_r_classes", {}, customized_r_classes);
+  bind("canonical_entry_types", {}, canonical_entry_types);
+  bind("sort_key_strings", false, sort_key_strings);
+}
+
+void DexOutputConfig::bind_config() {
+  bind("write_class_sizes", write_class_sizes, write_class_sizes);
 }
 
 void GlobalConfig::bind_config() {
@@ -131,12 +154,10 @@ void GlobalConfig::bind_config() {
        "\"always-skip-layer-0\"");
   bind("symbolicate_detached_methods", false, bool_param);
   bind("enable_quickening", false, bool_param);
-  bind("ab_experiments_states", {}, string_map_param);
-  bind("ab_experiments_states_override", {}, string_map_param);
-  bind("ab_experiments_default", "", string_param);
   bind("force_single_dex", false, bool_param);
   bind("emit_incoming_hashes", false, bool_param);
   bind("emit_outgoing_hashes", false, bool_param);
+  bind("ignore_no_keep_rules", {}, bool_param);
   bind("instruction_size_bitwidth_limit", 0u, uint32_param);
   bind("json_serde_supercls", {}, string_vector_param);
   bind("keep_all_annotation_classes", true, bool_param);
@@ -146,6 +167,7 @@ void GlobalConfig::bind_config() {
   bind("lower_with_cfg", {}, bool_param);
   bind("no_optimizations_annotations", {}, string_vector_param);
   bind("no_optimizations_blocklist", {}, string_vector_param);
+  bind("preserve_input_dexes", {}, bool_param);
   bind("proguard_map", "", string_param);
   bind("prune_unexported_components", {}, string_vector_param);
   bind("pure_methods", {}, string_vector_param);
@@ -161,6 +183,7 @@ void GlobalConfig::bind_config() {
   bind("no_devirtualize_annos", {}, string_vector_param);
   bind("create_init_class_insns", true, bool_param);
   bind("finalize_resource_table", false, bool_param);
+  bind("check_required_resources", {}, string_vector_param);
 
   for (const auto& entry : m_registry) {
     m_global_configs.emplace(entry.name,
@@ -185,6 +208,8 @@ GlobalConfigRegistry& GlobalConfig::default_registry() {
       register_as<MethodSimilarityOrderingConfig>("method_similarity_order"),
       register_as<ProguardConfig>("proguard"),
       register_as<PassManagerConfig>("pass_manager"),
+      register_as<ResourceConfig>("resources"),
+      register_as<DexOutputConfig>("dex_output"),
   };
   return registry;
 }

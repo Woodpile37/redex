@@ -107,8 +107,7 @@ struct EnumUtil {
   DexType* STRING_TYPE = type::java_lang_String();
   DexType* SERIALIZABLE_TYPE = DexType::make_type("Ljava/io/Serializable;");
   DexType* COMPARABLE_TYPE = DexType::make_type("Ljava/lang/Comparable;");
-  DexType* RTEXCEPTION_TYPE =
-      DexType::make_type("Ljava/lang/RuntimeException;");
+  DexType* RTEXCEPTION_TYPE = type::java_lang_RuntimeException();
   DexType* ILLEGAL_ARG_EXCP_TYPE =
       DexType::make_type("Ljava/lang/IllegalArgumentException;");
 
@@ -138,8 +137,8 @@ struct EnumUtil {
   DexMethodRef* INTEGER_COMPARETO_METHOD = DexMethod::make_method(
       "Ljava/lang/Integer;.compareTo:(Ljava/lang/Integer;)I");
   DexMethodRef* INTEGER_VALUEOF_METHOD = method::java_lang_Integer_valueOf();
-  DexMethodRef* RTEXCEPTION_CTOR_METHOD = DexMethod::make_method(
-      "Ljava/lang/RuntimeException;.<init>:(Ljava/lang/String;)V");
+  DexMethodRef* RTEXCEPTION_CTOR_METHOD =
+      method::java_lang_RuntimeException_init_String();
   DexMethodRef* ILLEGAL_ARG_CONSTRUCT_METHOD = DexMethod::make_method(
       "Ljava/lang/IllegalArgumentException;.<init>:(Ljava/lang/String;)V");
   DexMethodRef* STRING_EQ_METHOD =
@@ -337,7 +336,7 @@ struct EnumUtil {
       name.insert(name.size() - 1, "$u");
       type = DexType::get_type(name);
     }
-    type = DexType::make_type(name.c_str());
+    type = DexType::make_type(name);
     ClassCreator cc(type);
     cc.set_access(ACC_PUBLIC | ACC_FINAL);
     cc.set_super(type::java_lang_Object());
@@ -490,7 +489,7 @@ struct EnumUtil {
         {dasm(OPCODE_INVOKE_STATIC, INTEGER_VALUEOF_METHOD, {5_v}),
          dasm(OPCODE_MOVE_RESULT_OBJECT, {6_v}),
          dasm(OPCODE_APUT_OBJECT, {6_v, 1_v, 5_v}),
-         dasm(OPCODE_ADD_INT_LIT8, {5_v, 5_v, 1_L})});
+         dasm(OPCODE_ADD_INT_LIT, {5_v, 5_v, 1_L})});
 
     auto copy_array_method = DexMethod::make_method(
         "Ljava/lang/System;.arraycopy:(Ljava/lang/Object;ILjava/lang/"
@@ -1064,18 +1063,18 @@ class EnumTransformer final {
       auto attributes = optimize_enums::analyze_enum_clinit(enum_cls);
       size_t num_enum_constants = attributes.m_constants_map.size();
       if (num_enum_constants == 0) {
-        TRACE(ENUM, 2, "\tCannot analyze enum %s : ord %lu sfields %lu",
+        TRACE(ENUM, 2, "\tCannot analyze enum %s : ord %zu sfields %zu",
               SHOW(enum_cls), num_enum_constants,
               enum_cls->get_sfields().size());
         continue;
       } else if (num_enum_constants > config.max_enum_size) {
         if (!config.breaking_reference_equality_allowlist.count(*it)) {
-          TRACE(ENUM, 2, "\tSkip %s %lu values", SHOW(enum_cls),
+          TRACE(ENUM, 2, "\tSkip %s %zu values", SHOW(enum_cls),
                 num_enum_constants);
           continue;
         } else {
           TRACE(ENUM, 2,
-                "\tOptimimze %s (%lu values) but object equality is not "
+                "\tOptimimze %s (%zu values) but object equality is not "
                 "guaranteed",
                 SHOW(enum_cls), num_enum_constants);
         }
@@ -1147,6 +1146,9 @@ class EnumTransformer final {
 
   uint32_t get_int_objs_count() { return m_int_objs; }
   uint32_t get_enum_objs_count() { return m_enum_objs; }
+  uint32_t get_enum_attributes_map_size() {
+    return m_enum_attributes_map.size();
+  }
 
  private:
   /**
@@ -1601,16 +1603,21 @@ namespace optimize_enums {
  * Transform enums to Integer objects, return the total number of eliminated
  * enum objects.
  */
-int transform_enums(const Config& config,
+int transform_enums(PassManager& mgr,
+                    const Config& config,
                     DexStoresVector* stores,
                     size_t* num_int_objs) {
-  if (!config.candidate_enums.size()) {
+  if (config.candidate_enums.empty()) {
     return 0;
   }
 
   EnumTransformer transformer(config, stores);
   transformer.run();
   *num_int_objs = transformer.get_int_objs_count();
+  mgr.incr_metric("num_eliminated_enum_classes",
+                  transformer.get_enum_attributes_map_size());
+  TRACE(ENUM, 2, "optimize enums : num_eliminated_enum_classes %u",
+        transformer.get_enum_attributes_map_size());
   return transformer.get_enum_objs_count();
 }
 } // namespace optimize_enums

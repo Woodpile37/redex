@@ -7,10 +7,11 @@
 
 #include <boost/optional.hpp>
 
-#include "AbstractDomain.h"
+#include <sparta/AbstractDomain.h>
+#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
+
 #include "LocalPointersAnalysis.h"
 #include "Pass.h"
-#include "PatriciaTreeMapAbstractEnvironment.h"
 
 /*
  * This pass looks for recurring sequences of StringBuilder calls and outlines
@@ -78,37 +79,37 @@ class BuilderValue final : public sparta::AbstractValue<BuilderValue> {
  public:
   BuilderValue() = default;
 
-  void clear() override { m_state.clear(); }
+  void clear() { m_state.clear(); }
 
-  sparta::AbstractValueKind kind() const override {
+  sparta::AbstractValueKind kind() const {
     return sparta::AbstractValueKind::Value;
   }
 
-  bool leq(const BuilderValue& other) const override { return equals(other); }
+  bool leq(const BuilderValue& other) const { return equals(other); }
 
-  bool equals(const BuilderValue& other) const override {
+  bool equals(const BuilderValue& other) const {
     return m_state == other.m_state;
   }
 
-  sparta::AbstractValueKind join_with(const BuilderValue& other) override {
+  sparta::AbstractValueKind join_with(const BuilderValue& other) {
     if (equals(other)) {
       return sparta::AbstractValueKind::Value;
     }
     return sparta::AbstractValueKind::Top;
   }
 
-  sparta::AbstractValueKind widen_with(const BuilderValue& other) override {
+  sparta::AbstractValueKind widen_with(const BuilderValue& other) {
     return join_with(other);
   }
 
-  sparta::AbstractValueKind meet_with(const BuilderValue& other) override {
+  sparta::AbstractValueKind meet_with(const BuilderValue& other) {
     if (equals(other)) {
       return sparta::AbstractValueKind::Value;
     }
     return sparta::AbstractValueKind::Bottom;
   }
 
-  sparta::AbstractValueKind narrow_with(const BuilderValue& other) override {
+  sparta::AbstractValueKind narrow_with(const BuilderValue& other) {
     return meet_with(other);
   }
 
@@ -261,6 +262,16 @@ class Outliner {
 class StringBuilderOutlinerPass : public Pass {
  public:
   StringBuilderOutlinerPass() : Pass("StringBuilderOutlinerPass") {}
+
+  redex_properties::PropertyInteractions get_property_interactions()
+      const override {
+    using namespace redex_properties::interactions;
+    using namespace redex_properties::names;
+    return {
+        {HasSourceBlocks, Preserves},
+        {NoSpuriousGetClassCalls, Preserves},
+    };
+  }
 
   void bind_config() override {
     bind("max_outline_length", m_config.max_outline_length,

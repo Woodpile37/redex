@@ -7,7 +7,7 @@
 
 package redex;
 
-import static org.fest.assertions.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.Test;
 
@@ -179,6 +179,10 @@ class OverrideWithDifferentValue2 extends OverrideWithDifferentValue {
   }
 }
 
+class SideEffects {
+  public static int dummy;
+}
+
 public class IPConstantPropagationTest {
 
   // CHECK: method: virtual redex.IPConstantPropagationTest.two_ctors
@@ -267,11 +271,21 @@ public class IPConstantPropagationTest {
     // This Java code should be UB. Redex does the right thing to not evaluate the reference equality here.
     if (f0 == f1) {
       obj = f0;
+      // CHECK: const{{.*}} #int 111
+      // CHECK: sput{{.*}} redex.SideEffects.dummy
+      SideEffects.dummy = 111;
     } else {
       obj = f1;
+    // PRECHECK: const{{.*}} #int 222
+    // PRECHECK: sput{{.*}} redex.SideEffects.dummy
+      SideEffects.dummy = 222;
     }
     // CHECK: const{{.*}} #int 1000
     assertThat(obj.intValue()).isEqualTo(1000);
+
+    // The else-branch of the above if gets reordered to here by Redex' cfg linearization; annoying, but okay.
+    // POSTCHECK: const{{.*}} #int 222
+    // POSTCHECK: sput{{.*}} redex.SideEffects.dummy
   }
 
   // CHECK: method: virtual redex.IPConstantPropagationTest.immutable_instance_field
@@ -318,8 +332,8 @@ public class IPConstantPropagationTest {
     assertThat(a.return2()).isEqualTo(2);
     if (a.calculate(3) != 2 || a.return2() != 2) {
       // CHECK-NOT: return-void
-      // PRECHECK: invoke-virtual {{.*}} org.fest.assertions.api.BooleanAssert.isTrue
-      // POSTCHECK-NOT: invoke-virtual {{.*}} org.fest.assertions.api.BooleanAssert.isTrue
+      // PRECHECK: invoke-virtual {{.*}} org.assertj.core.api.AbstractBooleanAssert.isTrue
+      // POSTCHECK-NOT: invoke-virtual {{.*}} org.assertj.core.api.AbstractBooleanAssert.isTrue
       assertThat(false).isTrue();
     }
     // CHECK: return-void
@@ -337,7 +351,7 @@ public class IPConstantPropagationTest {
     assertThat(a.return2()).isEqualTo(2);
     assertThat(a.returnSomething()).isEqualTo(2);
     // CHECK-NOT: return-void
-    // CHECK: invoke-virtual {{.*}} org.fest.assertions.api.BooleanAssert.isTrue
+    // CHECK: invoke-virtual {{.*}} org.assertj.core.api.AbstractBooleanAssert.isTrue
     if (a.return2() != 2 || a.returnSomething() != 2) {
       assertThat(false).isTrue();
     }
@@ -350,8 +364,8 @@ public class IPConstantPropagationTest {
     OverrideWithSameValue a = new OverrideWithSameValue();
     assertThat(a.return3()).isEqualTo(3);
     // CHECK-NOT: return-void
-    // PRECHECK: invoke-virtual {{.*}} org.fest.assertions.api.BooleanAssert.isTrue
-    // POSTCHECK-NOT: invoke-virtual {{.*}} org.fest.assertions.api.BooleanAssert.isTrue
+    // PRECHECK: invoke-virtual {{.*}} org.assertj.core.api.AbstractBooleanAssert.isTrue
+    // POSTCHECK-NOT: invoke-virtual {{.*}} org.assertj.core.api.AbstractBooleanAssert.isTrue
     if (a.return3() != 3) {
       assertThat(false).isTrue();
     }
@@ -364,7 +378,7 @@ public class IPConstantPropagationTest {
     OverrideWithDifferentValue a = new OverrideWithDifferentValue();
     assertThat(a.returnSomething()).isEqualTo(4);
     // CHECK-NOT: return-void
-    // CHECK: invoke-virtual {{.*}} org.fest.assertions.api.BooleanAssert.isTrue
+    // CHECK: invoke-virtual {{.*}} org.assertj.core.api.AbstractBooleanAssert.isTrue
     if (a.returnSomething() != 4) {
       assertThat(false).isTrue();
     }

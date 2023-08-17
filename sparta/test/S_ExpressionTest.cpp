@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "S_Expression.h"
+#include <sparta/S_Expression.h>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -17,6 +17,8 @@
 #include <boost/functional/hash.hpp>
 
 using namespace sparta;
+
+namespace {
 
 void check_s_expr_istream(s_expr_istream& input) { EXPECT_TRUE(input.good()); }
 
@@ -41,6 +43,8 @@ void erroneous_parse(const std::string& str, size_t count, std::string& what) {
   EXPECT_TRUE(input.fail());
   what = input.what();
 }
+
+} // namespace
 
 TEST(S_ExpressionTest, basicOperations) {
   auto e1 = s_expr({s_expr("cons"), s_expr("a"),
